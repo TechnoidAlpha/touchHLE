@@ -24,6 +24,10 @@ Each item is something *4Towers: Onslaught* 1.01 (iOS 4.1, cocos2d) called that 
 - `-[UIApplication statusBarStyle]` and `-[UIApplication statusBarFrame]`.
 - `-[UIViewController init]` and a logging stub for `presentModalViewController:animated:`.
 
+## Filesystem
+
+- If creating the app's `Documents`, `Library` or `tmp` folder fails, touchHLE logs it (debug builds) and tries a plain `create_dir` instead of stopping. The Android build needed this.
+
 ## GameKit
 
 These are stubs. Nothing talks to Game Center.

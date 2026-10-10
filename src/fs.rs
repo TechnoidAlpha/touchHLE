@@ -573,7 +573,14 @@ impl Fs {
                     }
                 }
                 if let Err(e) = std::fs::create_dir_all(&path) {
-                    panic!("Could not create documents directory for app at {path:?}: {e:?}");
+                    log_dbg!(
+                        "Warning: create_dir_all failed at {:?}: {:?}, attempting fallback",
+                        path,
+                        e
+                    );
+                    if !path.exists() {
+                        let _ = std::fs::create_dir(&path);
+                    }
                 }
                 Some(path)
             } else {
