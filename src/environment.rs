@@ -694,6 +694,11 @@ impl Environment {
                 Some(std::fs::File::create(&env.options.dumping_file).map_err(|e| e.to_string())?);
         }
 
+        // Selector-filtered message trace (--trace-selectors=), off unless any
+        // selectors were chosen.
+        env.objc
+            .start_trace(&env.options.trace_selectors, env.bundle.bundle_identifier());
+
         env.set_up_initial_env_vars();
         dyld::Dyld::do_late_linking(&mut env);
 

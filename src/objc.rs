@@ -30,6 +30,7 @@ mod objects;
 mod properties;
 mod selectors;
 mod synchronization;
+mod trace;
 
 pub use classes::{
     class_getMethodImplementation, objc_classes, Class, ClassExports, ClassTemplate,
@@ -90,6 +91,9 @@ pub struct ObjC {
     /// Type information isn't part of the `objc_msgSend` ABI, so an alternative
     /// channel is needed.
     message_type_info: Option<(std::any::TypeId, &'static str)>,
+
+    /// Selector-filtered message trace, [None] when off. See [trace].
+    trace: Option<trace::MsgTrace>,
 }
 
 impl ObjC {
@@ -101,6 +105,7 @@ impl ObjC {
             sync_mutexes: HashMap::new(),
             initializer_threads: HashMap::new(),
             message_type_info: None,
+            trace: None,
         }
     }
 }

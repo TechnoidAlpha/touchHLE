@@ -64,6 +64,11 @@ impl SEL {
         // selectors are probably always UTF-8 but this hasn't been verified
         mem.cstr_at_utf8(self.0).unwrap()
     }
+    /// Like [SEL::as_str], but [None] instead of a panic for a selector that
+    /// is not valid UTF-8.
+    pub fn try_as_str(self, mem: &Mem) -> Option<&str> {
+        mem.cstr_at_utf8(self.0).ok()
+    }
     pub fn is_null(self) -> bool {
         self.0.is_null()
     }

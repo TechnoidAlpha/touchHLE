@@ -547,6 +547,9 @@ unsafe fn read_renderbuffer(gles: &mut dyn GLES, mut pixel_buffer: Vec<u8>) -> (
 /// [present_frame], trying to avoid noticeably modifying OpenGL ES state while
 /// doing so. The front and back buffers are then swapped.
 unsafe fn present_renderbuffer(env: &mut Environment) {
+    // Frame number for the message trace (--trace-selectors=).
+    env.objc.trace_note_frame_presented();
+
     // Save these for when we need to draw the frame
     let viewport = env.window.as_mut().unwrap().viewport();
     let rotation_matrix = env.window.as_mut().unwrap().rotation_matrix();

@@ -11,6 +11,7 @@
 //! - Mike Ash's [objc_msgSend's New Prototype](https://www.mikeash.com/pyblog/objc_msgsends-new-prototype.html)
 //! - Peter Steinberger's [Calling Super at Runtime in Swift](https://steipete.com/posts/calling-super-at-runtime/) explains `objc_msgSendSuper2`
 
+use super::trace::{trace_send, SendVariant};
 use super::{id, nil, Class, ObjC, IMP, SEL};
 use crate::abi::{CallFromHost, GuestRet};
 use crate::environment::ThreadId;
@@ -176,12 +177,18 @@ fn objc_msgSend_inner(
     super2: Option<Class>,
     tolerate_type_mismatch: bool,
     skip_initialize: bool,
+    variant: SendVariant,
 ) {
     log_dbg!(
         "Dispatching {} for {:?}",
         selector.as_str(&env.mem),
         receiver
     );
+    // Selector-filtered trace (--trace-selectors=). Must come before the type
+    // info is taken, since that tells host sends from guest sends.
+    if env.objc.trace.is_some() && receiver != nil {
+        trace_send(env, receiver, selector, super2, variant);
+    }
     let message_type_info = env.objc.message_type_info.take();
 
     if receiver == nil {
@@ -322,16 +329,26 @@ Type mismatch when sending message {} to {:?}!
 #[allow(non_snake_case)]
 pub(crate) fn objc_msgSend(env: &mut Environment, receiver: id, selector: SEL) {
     objc_msgSend_inner(
-        env, receiver, selector, /* super2: */ None, /* tolerate_type_mismatch: */ false,
+        env,
+        receiver,
+        selector,
+        /* super2: */ None,
+        /* tolerate_type_mismatch: */ false,
         /* skip_initialize: */ false,
+        /* variant: */ SendVariant::Normal,
     )
 }
 
 #[allow(non_snake_case)]
 pub(crate) fn _touchHLE_objc_msgSend_tolerant(env: &mut Environment, receiver: id, selector: SEL) {
     objc_msgSend_inner(
-        env, receiver, selector, /* super2: */ None, /* tolerate_type_mismatch: */ true,
+        env,
+        receiver,
+        selector,
+        /* super2: */ None,
+        /* tolerate_type_mismatch: */ true,
         /* skip_initialize: */ false,
+        /* variant: */ SendVariant::Normal,
     )
 }
 
@@ -343,8 +360,13 @@ pub(crate) fn _touchHLE_objc_msgSend_no_initialize(
     selector: SEL,
 ) {
     objc_msgSend_inner(
-        env, receiver, selector, /* super2: */ None, /* tolerate_type_mismatch: */ false,
+        env,
+        receiver,
+        selector,
+        /* super2: */ None,
+        /* tolerate_type_mismatch: */ false,
         /* skip_initialize: */ true,
+        /* variant: */ SendVariant::Normal,
     )
 }
 
@@ -364,8 +386,13 @@ pub(super) fn objc_msgSend_stret(
     selector: SEL,
 ) {
     objc_msgSend_inner(
-        env, receiver, selector, /* super2: */ None, /* tolerate_type_mismatch: */ false,
+        env,
+        receiver,
+        selector,
+        /* super2: */ None,
+        /* tolerate_type_mismatch: */ false,
         /* skip_initialize: */ false,
+        /* variant: */ SendVariant::Stret,
     )
 }
 
@@ -377,8 +404,13 @@ pub(crate) fn _touchHLE_objc_msgSend_stret_tolerant(
     selector: SEL,
 ) {
     objc_msgSend_inner(
-        env, receiver, selector, /* super2: */ None, /* tolerate_type_mismatch: */ true,
+        env,
+        receiver,
+        selector,
+        /* super2: */ None,
+        /* tolerate_type_mismatch: */ true,
         /* skip_initialize: */ false,
+        /* variant: */ SendVariant::Stret,
     )
 }
 
@@ -420,6 +452,7 @@ pub(super) fn objc_msgSendSuper2(
         /* super2: */ Some(class),
         /* tolerate_type_mismatch: */ false,
         /* skip_initialize: */ false,
+        /* variant: */ SendVariant::Super2,
     )
 }
 

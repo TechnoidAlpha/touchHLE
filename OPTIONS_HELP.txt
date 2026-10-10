@@ -228,6 +228,17 @@ Debugging options:
         data directory. Defaults to {user directory}/DUMP.txt. Note that this
         file will get truncated (deleted) if it already exists!
 
+    --trace-selectors=...
+        Writes one line to trace.log in the user data directory for every
+        Objective-C message sent with one of the listed selectors, for example
+        --trace-selectors=setPosition:,schedule:interval:. Each line has the
+        presented frame number, milliseconds since startup, thread, whether
+        the app or touchHLE sent it, receiver class, selector, the first two
+        argument words (as hex and as a float), four stack words and the link
+        register. Selectors can also be listed one per line in
+        trace_selectors.txt in the user data directory (# starts a comment);
+        the option and the file add up. trace.log is replaced on each run.
+
 Other options:
     --preferred-languages=...
         Specifies a list of preferred languages to be reported to the app.
