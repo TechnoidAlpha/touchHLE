@@ -31,6 +31,15 @@ These are stubs. Nothing talks to Game Center.
 - `GKAchievement` and `GKScore` accept a value and a report call and do nothing.
 - `+[GKLocalPlayer localPlayer]` returns an object, and `authenticateWithCompletionHandler:` does nothing.
 
+## Message trace
+
+`--trace-selectors=` takes a comma-separated list of Objective-C selectors, for example `--trace-selectors=schedule:interval:,setPosition:`. Every time the game (or touchHLE itself) sends one of those messages, one line goes into `trace.log`: the frame number, milliseconds since start, the thread, who sent it, the receiver's class, the selector, the first two arguments (as hex and as a float), four words from the stack and the return address. The first lines of the file say which touchHLE build, which app and which selectors. It is there to time things the decompile cannot, like how long a station takes to charge.
+
+You can also list selectors one per line in `trace_selectors.txt` next to the other touchHLE files (`#` starts a comment). The option and the file add up. With no selectors nothing is traced and nothing is written. `trace.log` is replaced each run.
+
+- **Windows:** `trace.log` is written in the folder you run `touchHLE.exe` from, next to `touchHLE_log.txt`.
+- **Android:** the command line is not available, so either put `trace_selectors.txt` in touchHLE's files folder, or add the option to the game's line in `touchHLE_options.txt`. `trace.log` lands in the same folder: `Android/data/org.touchhle.android.unofficial/files/` for a fork build (`adb pull /sdcard/Android/data/org.touchhle.android.unofficial/files/trace.log`).
+
 ## Builds
 
 The build workflow on this branch clones this fork instead of upstream and also runs on pushes here, so GitHub Actions builds the branch for Windows, macOS and Android. That is the only change to it.
