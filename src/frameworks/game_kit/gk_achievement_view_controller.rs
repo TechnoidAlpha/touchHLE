@@ -5,7 +5,7 @@
  */
 //! `GKAchievementViewController`.
 
-use crate::objc::{id, msg, nil, objc_classes, ClassExports, SEL};
+use crate::objc::{id, msg, objc_classes, ClassExports, SEL};
 
 pub const CLASSES: ClassExports = objc_classes! {
 
