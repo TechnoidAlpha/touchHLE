@@ -16,12 +16,14 @@ use std::io::Cursor;
 
 use plist::{to_writer_binary, Dictionary, Uid, Value};
 
+use crate::frameworks::core_graphics::CGPoint;
 use crate::frameworks::foundation::ns_keyed_unarchiver::NSKeyedArchiveRootObjectKey;
-use crate::frameworks::foundation::ns_string::{get_static_str, to_rust_string};
+use crate::frameworks::foundation::ns_string::{from_rust_string, get_static_str, to_rust_string};
 use crate::frameworks::foundation::NSUInteger;
 use crate::mem::{ConstPtr, GuestUSize};
 use crate::objc::{
-    id, msg, msg_class, nil, objc_classes, release, retain, ClassExports, HostObject, NSZonePtr,
+    autorelease, id, msg, msg_class, nil, objc_classes, release, retain, ClassExports, HostObject,
+    NSZonePtr,
 };
 use crate::Environment;
 
@@ -82,12 +84,59 @@ pub const CLASSES: ClassExports = objc_classes! {
     encode_object_for_key(env, this, object, key);
 }
 
+- (())encodeBool:(bool)val
+          forKey:(id)key {
+    let key = normalize_key(env, key);
+    let scope = get_value_to_encode_for_current_key(env, this);
+    scope.insert(key, Value::Boolean(val));
+}
+
 - (())encodeInt:(i32)val
          forKey:(id)key {
     let key = normalize_key(env, key);
     let scope = get_value_to_encode_for_current_key(env, this);
-    assert!(!scope.contains_key(&key));
     scope.insert(key, Value::Integer(val.into()));
+}
+
+- (())encodeInt32:(i32)val
+           forKey:(id)key {
+    let key = normalize_key(env, key);
+    let scope = get_value_to_encode_for_current_key(env, this);
+    scope.insert(key, Value::Integer(val.into()));
+}
+
+- (())encodeInt64:(i64)val
+           forKey:(id)key {
+    let key = normalize_key(env, key);
+    let scope = get_value_to_encode_for_current_key(env, this);
+    scope.insert(key, Value::Integer(val.into()));
+}
+
+- (())encodeFloat:(f32)val
+           forKey:(id)key {
+    let key = normalize_key(env, key);
+    let scope = get_value_to_encode_for_current_key(env, this);
+    scope.insert(key, Value::Real(val.into()));
+}
+
+- (())encodeDouble:(f64)val
+            forKey:(id)key {
+    let key = normalize_key(env, key);
+    let scope = get_value_to_encode_for_current_key(env, this);
+    scope.insert(key, Value::Real(val));
+}
+
+- (())encodeCGPoint:(CGPoint)point
+             forKey:(id)key { // NSString *
+    // Added for 4Towers. Autoreleased, not released: already_archived keys
+    // on the object address, so the string must outlive this archiving pass.
+    // CGPoint is a packed struct: copy the fields out before format! borrows
+    // them (E0793).
+    let (x, y) = (point.x, point.y);
+    let string = from_rust_string(env, format!("{{{}, {}}}", x, y));
+    let string = autorelease(env, string);
+    let key = normalize_key(env, key);
+    encode_object_for_key(env, this, string, key);
 }
 
 - (())encodeBytes:(ConstPtr<u8>)bytes
@@ -96,7 +145,6 @@ pub const CLASSES: ClassExports = objc_classes! {
     let key = normalize_key(env, key);
     let data = env.mem.bytes_at(bytes.cast(), length).to_vec();
     let scope = get_value_to_encode_for_current_key(env, this);
-    assert!(!scope.contains_key(&key));
     scope.insert(key, Value::Data(data));
 }
 
@@ -256,6 +304,5 @@ pub fn encode_object(env: &mut Environment, archiver: id, object: id) -> Uid {
 fn encode_object_for_key(env: &mut Environment, archiver: id, object: id, normalized_key: String) {
     let uid = encode_object(env, archiver, object);
     let scope = get_value_to_encode_for_current_key(env, archiver);
-    assert!(!scope.contains_key(&normalized_key));
     scope.insert(normalized_key, Value::Uid(uid));
 }

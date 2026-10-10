@@ -676,8 +676,30 @@ pub const CLASSES: ClassExports = objc_classes! {
         }
     }
     // TODO: runtime here is O(n^2), it could be O(n) instead
-    for i in to_remove {
+    for i in to_remove.into_iter().rev() {
         () = msg![env; this removeObjectAtIndex:i];
+    }
+}
+
+- (())removeObjectIdenticalTo:(id)object {
+    let mut to_remove = Vec::new();
+    let count: NSUInteger = msg![env; this count];
+    for i in 0..count {
+        let curr_object: id = msg![env; this objectAtIndex:i];
+        if curr_object == object {
+            to_remove.push(i);
+        }
+    }
+    for i in to_remove.into_iter().rev() {
+        () = msg![env; this removeObjectAtIndex:i];
+    }
+}
+
+- (())removeObjectsInArray:(id)other_array {
+    let other_count: NSUInteger = msg![env; other_array count];
+    for i in 0..other_count {
+        let obj: id = msg![env; other_array objectAtIndex:i];
+        () = msg![env; this removeObject:obj];
     }
 }
 
