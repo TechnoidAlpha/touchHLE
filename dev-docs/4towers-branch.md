@@ -31,6 +31,10 @@ These are stubs. Nothing talks to Game Center.
 - `GKAchievement` and `GKScore` accept a value and a report call and do nothing.
 - `+[GKLocalPlayer localPlayer]` returns an object, and `authenticateWithCompletionHandler:` does nothing.
 
+## Builds
+
+The build workflow on this branch clones this fork instead of upstream and also runs on pushes here, so GitHub Actions builds the branch for Windows, macOS and Android. That is the only change to it.
+
 ## Local tooling
 
-The last commit on the branch is test tooling for my Windows machine and is not needed to run the game: a frame dump to a `.ppm` file, touch injection from a `touch_cmd.txt` file, and a linker setting for the Windows GNU toolchain. Check out the commit before it for the fixes alone.
+My test tooling is kept off this branch, on `4towers-tooling`: a frame dump to a `.ppm` file, touch injection from a `touch_cmd.txt` file, and a linker setting for the Windows GNU toolchain. None of it is needed to run the game.
