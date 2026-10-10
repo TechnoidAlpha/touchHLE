@@ -11,6 +11,7 @@ Each item is something *4Towers: Onslaught* 1.01 (iOS 4.1, cocos2d) called that 
 - `-[NSNumber encodeWithCoder:]` for the long long, short, char, unsigned and float kinds.
 - `NSKeyedArchiver`: `encodeBool:forKey:`, `encodeInt32:forKey:`, `encodeInt64:forKey:`, `encodeFloat:forKey:`, `encodeDouble:forKey:` and `encodeCGPoint:forKey:`. Encoding the same key twice now overwrites instead of stopping the emulator.
 - `NSSet` and `NSMutableSet`: `copyWithZone:` and `mutableCopyWithZone:`.
+- `initWithDictionary:` with nil gives an empty dictionary instead of stopping the emulator (seen in `Game::addCreeps` on Android).
 - `NSObject`: `methodForSelector:`, `instanceMethodForSelector:` and `methodSignatureForSelector:`. `instanceMethodSignatureForSelector:` returns nil for a selector it does not know.
 
 ## AudioToolbox and CoreGraphics
