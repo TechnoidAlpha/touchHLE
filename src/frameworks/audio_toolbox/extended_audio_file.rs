@@ -10,9 +10,9 @@
 // TODO: Audio format conversion
 
 use super::audio_file::{
-    kAudioFileBadPropertySizeError, kAudioFilePropertyDataFormat, kAudioFileReadPermission,
-    property_size, AudioFileClose, AudioFileGetProperty, AudioFileID, AudioFileOpenURL,
-    AudioFileReadBytes,
+    kAudioFileBadPropertySizeError, kAudioFilePropertyAudioDataPacketCount,
+    kAudioFilePropertyDataFormat, kAudioFileReadPermission, property_size, AudioFileClose,
+    AudioFileGetProperty, AudioFileID, AudioFileOpenURL, AudioFileReadBytes,
 };
 use super::audio_queue::is_supported_audio_format;
 use super::audio_unit::AudioBufferList;
@@ -55,6 +55,7 @@ type ExtAudioFileRef = MutPtr<OpaqueExtAudioFile>;
 type ExtAudioFilePropertyID = u32;
 const kExtAudioFileProperty_FileDataFormat: ExtAudioFilePropertyID = fourcc(b"ffmt");
 const kExtAudioFileProperty_ClientDataFormat: ExtAudioFilePropertyID = fourcc(b"cfmt");
+const kExtAudioFileProperty_FileLengthFrames: ExtAudioFilePropertyID = fourcc(b"#frm");
 
 fn ExtAudioFileOpenURL(
     env: &mut Environment,
@@ -113,6 +114,7 @@ fn ExtAudioFileGetProperty(
 
     let audio_file_property_id = match in_property_id {
         kExtAudioFileProperty_FileDataFormat => kAudioFilePropertyDataFormat,
+        kExtAudioFileProperty_FileLengthFrames => kAudioFilePropertyAudioDataPacketCount,
         _ => unimplemented!(
             "Unimplemented property ID: {}",
             debug_fourcc(in_property_id)

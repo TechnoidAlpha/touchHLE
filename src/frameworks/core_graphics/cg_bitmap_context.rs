@@ -69,7 +69,11 @@ pub fn CGBitmapContextCreate(
         let data = env.mem.alloc(total_size);
         (data, true, bytes_per_row)
     } else {
-        assert!(bytes_per_row != 0);
+        let bytes_per_row = if bytes_per_row == 0 {
+            width.checked_mul(component_count).unwrap()
+        } else {
+            bytes_per_row
+        };
         (data, false, bytes_per_row)
     };
 
