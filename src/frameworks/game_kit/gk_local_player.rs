@@ -16,8 +16,14 @@ pub const CLASSES: ClassExports = objc_classes! {
 @implementation GKLocalPlayer: NSObject
 
 + (id)localPlayer {
-    // TODO
-    nil
+    let instance: id = msg![env; this new];
+    instance
+}
+
++ (())authenticateWithCompletionHandler:(id)_handler {
+}
+
+- (())authenticateWithCompletionHandler:(id)_handler {
 }
 
 @end

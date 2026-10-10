@@ -53,6 +53,11 @@ pub const CLASSES: ClassExports = objc_classes! {
     env.objc.alloc_object(this, host_object, &mut env.mem)
 }
 
+- (id)init {
+    () = msg![env; this initWithNibName:nil bundle:nil];
+    this
+}
+
 // TODO: this should be a designated initializer
 - (id)initWithNibName:(id)nib_name // NSString *
                bundle:(id)bundle { // NSBundle *
@@ -189,6 +194,10 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 - (())setModalTransitionStyle:(UIModalTransitionStyle)style {
     todo_objc_setter!(this, style);
+}
+
+- (())presentModalViewController:(id)modal_vc animated:(bool)animated {
+    log!("TODO: [(UIViewController*){:?} presentModalViewController:{:?} animated:{}]", this, modal_vc, animated);
 }
 
 - (())dismissModalViewControllerAnimated:(bool)animated {

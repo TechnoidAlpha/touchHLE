@@ -14,8 +14,13 @@ pub const CLASSES: ClassExports = objc_classes! {
 @implementation GKScore: NSObject
 
 - (id)initWithCategory:(id)_category { // NSString *
-    // TODO
-    nil
+    this
+}
+
+- (())setValue:(i64)_value {
+}
+
+- (())reportScoreWithCompletionHandler:(id)_handler {
 }
 
 @end
