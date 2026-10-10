@@ -34,7 +34,3 @@ These are stubs. Nothing talks to Game Center.
 ## Builds
 
 The build workflow on this branch clones this fork instead of upstream and also runs on pushes here, so GitHub Actions builds the branch for Windows, macOS and Android. That is the only change to it.
-
-## Local tooling
-
-My test tooling is kept off this branch, on `4towers-tooling`: a frame dump to a `.ppm` file, touch injection from a `touch_cmd.txt` file, and a linker setting for the Windows GNU toolchain. None of it is needed to run the game.
