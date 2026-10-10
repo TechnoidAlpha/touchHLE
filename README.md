@@ -1,3 +1,11 @@
+> **This is a personal fork, on the `4towers` branch.**
+>
+> It carries a handful of extra framework stubs and fixes I needed to get one iOS 4.1 game, *4Towers: Onslaught*, running from my own copy. `trunk` here is the unmodified upstream.
+>
+> **The changes on this branch were written with AI assistance.** touchHLE [does not accept AI-assisted code](CONTRIBUTING.md#copyright-and-reverse-engineering), so none of this has been or will be submitted upstream, and it should not be copied into a contribution there. The touchHLE developers have not reviewed it and are not responsible for it. For the real project, go to <https://github.com/touchHLE/touchHLE>.
+>
+> What the branch adds is listed in [`dev-docs/4towers-branch.md`](dev-docs/4towers-branch.md).
+
 # touchHLE: high-level emulator for early iOS apps
 
 **touchHLE** is a high-level emulator for early iOS apps. It runs on modern desktop operating systems and Android, and is written in Rust.
