@@ -7,6 +7,7 @@
 
 use super::ui_device::*;
 use crate::dyld::{export_c_func, ConstantExports, FunctionExports, HostConstant};
+use crate::frameworks::core_graphics::{CGPoint, CGRect, CGSize};
 use crate::frameworks::foundation::ns_string::{from_rust_string, get_static_str};
 use crate::frameworks::foundation::{ns_array, ns_string, NSInteger, NSUInteger};
 use crate::mem::MutPtr;
@@ -117,6 +118,37 @@ pub const CLASSES: ClassExports = objc_classes! {
                animated:(bool)_animated {
     // TODO: animation
     msg![env; this setStatusBarStyle:style]
+}
+
+- (UIStatusBarStyle)statusBarStyle {
+    0
+}
+
+- (CGRect)statusBarFrame {
+    if env.framework_state.uikit.ui_application.status_bar_hidden {
+        CGRect {
+            origin: CGPoint { x: 0.0, y: 0.0 },
+            size: CGSize { width: 0.0, height: 0.0 },
+        }
+    } else {
+        let (width, height) = env.window().device_family().portrait_size();
+        let orientation: UIInterfaceOrientation = msg![env; this statusBarOrientation];
+        const STATUS_BAR_HEIGHT: f32 = 20.0;
+        match orientation {
+            UIDeviceOrientationPortrait | UIDeviceOrientationPortraitUpsideDown => CGRect {
+                origin: CGPoint { x: 0.0, y: 0.0 },
+                size: CGSize { width: width as f32, height: STATUS_BAR_HEIGHT },
+            },
+            UIDeviceOrientationLandscapeLeft | UIDeviceOrientationLandscapeRight => CGRect {
+                origin: CGPoint { x: 0.0, y: 0.0 },
+                size: CGSize { width: STATUS_BAR_HEIGHT, height: height as f32 },
+            },
+            _ => CGRect {
+                origin: CGPoint { x: 0.0, y: 0.0 },
+                size: CGSize { width: width as f32, height: STATUS_BAR_HEIGHT },
+            },
+        }
+    }
 }
 
 - (UIInterfaceOrientation)statusBarOrientation {

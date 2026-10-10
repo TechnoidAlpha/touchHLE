@@ -1094,7 +1094,7 @@ pub(super) fn class_replaceMethod(
     existing
 }
 
-pub(super) fn class_getMethodImplementation(env: &mut Environment, cls: Class, name: SEL) -> IMP {
+pub fn class_getMethodImplementation(env: &mut Environment, cls: Class, name: SEL) -> IMP {
     if cls == nil {
         return IMP::guest_null();
     }

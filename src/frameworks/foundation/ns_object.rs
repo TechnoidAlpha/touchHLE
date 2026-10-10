@@ -21,8 +21,9 @@ use crate::frameworks::foundation::ns_thread::detach_new_thread_inner;
 use crate::libc::semaphore::{host_destroy_semaphore, sem_wait};
 use crate::mem::MutVoidPtr;
 use crate::objc::{
-    autorelease, id, msg, msg_class, msg_send, msg_send_no_type_checking, nil, objc_classes,
-    retain, Class, ClassExports, NSZonePtr, ObjC, TrivialHostObject, SEL,
+    autorelease, class_getMethodImplementation, id, msg, msg_class, msg_send,
+    msg_send_no_type_checking, nil, objc_classes, retain, Class, ClassExports, NSZonePtr, ObjC,
+    TrivialHostObject, IMP, SEL,
 };
 
 pub const CLASSES: ClassExports = objc_classes! {
@@ -66,6 +67,10 @@ pub const CLASSES: ClassExports = objc_classes! {
     env.objc.class_has_method(this, selector)
 }
 
++ (IMP)instanceMethodForSelector:(SEL)selector {
+    class_getMethodImplementation(env, this, selector)
+}
+
 + (())cancelPreviousPerformRequestsWithTarget:(id)target selector:(SEL)selector object:(id)arg {
     let run_loop: id = msg_class![env; NSRunLoop currentRunLoop];
     cancel_perform_requests(env, run_loop, target, selector, arg);
@@ -87,9 +92,13 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 + (id)instanceMethodSignatureForSelector:(SEL)sel {
     // TODO: support `host` method signatures
-    let sig = *env.objc.class_get_method_signature(this, sel).unwrap();
-    log_dbg!("instanceMethodSignatureForSelector: '{}' -> {:?}", sel.as_str(&env.mem), env.mem.cstr_at_utf8(sig));
-    msg_class![env; NSMethodSignature signatureWithObjCTypes:sig]
+    if let Some(&sig) = env.objc.class_get_method_signature(this, sel) {
+        log_dbg!("instanceMethodSignatureForSelector: '{}' -> {:?}", sel.as_str(&env.mem), env.mem.cstr_at_utf8(sig));
+        msg_class![env; NSMethodSignature signatureWithObjCTypes:sig]
+    } else {
+        log_dbg!("instanceMethodSignatureForSelector: '{}' not found", sel.as_str(&env.mem));
+        nil
+    }
 }
 
 + (())initialize {
@@ -250,6 +259,16 @@ forUndefinedKey:(id)key { // NSString*
 
 - (bool)respondsToSelector:(SEL)selector {
     env.objc.object_has_method(&env.mem, this, selector)
+}
+
+- (IMP)methodForSelector:(SEL)selector {
+    let class: Class = ObjC::read_isa(this, &env.mem);
+    class_getMethodImplementation(env, class, selector)
+}
+
+- (id)methodSignatureForSelector:(SEL)sel {
+    let class: Class = ObjC::read_isa(this, &env.mem);
+    msg![env; class instanceMethodSignatureForSelector:sel]
 }
 
 - (id)performSelector:(SEL)sel {
