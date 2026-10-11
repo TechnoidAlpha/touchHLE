@@ -5,6 +5,7 @@
  */
 //! The Audio Toolbox framework.
 
+use crate::audio::openal::alc_types::ALCdevice;
 use crate::audio::openal::{OpenAL, OpenALContext, OpenALManager};
 
 /// Macro for checking if an argument is null and returning `paramErr` if so.
@@ -63,6 +64,14 @@ impl State {
         manager: &'manager mut OpenALManager,
     ) -> OpenAL<'s> {
         self.al_context.make_al_context_current(manager)
+    }
+
+    /// The OpenAL device of the internal context, if it has been made.
+    pub fn al_device(&self) -> Option<*mut ALCdevice> {
+        self.al_context
+            .0
+            .as_ref()
+            .map(|ctx| ctx.GetContextsDevice())
     }
 }
 

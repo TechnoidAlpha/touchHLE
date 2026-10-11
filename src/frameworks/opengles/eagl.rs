@@ -268,6 +268,19 @@ pub const CLASSES: ClassExports = objc_classes! {
     // delayed, so this needs to be checked before returning.
     let sleep_for = limit_framerate(&mut env.objc.borrow_mut::<EAGLContextHostObject>(this).next_frame_due, &env.options);
 
+    // Nothing is presented while touchHLE is in the background (Home on
+    // Android, F9 on a computer): on Android the window's surface is gone.
+    // An app is not meant to draw then (4Towers stops its display link).
+    if env.window.as_ref().is_some_and(|window| window.is_backgrounded()) {
+        if env.window.as_mut().is_some_and(|window| window.note_skipped_present()) {
+            log!("Lifecycle: a frame presented in the background is not shown.");
+        }
+        if let Some(sleep_for) = sleep_for {
+            env.sleep(sleep_for);
+        }
+        return true;
+    }
+
     if env.options.print_fps {
         env
             .objc

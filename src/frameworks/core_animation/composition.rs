@@ -63,6 +63,16 @@ unsafe fn load_matrix(gles: &mut dyn GLES, matrix: Matrix<4>) {
 ///
 /// Returns the time a recomposite is due, if any.
 pub fn recomposite_if_necessary(env: &mut Environment, force: bool) -> Option<Instant> {
+    // Nothing is presented while touchHLE is in the background: on Android
+    // the window's surface is gone (see Window::is_backgrounded).
+    if env
+        .window
+        .as_ref()
+        .is_some_and(|window| window.is_backgrounded())
+    {
+        return None;
+    }
+
     let mut animation_state = animation::State::default();
     let windows = env.framework_state.uikit.ui_view.ui_window.windows.clone();
     if !windows.iter().any(|&window| !msg![env; window isHidden]) {

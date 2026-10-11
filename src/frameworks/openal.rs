@@ -46,6 +46,8 @@ pub struct State {
     warned_mixer_get_rate: bool,
     warned_mixer_output_rate_proc: bool,
     warned_invalid_host_devices: HashSet<*mut ALCdevice>,
+    /// Set while the app is in the background (see [set_devices_paused]).
+    devices_paused: bool,
 }
 impl State {
     fn get(env: &mut Environment) -> &mut Self {
@@ -113,6 +115,32 @@ macro_rules! try_get_context {
     };
 }
 
+/// Pause or resume every OpenAL device touchHLE has open: the ones the app
+/// opened with `alcOpenDevice`, and the one behind Audio Toolbox (which
+/// `AVAudioPlayer`, audio queues, audio units and system sounds play
+/// through). Used when the app goes to the background and comes back, so
+/// nothing keeps playing on the host while the app is away. Mixing stops,
+/// and sources carry on where they were on resume.
+pub fn set_devices_paused(env: &mut Environment, paused: bool) {
+    let state = State::get(env);
+    if state.devices_paused == paused {
+        return;
+    }
+    state.devices_paused = paused;
+    let mut devices: Vec<*mut ALCdevice> = state.devices.values().copied().collect();
+    if let Some(device) = env.framework_state.audio_toolbox.al_device() {
+        devices.push(device);
+    }
+    log!(
+        "Lifecycle: {} {} OpenAL device(s).",
+        if paused { "pausing" } else { "resuming" },
+        devices.len()
+    );
+    for device in devices {
+        unsafe { al::set_device_paused(device, paused) };
+    }
+}
+
 // === alc.h ===
 
 fn alcOpenDevice(env: &mut Environment, devicename: ConstPtr<u8>) -> MutPtr<GuestALCdevice> {
@@ -138,6 +166,11 @@ fn alcOpenDevice(env: &mut Environment, devicename: ConstPtr<u8>) -> MutPtr<Gues
     if res.is_null() {
         log_dbg!("alcOpenDevice(NULL) returned NULL");
         return Ptr::null();
+    }
+
+    if State::get(env).devices_paused {
+        // Opened in the background: it stays quiet until the app is back.
+        unsafe { al::set_device_paused(res, true) };
     }
 
     let guest_res = env.mem.alloc_and_write(GuestALCdevice { _filler: 0 });

@@ -17,6 +17,67 @@ pub use al_sys::{alcCloseDevice, alcGetError, alcGetString, alcOpenDevice};
 
 use al_types::*;
 
+/// `alcDevicePauseSOFT` or `alcDeviceResumeSOFT`.
+type DevicePauseFn = unsafe extern "C" fn(*mut ALCdevice);
+
+/// `alcDevicePauseSOFT` and `alcDeviceResumeSOFT` (the `ALC_SOFT_pause_device`
+/// extension), looked up once. [None] if the OpenAL in use does not have them.
+static DEVICE_PAUSE_FNS: std::sync::OnceLock<Option<(DevicePauseFn, DevicePauseFn)>> =
+    std::sync::OnceLock::new();
+
+fn device_pause_fns() -> Option<(DevicePauseFn, DevicePauseFn)> {
+    *DEVICE_PAUSE_FNS.get_or_init(|| {
+        let lookup = |name: &[u8]| unsafe {
+            al_sys::alcGetProcAddress(std::ptr::null_mut(), name.as_ptr().cast())
+        };
+        let pause = lookup(b"alcDevicePauseSOFT\0");
+        let resume = lookup(b"alcDeviceResumeSOFT\0");
+        if pause.is_null() || resume.is_null() {
+            log!("OpenAL has no ALC_SOFT_pause_device: audio is not paused in the background.");
+            return None;
+        }
+        // SAFETY: both names are functions of that signature in
+        // ALC_SOFT_pause_device, and alcGetProcAddress returned them for it.
+        unsafe {
+            Some((
+                std::mem::transmute::<*mut std::ffi::c_void, DevicePauseFn>(pause),
+                std::mem::transmute::<*mut std::ffi::c_void, DevicePauseFn>(resume),
+            ))
+        }
+    })
+}
+
+/// Pause (stop mixing and stop the host's audio output) or resume a playback
+/// device, with `ALC_SOFT_pause_device`. Sources keep their state and carry
+/// on where they were when the device resumes. Does nothing (and logs once)
+/// if the OpenAL in use does not have the extension.
+///
+/// # Safety
+/// `device` must be an open device.
+pub unsafe fn set_device_paused(device: *mut ALCdevice, paused: bool) {
+    let Some((pause, resume)) = device_pause_fns() else {
+        return;
+    };
+    if paused {
+        pause(device);
+    } else {
+        resume(device);
+    }
+    let error = al_sys::alcGetError(device);
+    if error != 0 {
+        log!(
+            "alc{}SOFT({:?}) failed: {:#x}",
+            if paused {
+                "DevicePause"
+            } else {
+                "DeviceResume"
+            },
+            device,
+            error
+        );
+    }
+}
+
 static OPENALMANAGER_INSTANCE_EXISTS: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 pub struct OpenALManager {}

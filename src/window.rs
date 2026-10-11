@@ -154,6 +154,15 @@ pub enum Event {
     /// OS has informed touchHLE it will soon become inactive.
     /// (iOS `applicationWillResignActive:`, Android `onPause()`)
     AppWillResignActive,
+    /// OS has sent touchHLE to the background.
+    /// (iOS `applicationDidEnterBackground:`, Android `onPause()`)
+    AppDidEnterBackground,
+    /// OS is bringing touchHLE back from the background.
+    /// (iOS `applicationWillEnterForeground:`, Android `onResume()`)
+    AppWillEnterForeground,
+    /// OS has made touchHLE active again.
+    /// (iOS `applicationDidBecomeActive:`, Android `onResume()`)
+    AppDidBecomeActive,
     /// OS has informed touchHLE it will soon terminate.
     /// (iOS `applicationWillTerminate:`, Android `onDestroy()`)
     AppWillTerminate,
@@ -217,10 +226,16 @@ pub struct Window {
     event_pump: sdl2::EventPump,
     event_queue: VecDeque<Event>,
     last_polled: Instant,
-    /// Separate queue for extremely high-priority events (e.g. app about to
-    /// terminate).
-    high_priority_event: Option<Event>,
-    enable_event_polling: bool,
+    /// Separate queue for app lifecycle events (going to the background and
+    /// back, termination), which are handed out before any other event. SDL
+    /// sends them in pairs on Android, so this is a queue, not one slot.
+    lifecycle_events: VecDeque<Event>,
+    /// Set when the host sends touchHLE to the background, cleared when it
+    /// brings it back. While set, nothing is presented: on Android the
+    /// window's surface is destroyed and the GL context is not current.
+    backgrounded: bool,
+    /// Presents skipped while backgrounded, logged when it comes back.
+    presents_skipped: u32,
     #[cfg(target_os = "macos")]
     max_height: u32,
     #[cfg(target_os = "macos")]
@@ -370,8 +385,9 @@ impl Window {
             event_pump,
             event_queue: VecDeque::new(),
             last_polled: Instant::now() - Duration::from_secs(1),
-            high_priority_event: None,
-            enable_event_polling: true,
+            lifecycle_events: VecDeque::new(),
+            backgrounded: false,
+            presents_skipped: 0,
             #[cfg(target_os = "macos")]
             max_height,
             #[cfg(target_os = "macos")]
@@ -495,7 +511,7 @@ impl Window {
         // so, we keep track of an unconsumed one from a previous loop iteration
         // FIXME: use peek_event() from even_subsystem
         let mut previous_event: Option<sdl2::event::Event> = None;
-        while self.enable_event_polling {
+        loop {
             use sdl2::event::Event as E;
             let event = if let Some(e) = previous_event.take() {
                 match e {
@@ -712,22 +728,61 @@ impl Window {
                         continue;
                     }
                 }
+                // On Android (with SDL_ANDROID_BLOCK_ON_PAUSE=0) SDL sends
+                // WILLENTERBACKGROUND and DIDENTERBACKGROUND together when
+                // the activity pauses, and WILLENTERFOREGROUND and
+                // DIDENTERFOREGROUND together when it resumes. Polling must
+                // go on: SDL only lets go of the window's surface once the
+                // app has taken DIDENTERBACKGROUND off its queue. See
+                // dev-docs/4towers-branch.md, "Home and back".
                 E::AppWillEnterBackground { .. } => {
-                    log!("Received app-will-resign-active event.");
-                    assert!(self.high_priority_event.is_none());
-                    self.high_priority_event = Some(Event::AppWillResignActive);
-                    // For some reason, if we don't pause event polling, we will
-                    // never finish handling the event.
-                    // TODO: Add a mechanism for re-enabling polling, if at some
-                    // point we support returning touchHLE to the foreground.
-                    self.enable_event_polling = false;
+                    self.queue_lifecycle_event(Event::AppWillResignActive);
+                    continue;
+                }
+                E::AppDidEnterBackground { .. } => {
+                    self.queue_lifecycle_event(Event::AppDidEnterBackground);
+                    continue;
+                }
+                E::AppWillEnterForeground { .. } => {
+                    self.queue_lifecycle_event(Event::AppWillEnterForeground);
+                    continue;
+                }
+                E::AppDidEnterForeground { .. } => {
+                    self.queue_lifecycle_event(Event::AppDidBecomeActive);
                     continue;
                 }
                 E::AppTerminating { .. } => {
-                    log!("Received app-will-terminate event.");
-                    assert!(self.high_priority_event.is_none());
-                    self.high_priority_event = Some(Event::AppWillTerminate);
-                    self.enable_event_polling = false;
+                    self.queue_lifecycle_event(Event::AppWillTerminate);
+                    continue;
+                }
+                // Desktop SDL never sends the four events above, so F9 and
+                // F10 stand in for Home and for coming back, for testing.
+                E::KeyDown {
+                    keycode: Some(sdl2::keyboard::Keycode::F9),
+                    repeat: false,
+                    ..
+                } => {
+                    if self.backgrounded {
+                        echo!("F9 pressed, already in the background.");
+                    } else {
+                        echo!("F9 pressed, simulating going to the background.");
+                        self.queue_lifecycle_event(Event::AppWillResignActive);
+                        self.queue_lifecycle_event(Event::AppDidEnterBackground);
+                    }
+                    continue;
+                }
+                E::KeyDown {
+                    keycode: Some(sdl2::keyboard::Keycode::F10),
+                    repeat: false,
+                    ..
+                } => {
+                    if self.backgrounded {
+                        echo!("F10 pressed, simulating coming back.");
+                        self.queue_lifecycle_event(Event::AppWillEnterForeground);
+                        self.queue_lifecycle_event(Event::AppDidBecomeActive);
+                    } else {
+                        echo!("F10 pressed, not in the background.");
+                    }
                     continue;
                 }
                 E::FingerUp {
@@ -868,12 +923,51 @@ impl Window {
         }
     }
 
-    /// Pop an event from the queue (in FIFO order, except for high priority
-    /// events)
+    /// Pop an event from the queue (in FIFO order, except that lifecycle
+    /// events come before all others)
     pub fn pop_event(&mut self) -> Option<Event> {
-        self.high_priority_event
-            .take()
+        self.lifecycle_events
+            .pop_front()
             .or_else(|| self.event_queue.pop_front())
+    }
+
+    /// Queue a lifecycle event and keep track of whether touchHLE is in the
+    /// background: from the moment the background event is queued until the
+    /// foreground one is, nothing is presented (see [Self::is_backgrounded]).
+    fn queue_lifecycle_event(&mut self, event: Event) {
+        log!("Lifecycle: received {:?}.", event);
+        match event {
+            Event::AppDidEnterBackground => {
+                self.backgrounded = true;
+                self.presents_skipped = 0;
+            }
+            Event::AppWillEnterForeground => {
+                if self.presents_skipped > 0 {
+                    log!(
+                        "Lifecycle: {} present(s) skipped in the background.",
+                        self.presents_skipped
+                    );
+                }
+                self.backgrounded = false;
+            }
+            _ => (),
+        }
+        self.lifecycle_events.push_back(event);
+    }
+
+    /// Whether the host has sent touchHLE to the background. While it is, the
+    /// window must not be drawn to or swapped: on Android, SDL destroys the
+    /// window's EGL surface and leaves no GL context current.
+    pub fn is_backgrounded(&self) -> bool {
+        self.backgrounded
+    }
+
+    /// Count a present skipped because touchHLE is in the background.
+    /// Returns [true] the first time on each trip, so the caller can log it
+    /// once.
+    pub fn note_skipped_present(&mut self) -> bool {
+        self.presents_skipped += 1;
+        self.presents_skipped == 1
     }
 
     fn controller_added(&mut self, joystick_idx: u32) {
@@ -1264,8 +1358,11 @@ impl Window {
     }
 
     /// Swap front-buffer and back-buffer so the result of OpenGL rendering is
-    /// presented.
+    /// presented. Does nothing while touchHLE is in the background.
     pub fn swap_window(&self) {
+        if self.backgrounded {
+            return;
+        }
         self.window.gl_swap_window();
     }
 

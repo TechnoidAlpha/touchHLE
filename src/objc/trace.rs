@@ -1093,14 +1093,47 @@ fn read_peek(objc: &ObjC, mem: &Mem, peek: &mut Peek, words: [u32; 3]) -> Result
     Ok(peek::fmt_peek_value(spec.ty, word, class.as_deref()))
 }
 
-/// One `trace.log` row for a line the app printed with `NSLog`: the frame,
-/// ms and thread as for any row, origin `nslog`, `-` for the variant and the
-/// class, the message in the selector column with each tab, carriage return
-/// and newline turned into a space, and `-` in the ten columns after it.
-fn nslog_row(frame: u32, ms: f64, thread: usize, message: &str) -> String {
-    let message = message.replace(['\t', '\r', '\n'], " ");
+/// One `trace.log` row of text rather than a call: the frame, ms and thread
+/// as for any row, `origin`, `-` for the variant and the class, the text in
+/// the selector column with each tab, carriage return and newline turned
+/// into a space, and `-` in the ten columns after it.
+fn text_row(frame: u32, ms: f64, thread: usize, origin: &str, text: &str) -> String {
+    let text = text.replace(['\t', '\r', '\n'], " ");
     let rest = ["-"; 10].join("\t");
-    format!("{frame}\t{ms:.3}\t{thread}\tnslog\t-\t-\t{message}\t{rest}\n")
+    format!("{frame}\t{ms:.3}\t{thread}\t{origin}\t-\t-\t{text}\t{rest}\n")
+}
+
+/// The row for a line the app printed with `NSLog`: origin `nslog`.
+fn nslog_row(frame: u32, ms: f64, thread: usize, message: &str) -> String {
+    text_row(frame, ms, thread, "nslog", message)
+}
+
+/// The row for an app lifecycle step: origin `lifecycle`, and
+/// `lifecycle: <step>` in the selector column.
+fn lifecycle_row(frame: u32, ms: f64, thread: usize, step: &str) -> String {
+    text_row(
+        frame,
+        ms,
+        thread,
+        "lifecycle",
+        &format!("lifecycle: {step}"),
+    )
+}
+
+/// Called by UIKit at each app lifecycle step it tells the app about
+/// (`resign active`, `background`, `foreground`, `active`, `terminate`).
+/// When the trace is on, the step goes into `trace.log` as a row with origin
+/// `lifecycle` (see [lifecycle_row]), whether or not the delegate's methods
+/// are traced selectors, so a trace shows where the app went to the
+/// background and came back.
+pub fn trace_lifecycle(env: &mut Environment, step: &str) {
+    let elapsed_ms = env.startup_time.elapsed().as_secs_f64() * 1000.0;
+    let thread = env.current_thread;
+    let Some(trace) = env.objc.trace.as_mut() else {
+        return;
+    };
+    let row = lifecycle_row(trace.frame, elapsed_ms, thread, step);
+    let _ = trace.out.write_all(row.as_bytes());
 }
 
 /// Called by `NSLog` with each line it prints (after the
@@ -1260,8 +1293,9 @@ fn fmt_f32(bits: u32) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        capture_due, class_chain_names, nslog_row, parse_selector_line, returns_struct, touch_row,
-        Class, ClassHostObject, Filter, Markers, ObjC, Ptr, Traced, TrampolineCache,
+        capture_due, class_chain_names, lifecycle_row, nslog_row, parse_selector_line,
+        returns_struct, touch_row, Class, ClassHostObject, Filter, Markers, ObjC, Ptr, Traced,
+        TrampolineCache,
     };
     use crate::objc::classes::InitializationStatus;
     use crate::objc::{nil, TrivialHostObject};
@@ -1277,6 +1311,17 @@ mod tests {
              -\t-\t-\t-\t-\t-\t-\t-\t-\t-\n"
         );
         // As many columns as the header names.
+        assert_eq!(row.trim_end_matches('\n').split('\t').count(), 17);
+    }
+
+    #[test]
+    fn lifecycle_rows_fill_every_column() {
+        let row = lifecycle_row(120, 45678.25, 0, "background");
+        assert_eq!(
+            row,
+            "120\t45678.250\t0\tlifecycle\t-\t-\tlifecycle: background\t\
+             -\t-\t-\t-\t-\t-\t-\t-\t-\t-\n"
+        );
         assert_eq!(row.trim_end_matches('\n').split('\t').count(), 17);
     }
 

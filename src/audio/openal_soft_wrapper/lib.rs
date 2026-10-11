@@ -84,6 +84,11 @@ extern "C" {
     pub fn alcGetError(device: *mut ALCdevice) -> ALCenum;
 
     pub fn alcGetString(device: *mut ALCdevice, param: ALCenum) -> *const ALCchar;
+
+    pub fn alcGetProcAddress(
+        device: *mut ALCdevice,
+        funcname: *const ALCchar,
+    ) -> *mut std::ffi::c_void;
 }
 
 // === al.h ===

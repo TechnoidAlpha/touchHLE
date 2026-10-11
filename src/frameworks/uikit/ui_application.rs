@@ -12,8 +12,8 @@ use crate::frameworks::foundation::ns_string::{from_rust_string, get_static_str}
 use crate::frameworks::foundation::{ns_array, ns_string, NSInteger, NSUInteger};
 use crate::mem::MutPtr;
 use crate::objc::{
-    autorelease, id, msg, msg_class, nil, objc_classes, release, retain, todo_objc_setter,
-    ClassExports, HostObject, NSZonePtr,
+    autorelease, id, msg, msg_class, msg_send, nil, objc_classes, release, retain,
+    todo_objc_setter, ClassExports, HostObject, NSZonePtr,
 };
 use crate::window::DeviceOrientation;
 use crate::Environment;
@@ -23,6 +23,17 @@ pub struct State {
     /// [UIApplication sharedApplication]
     shared_application: Option<id>,
     pub(super) status_bar_hidden: bool,
+    /// `applicationWillResignActive:` has been sent, and
+    /// `applicationDidBecomeActive:` not since.
+    resigned: bool,
+    /// `applicationDidEnterBackground:` has been sent, and
+    /// `applicationWillEnterForeground:` not since.
+    in_background: bool,
+}
+impl State {
+    fn get(env: &mut Environment) -> &mut Self {
+        &mut env.framework_state.uikit.ui_application
+    }
 }
 
 struct UIApplicationHostObject {
@@ -464,89 +475,161 @@ pub(super) fn UIApplicationMain(
     let _: () = msg![env; run_loop run];
 }
 
-/// Tell the app it's about to quit and then exit.
-///
-/// The app is told what an iPhone OS 4 app with multitasking is told when
-/// the Home button sends it to the background:
-/// `applicationWillResignActive:`, then `applicationDidEnterBackground:`
-/// (if the delegate has it), and then, as the suspended app is never
-/// resumed, `applicationWillTerminate:`. Each runs to completion before the
-/// next (`msg!` runs the guest method until it returns), so whatever the
-/// app saves in them, for example with `-[NSUserDefaults synchronize]`, is
-/// written to the sandbox before touchHLE exits. The defaults are also
-/// synchronized once more at the end, for an app that changes them in these
-/// methods without synchronizing.
-pub(super) fn exit(env: &mut Environment) {
+/// Send one of the delegate's life-cycle methods (which take the
+/// application) if the delegate has it, then post the matching
+/// notification, in an autorelease pool of its own. The method runs to the
+/// end (`msg_send` runs the guest method until it returns) before this does.
+fn tell_app(env: &mut Environment, selector: &str, notification: &'static str) {
     let ui_application: id = msg_class![env; UIApplication sharedApplication];
+    let pool: id = msg_class![env; NSAutoreleasePool new];
+
+    let delegate: id = msg![env; ui_application delegate];
+    let has_method = env
+        .objc
+        .object_has_method_named(&env.mem, delegate, selector);
+    if let Some(sel) = env.objc.lookup_selector(selector).filter(|_| has_method) {
+        log!("Lifecycle: sending {} to the app delegate.", selector);
+        () = msg_send(env, (delegate, sel, ui_application));
+    }
 
     let center: id = msg_class![env; NSNotificationCenter defaultCenter];
+    let notif_name = get_static_str(env, notification);
+    () = msg![env; center postNotificationName:notif_name object:ui_application userInfo:nil];
 
-    {
-        let pool: id = msg_class![env; NSAutoreleasePool new];
+    let _: () = msg![env; pool drain];
+}
 
-        // Skip NSUserDefaults code while in the app picker, otherwise we get
-        // a strange error when existing touchHLE due to the fake bundle.
-        if !env.is_app_picker {
-            // Apple's docs (used to) vaguely mention that `synchronize` is
-            // invoked on periodic intervals.
-            // Second best - and implemented here - is to save before app exits.
-            // TODO: call `synchronize` periodically
-            let user_defaults: id = msg_class![env; NSUserDefaults standardUserDefaults];
-            let _: bool = msg![env; user_defaults synchronize];
-        }
+/// Write the app's `NSUserDefaults` to the sandbox.
+fn synchronize_user_defaults(env: &mut Environment) {
+    // Skip NSUserDefaults code while in the app picker, otherwise we get
+    // a strange error when existing touchHLE due to the fake bundle.
+    if env.is_app_picker {
+        return;
+    }
+    let pool: id = msg_class![env; NSAutoreleasePool new];
+    let user_defaults: id = msg_class![env; NSUserDefaults standardUserDefaults];
+    let _: bool = msg![env; user_defaults synchronize];
+    let _: () = msg![env; pool drain];
+}
 
-        let delegate: id = msg![env; ui_application delegate];
-        if env
-            .objc
-            .object_has_method_named(&env.mem, delegate, "applicationWillResignActive:")
-        {
-            () = msg![env; delegate applicationWillResignActive:ui_application];
-        }
+// Home and back. iPhone OS 4 tells an app with multitasking (one whose
+// Info.plist has no UIApplicationExitsOnSuspend) the following, and the app
+// stays in memory in between:
+// - Home: applicationWillResignActive:, then applicationDidEnterBackground:
+// - back: applicationWillEnterForeground:, then applicationDidBecomeActive:
+// touchHLE gets these from the host (Android's onPause and onResume through
+// SDL, or F9 and F10 on a computer), see crate::window::Event. Each message
+// is sent once per trip: one that would repeat the last is ignored, and one
+// that skips a step sends the step first.
 
-        let notif_name = get_static_str(env, UIApplicationWillResignActiveNotification);
-        () = msg![env; center postNotificationName:notif_name object:ui_application userInfo:nil];
+/// The app is about to become inactive (the first half of Home).
+pub(super) fn will_resign_active(env: &mut Environment) {
+    if State::get(env).resigned {
+        log!("Lifecycle: already inactive, ignoring.");
+        return;
+    }
+    State::get(env).resigned = true;
+    crate::objc::trace_lifecycle(env, "resign active");
+    tell_app(
+        env,
+        "applicationWillResignActive:",
+        UIApplicationWillResignActiveNotification,
+    );
+}
 
-        let _: () = msg![env; pool drain];
-    };
+/// The app is now in the background (the second half of Home). It stays
+/// alive: touchHLE keeps running it, but presents nothing (see
+/// [crate::window::Window::is_backgrounded]) and pauses its audio.
+pub(super) fn did_enter_background(env: &mut Environment) {
+    if State::get(env).in_background {
+        log!("Lifecycle: already in the background, ignoring.");
+        return;
+    }
+    if !State::get(env).resigned {
+        will_resign_active(env);
+    }
+    State::get(env).in_background = true;
+    crate::objc::trace_lifecycle(env, "background");
+    // 4Towers saves the level being played only here.
+    tell_app(
+        env,
+        "applicationDidEnterBackground:",
+        UIApplicationDidEnterBackgroundNotification,
+    );
+    // Android may kill a process in the background without telling it, so
+    // what the app saved is written to the sandbox now.
+    synchronize_user_defaults(env);
+    crate::frameworks::openal::set_devices_paused(env, true);
+}
 
-    {
-        let pool: id = msg_class![env; NSAutoreleasePool new];
-        let delegate: id = msg![env; ui_application delegate];
-        // 4Towers saves the level being played only here.
-        if env
-            .objc
-            .object_has_method_named(&env.mem, delegate, "applicationDidEnterBackground:")
-        {
-            log!("Sending applicationDidEnterBackground: before exiting.");
-            () = msg![env; delegate applicationDidEnterBackground:ui_application];
-        }
+/// The app is coming back from the background (the first half of coming
+/// back).
+pub(super) fn will_enter_foreground(env: &mut Environment) {
+    if !State::get(env).in_background {
+        log!("Lifecycle: not in the background, ignoring.");
+        return;
+    }
+    State::get(env).in_background = false;
+    crate::objc::trace_lifecycle(env, "foreground");
+    tell_app(
+        env,
+        "applicationWillEnterForeground:",
+        UIApplicationWillEnterForegroundNotification,
+    );
+}
 
-        let notif_name = get_static_str(env, UIApplicationDidEnterBackgroundNotification);
-        () = msg![env; center postNotificationName:notif_name object:ui_application userInfo:nil];
+/// The app is active again (the second half of coming back).
+pub(super) fn did_become_active(env: &mut Environment) {
+    if State::get(env).in_background {
+        will_enter_foreground(env);
+    }
+    if !State::get(env).resigned {
+        log!("Lifecycle: already active, ignoring.");
+        return;
+    }
+    State::get(env).resigned = false;
+    crate::frameworks::openal::set_devices_paused(env, false);
+    crate::objc::trace_lifecycle(env, "active");
+    tell_app(
+        env,
+        "applicationDidBecomeActive:",
+        UIApplicationDidBecomeActiveNotification,
+    );
+}
 
-        let _: () = msg![env; pool drain];
-    };
+/// Tell the app it's about to quit and then exit. Used when the window is
+/// closed (or the user quits touchHLE otherwise), and when the host
+/// terminates touchHLE (Android's onDestroy, which can follow Home).
+///
+/// The app is first sent to the background as by Home, unless it already
+/// is: `applicationWillResignActive:` and `applicationDidEnterBackground:`
+/// (see [did_enter_background]) are sent only if they have not been sent
+/// for this trip. Then, as a suspended app is never resumed,
+/// `applicationWillTerminate:`. Each runs to completion before the next, so
+/// whatever the app saves in them, for example with
+/// `-[NSUserDefaults synchronize]`, is written to the sandbox before
+/// touchHLE exits. The defaults are also synchronized before the first
+/// message and once more at the end, for an app that changes them in these
+/// methods without synchronizing.
+pub(super) fn exit(env: &mut Environment) {
+    // Apple's docs (used to) vaguely mention that `synchronize` is
+    // invoked on periodic intervals.
+    // Second best - and implemented here - is to save before app exits.
+    // TODO: call `synchronize` periodically
+    synchronize_user_defaults(env);
 
-    {
-        let pool: id = msg_class![env; NSAutoreleasePool new];
-        let delegate: id = msg![env; ui_application delegate];
-        if env
-            .objc
-            .object_has_method_named(&env.mem, delegate, "applicationWillTerminate:")
-        {
-            () = msg![env; delegate applicationWillTerminate:ui_application];
-        }
+    if !State::get(env).in_background {
+        log!("Lifecycle: sending the app to the background before exiting.");
+        did_enter_background(env);
+    }
 
-        let notif_name = get_static_str(env, UIApplicationWillTerminateNotification);
-        () = msg![env; center postNotificationName:notif_name object:ui_application userInfo:nil];
-
-        if !env.is_app_picker {
-            let user_defaults: id = msg_class![env; NSUserDefaults standardUserDefaults];
-            let _: bool = msg![env; user_defaults synchronize];
-        }
-
-        let _: () = msg![env; pool drain];
-    };
+    crate::objc::trace_lifecycle(env, "terminate");
+    tell_app(
+        env,
+        "applicationWillTerminate:",
+        UIApplicationWillTerminateNotification,
+    );
+    synchronize_user_defaults(env);
 
     // Frames the message trace's capture still has queued are written first.
     crate::objc::trace_finish(env);
