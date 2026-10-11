@@ -241,6 +241,9 @@ pub struct Window {
     background_unhandled: bool,
     /// Presents skipped while backgrounded, logged when it comes back.
     presents_skipped: u32,
+    /// Whether a make-current that failed in the background has been
+    /// logged on this trip (see [Self::make_gl_context_current]).
+    make_current_failure_logged: std::cell::Cell<bool>,
     #[cfg(target_os = "macos")]
     max_height: u32,
     #[cfg(target_os = "macos")]
@@ -391,6 +394,7 @@ impl Window {
             backgrounded: false,
             background_unhandled: false,
             presents_skipped: 0,
+            make_current_failure_logged: std::cell::Cell::new(false),
             #[cfg(target_os = "macos")]
             max_height,
             #[cfg(target_os = "macos")]
@@ -955,6 +959,7 @@ impl Window {
                 self.backgrounded = true;
                 self.background_unhandled = true;
                 self.presents_skipped = 0;
+                self.make_current_failure_logged.set(false);
             }
             Event::AppWillEnterForeground => {
                 if self.presents_skipped > 0 {
@@ -1316,8 +1321,27 @@ impl Window {
             .set_share_with_current_context(value)
     }
 
+    /// Make a GL context current on the window. In the foreground a failure
+    /// panics. In the background it can fail (on Android the window's surface
+    /// may be going away under SDL), and then it is logged once per trip and
+    /// no context is left current, so the GL calls that follow do nothing
+    /// rather than reach another context.
     pub unsafe fn make_gl_context_current(&self, gl_ctx: &GLContext) {
-        self.window.gl_make_current(&gl_ctx.0).unwrap();
+        let result = self.window.gl_make_current(&gl_ctx.0);
+        if !self.backgrounded {
+            result.unwrap();
+            return;
+        }
+        if let Err(e) = result {
+            if !self.make_current_failure_logged.replace(true) {
+                log!(
+                    "Lifecycle: could not make a GL context current in the background \
+                     ({}), skipping.",
+                    e
+                );
+            }
+            let _ = self.video_ctx.gl_release_current_context();
+        }
     }
 
     /// Make the internal OpenGL ES context (for splash screen and UI rendering)
