@@ -68,7 +68,7 @@ On Android touchHLE uses SDL's blocking event pump, which suspends touchHLE's th
 
 Also:
 
-- `onDestroy` sends `SDL_QUIT` and `SDL_APP_TERMINATING` after flushing the queue (`SDL_android.c` L1178-1196); touchHLE handles the second first and exits as above.
+- `onDestroy` sends `SDL_QUIT` and `SDL_APP_TERMINATING` after flushing the queue, then posts the resume semaphore (`SDL_android.c` L1178-1196), so a pump blocked in the background wakes and sends the foreground pair after them (and does not restore the GL context, as `SDL_QUIT` is queued: `SDL_androidevents.c` L145). touchHLE handles the terminate event first and exits as above. From the first quit or terminate event, and once its exit has started, touchHLE ignores foreground events ("Lifecycle: touchHLE is quitting, ignoring AppWillEnterForeground."), so the window stays in the background and nothing is presented before the process ends.
 - Desktop SDL never sends these app events (in SDL 2.26.4 only the Android, iOS and WinRT back ends do), and touchHLE does not treat a window losing focus or being minimized as Home.
 
 **Testing on a computer:** F9 simulates Home (resign, then background), F10 simulates coming back (foreground, then active). Each is logged ("F9 pressed, simulating going to the background."), and F9 while in the background or F10 while not is logged and ignored. F12 (the debugger), Backspace and Return keep their old meanings.

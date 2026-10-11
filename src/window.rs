@@ -239,6 +239,9 @@ pub struct Window {
     /// handled it (see [Self::background_handled]). While set, SDL is not
     /// polled.
     background_unhandled: bool,
+    /// Set once touchHLE is quitting: on a quit or terminate event from the
+    /// host, or when UIKit's exit starts (see [Self::set_quitting]).
+    quitting: bool,
     /// Presents skipped while backgrounded, logged when it comes back.
     presents_skipped: u32,
     /// Whether a make-current that failed in the background has been
@@ -393,6 +396,7 @@ impl Window {
             lifecycle_events: VecDeque::new(),
             backgrounded: false,
             background_unhandled: false,
+            quitting: false,
             presents_skipped: 0,
             make_current_failure_logged: std::cell::Cell::new(false),
             #[cfg(target_os = "macos")]
@@ -576,7 +580,10 @@ impl Window {
             }
 
             self.event_queue.push_back(match event {
-                E::Quit { .. } => Event::Quit,
+                E::Quit { .. } => {
+                    self.quitting = true;
+                    Event::Quit
+                }
                 E::MouseButtonDown {
                     x,
                     y,
@@ -954,7 +961,21 @@ impl Window {
     /// foreground one is, nothing is presented (see [Self::is_backgrounded]).
     fn queue_lifecycle_event(&mut self, event: Event) {
         log!("Lifecycle: received {:?}.", event);
+        // On Android, after nativeSendQuit (onDestroy) SDL's blocked pump
+        // wakes and sends the foreground pair after SDL_QUIT and
+        // SDL_APP_TERMINATING. Coming back is not going to happen then, and
+        // nothing is to be presented until the process ends.
+        if self.quitting
+            && matches!(
+                event,
+                Event::AppWillEnterForeground | Event::AppDidBecomeActive
+            )
+        {
+            log!("Lifecycle: touchHLE is quitting, ignoring {:?}.", event);
+            return;
+        }
         match event {
+            Event::AppWillTerminate => self.quitting = true,
             Event::AppDidEnterBackground => {
                 self.backgrounded = true;
                 self.background_unhandled = true;
@@ -1012,6 +1033,12 @@ impl Window {
     /// [Self::poll_for_events]).
     pub fn background_handled(&mut self) {
         self.background_unhandled = false;
+    }
+
+    /// Called by UIKit when it starts to exit, so that no foreground event
+    /// arriving from then on takes the window out of the background.
+    pub fn set_quitting(&mut self) {
+        self.quitting = true;
     }
 
     /// Count a present skipped because touchHLE is in the background.

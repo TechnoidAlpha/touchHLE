@@ -644,6 +644,10 @@ pub(super) fn did_become_active(env: &mut Environment) {
 /// message and once more at the end, for an app that changes them in these
 /// methods without synchronizing.
 pub(super) fn exit(env: &mut Environment) {
+    if let Some(window) = env.window.as_mut() {
+        window.set_quitting();
+    }
+
     // Apple's docs (used to) vaguely mention that `synchronize` is
     // invoked on periodic intervals.
     // Second best - and implemented here - is to save before app exits.
