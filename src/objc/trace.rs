@@ -842,10 +842,12 @@ fn start_capture_for_scene(trace: &mut MsgTrace) {
             );
             trace.capture = Some(capture);
         }
-        Err(e) => log!(
-            "Warning: frame capture is off, scene dumps have no picture: {}",
-            e
-        ),
+        Err(e) => {
+            log!(
+                "Warning: frame capture is off, scene dumps have no picture: {}",
+                e
+            );
+        }
     }
 }
 
@@ -923,10 +925,12 @@ fn write_scene_dump(env: &mut Environment, frame: u32, ms: f64, whole_ms: u64, r
         let path = dir.join(&file_name);
         match std::fs::write(&path, text) {
             Ok(()) if reason != "periodic" => {
-                log!("Scene dump ({}) written to {}", reason, path.display())
+                log!("Scene dump ({}) written to {}", reason, path.display());
             }
             Ok(()) => (),
-            Err(e) => log!("Warning: could not write {}: {}", path.display(), e),
+            Err(e) => {
+                log!("Warning: could not write {}: {}", path.display(), e);
+            }
         }
     }
     env.objc.trace = Some(trace);
