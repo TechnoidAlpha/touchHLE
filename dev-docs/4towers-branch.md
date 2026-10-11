@@ -86,7 +86,7 @@ The grammar of one peek, a single word with no spaces:
 - `<base>` is `self` (the receiver), `arg0` or `arg1`: the words in the row's `arg0` and `arg1` columns (r2 and r3 for an ordinary send; for a `stret` send, r3 and the first stack word). A float argument is just a word, so read it from `arg0_f32` instead.
 - `.name` is the instance variable `name` of the object, found by name on its class chain in the class table touchHLE built from the binary's Objective-C metadata. It may only come straight after the base or after `->`: a field is not an object.
 - `.+0xNN` (or decimal `.+NN`) moves NN bytes further on, from the object or from the field reached so far, so `self.sprPoint.+4:f32` is the y of a `CGPoint` ivar and `self.+0x150:f32` reads a raw offset.
-- `->` reads the 4-byte pointer reached so far and carries on in the object it points at, whose class is read from its own isa: `->name` or `->+0xNN`.
+- `->` reads the 4-byte pointer reached so far and carries on in the object it points at, whose class is read from its own isa: `->name` or `->+0xNN`. It is not C's `->`: the base is already the object, so `self->hp` reads the pointer at `self` (the isa) and then looks for `hp` on the class object, which gives `-` with "has no ivar hp". Write `self.hp:f32`.
 - `:<type>` is `i32`, `u32`, `f32`, `u8` (a `BOOL` or `char` ivar), `ptr` (hex) or `id` (hex, a colon and the class name read from the object's isa, for example `0x0012a4c0:Creeps`, or `nil`).
 - With no step at all, the base word itself is the value: `arg0:id` names the class of the first argument.
 

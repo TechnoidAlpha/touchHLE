@@ -21,7 +21,7 @@
 //!   the base or `->`: a field is not an object.
 //! - `.+<offset>` moves that many bytes further on (`0x` for hex, or
 //!   decimal), from the object or from the field so far, so
-//!   `self.currPoint.+4:f32` is the y of a `CGPoint` ivar.
+//!   `self.sprPoint.+4:f32` is the y of a `CGPoint` ivar.
 //! - `->` reads the 4-byte pointer at the address so far and carries on in
 //!   the object it points at; it must be followed by an ivar or an offset.
 //! - `<type>` is `i32`, `u32`, `f32`, `u8`, `ptr` (hex) or `id` (hex and the
@@ -261,9 +261,9 @@ mod tests {
                 PeekType::Ptr,
             ),
             (
-                "self.currPoint.+0x4:f32",
+                "self.sprPoint.+0x4:f32",
                 PeekBase::Receiver,
-                vec![ivar("currPoint"), PeekStep::Bytes(4)],
+                vec![ivar("sprPoint"), PeekStep::Bytes(4)],
                 PeekType::F32,
             ),
             (
@@ -278,14 +278,9 @@ mod tests {
                 PeekType::I32,
             ),
             (
-                "arg0->target_2->hp:f32",
+                "arg0.target_2->hp:f32",
                 PeekBase::Arg0,
-                vec![
-                    PeekStep::Deref,
-                    ivar("target_2"),
-                    PeekStep::Deref,
-                    ivar("hp"),
-                ],
+                vec![ivar("target_2"), PeekStep::Deref, ivar("hp")],
                 PeekType::F32,
             ),
             ("arg0:id", PeekBase::Arg0, vec![], PeekType::Id),
