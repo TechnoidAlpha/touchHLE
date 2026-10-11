@@ -35,6 +35,7 @@ mod debug;
 mod dyld;
 mod environment;
 mod font;
+mod frame_capture;
 mod frameworks;
 mod fs;
 mod gdb;

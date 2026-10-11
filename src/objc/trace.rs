@@ -3,14 +3,27 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
-//! Selector-filtered message trace (`--trace-selectors=`).
+//! Selector-filtered message trace (`--trace-selectors=`), with frame
+//! capture (`--capture-frames=`) and a touch log.
 //!
 //! When at least one selector is chosen, every call of a chosen selector
 //! writes one tab-separated line to `trace.log` in the user data directory.
 //! Selectors come from the `--trace-selectors=` option and from the file
 //! `trace_selectors.txt` in the user data directory (one per line, `#` starts
-//! a comment); the two add up. With no selectors the trace is off and the only
-//! cost per message is one `Option::is_some` check.
+//! a comment); the two add up. The trace is on when there is at least one
+//! selector or `--capture-frames=` is set. When it is off, the only cost per
+//! message is one `Option::is_some` check.
+//!
+//! A line of `trace_selectors.txt` may add marker words after the selector,
+//! separated by spaces (see [parse_selector_line]). The only one is `png`:
+//! `powerFire png` saves the first frame presented after each call of
+//! `powerFire`, the frame that shows its result. `--capture-frames=N` saves
+//! every Nth frame as well. Frames are read back on the CAEAGLLayer fast
+//! path only (see [trace_present_frame]) and written by a worker thread as
+//! `frames/f{frame:06}_{ms}.png` (see [crate::frame_capture]), where
+//! `frame` is the frame column of the trace lines whose drawing the picture
+//! shows and `ms` the whole milliseconds since startup when it was
+//! presented.
 //!
 //! Two kinds of call are traced:
 //!
@@ -38,6 +51,7 @@ use super::{id, nil, Class, ClassHostObject, ObjC, IMP, SEL};
 use crate::abi::GuestFunction;
 use crate::cpu::Cpu;
 use crate::dyld::HostFunction;
+use crate::frame_capture::{FrameCapture, FRAMES_DIR};
 use crate::mem::{ConstPtr, Ptr};
 use crate::window::{Coords, FingerId};
 use crate::Environment;
@@ -69,11 +83,20 @@ pub(super) enum SendVariant {
     Super2,
 }
 
+/// What a line of `trace_selectors.txt` asks for besides tracing the
+/// selector, see [parse_selector_line].
+#[derive(Copy, Clone, Default, Debug, PartialEq, Eq)]
+struct Markers {
+    /// `png`: save the first frame presented after each call.
+    png: bool,
+}
+
 pub struct MsgTrace {
-    selectors: HashSet<String>,
-    /// Whether each (uniqued) selector pointer is traced, so the string
-    /// comparison happens once per selector.
-    cache: HashMap<SEL, bool>,
+    /// The traced selectors and their markers.
+    selectors: HashMap<String, Markers>,
+    /// The markers of each (uniqued) selector pointer, or [None] if it is not
+    /// traced, so the string comparison happens once per selector.
+    cache: HashMap<SEL, Option<Markers>>,
     /// Stubs handed out by `methodForSelector:` for traced selectors, see
     /// [trace_wrap_imp].
     trampolines: TrampolineCache<(Class, SEL, u32), (SEL, GuestFunction)>,
@@ -86,6 +109,15 @@ pub struct MsgTrace {
     /// The touch log, see [trace_touches]. [None] if it could not be
     /// created.
     input: Option<File>,
+    /// The frame capture worker, if frames are to be saved and it started.
+    capture: Option<FrameCapture>,
+    /// `--capture-frames=N`: save every Nth frame. 0 is off.
+    capture_every: u32,
+    /// A selector with the `png` marker was called since the last frame.
+    capture_pending: bool,
+    /// Whether the "frames are not captured on this path" message has been
+    /// logged.
+    uncaptured_path_logged: bool,
 }
 
 /// The trampolines handed out for traced selectors, keyed both ways: by what
@@ -123,25 +155,82 @@ impl<K: Hash + Eq, V: Copy> TrampolineCache<K, V> {
     }
 }
 
+/// One line of `trace_selectors.txt`: the selector, then optional marker
+/// words, separated by spaces or tabs; `#` starts a comment. Returns [None]
+/// for a blank or comment-only line, otherwise the selector, its markers and
+/// any words that are not a known marker (they are ignored, and logged once
+/// by the caller). The only marker is `png`.
+fn parse_selector_line(line: &str) -> Option<(String, Markers, Vec<String>)> {
+    let line = line.split('#').next().unwrap();
+    let mut words = line.split_whitespace();
+    let selector = words.next()?.to_string();
+    let mut markers = Markers::default();
+    let mut unknown = Vec::new();
+    for word in words {
+        match word {
+            "png" => markers.png = true,
+            _ => unknown.push(word.to_string()),
+        }
+    }
+    Some((selector, markers, unknown))
+}
+
+/// `--capture-frames=` in words, for the trace header and the log.
+fn periodic_capture(capture_every: u32) -> String {
+    match capture_every {
+        0 => "no periodic capture".to_string(),
+        1 => "every frame".to_string(),
+        n => format!("every {n}th frame"),
+    }
+}
+
 impl MsgTrace {
     /// Gather the selectors from the option and the file, and open the log if
-    /// there are any. Returns [None] when the trace is off.
-    fn open(option_selectors: &[String], bundle_id: &str) -> Option<MsgTrace> {
+    /// there are any or `capture_every` is not 0. Returns [None] when the
+    /// trace is off.
+    fn open(option_selectors: &[String], capture_every: u32, bundle_id: &str) -> Option<MsgTrace> {
         let base = crate::paths::user_data_base_path();
-        let mut list: Vec<String> = option_selectors.to_vec();
+        let mut lines: Vec<(String, Markers)> = option_selectors
+            .iter()
+            .map(|s| (s.clone(), Markers::default()))
+            .collect();
         if let Ok(file) = File::open(base.join(TRACE_SELECTORS_FILE)) {
+            let mut unknown_logged: HashSet<String> = HashSet::new();
             for line in BufReader::new(file).lines().map_while(Result::ok) {
-                let line = line.split('#').next().unwrap().trim();
-                if !line.is_empty() {
-                    list.push(line.to_string());
+                let Some((selector, markers, unknown)) = parse_selector_line(&line) else {
+                    continue;
+                };
+                for word in unknown {
+                    if unknown_logged.insert(word.clone()) {
+                        log!(
+                            "Warning: {} has an unknown marker {:?} (after {}), ignored; the only marker is png",
+                            TRACE_SELECTORS_FILE,
+                            word,
+                            selector
+                        );
+                    }
                 }
+                lines.push((selector, markers));
             }
         }
-        let mut selectors = HashSet::new();
-        list.retain(|s| selectors.insert(s.clone()));
-        if selectors.is_empty() {
+        // The same selector may be listed twice; its markers add up.
+        let mut list: Vec<String> = Vec::new();
+        let mut selectors: HashMap<String, Markers> = HashMap::new();
+        for (selector, markers) in lines {
+            let entry = selectors.entry(selector.clone()).or_insert_with(|| {
+                list.push(selector);
+                Markers::default()
+            });
+            entry.png |= markers.png;
+        }
+        if selectors.is_empty() && capture_every == 0 {
             return None;
         }
+        let png_after: Vec<&str> = list
+            .iter()
+            .filter(|s| selectors[*s].png)
+            .map(String::as_str)
+            .collect();
 
         let path = base.join(TRACE_LOG_FILE);
         let mut out = match File::create(&path) {
@@ -162,12 +251,19 @@ impl MsgTrace {
              # arg0/arg1 are r2/r3 (r3/stack0 for stret sends); sp0-sp3 are the words at sp\n\
              # self is the receiver's address\n\
              # no imp lines for methods that return a struct or a union\n\
+             # frame capture (frames/f<frame>_<ms>.png): {}; png after: {}\n\
              frame\tms\tthread\torigin\tvariant\tclass\tselector\targ0\targ0_f32\targ1\targ1_f32\tsp0\tsp1\tsp2\tsp3\tlr\tself\n",
             crate::branding(),
             if crate::branding().is_empty() { "" } else { " " },
             crate::VERSION,
             bundle_id,
             list.join(","),
+            periodic_capture(capture_every),
+            if png_after.is_empty() {
+                "none".to_string()
+            } else {
+                png_after.join(",")
+            },
         );
         if let Err(e) = out.write_all(header.as_bytes()) {
             log!("Warning: could not write {}: {}", path.display(), e);
@@ -179,6 +275,26 @@ impl MsgTrace {
             path.display()
         );
         let input = open_input_log(&base.join(INPUT_LOG_FILE), bundle_id);
+        let capture = if capture_every > 0 || !png_after.is_empty() {
+            let dir = base.join(FRAMES_DIR);
+            match FrameCapture::start(dir.clone()) {
+                Ok(capture) => {
+                    log!(
+                        "Frame capture on ({}, after {} png selector(s)), writing to {}",
+                        periodic_capture(capture_every),
+                        png_after.len(),
+                        dir.display()
+                    );
+                    Some(capture)
+                }
+                Err(e) => {
+                    log!("Warning: frame capture is off: {}", e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
         Some(MsgTrace {
             selectors,
             cache: HashMap::new(),
@@ -187,6 +303,10 @@ impl MsgTrace {
             out,
             frame: 0,
             input,
+            capture,
+            capture_every,
+            capture_pending: false,
+            uncaptured_path_logged: false,
         })
     }
 }
@@ -259,34 +379,116 @@ pub fn trace_touches(env: &mut Environment, phase: &str, touches: &HashMap<Finge
 }
 
 impl ObjC {
-    /// Turn the message trace on if any selectors were chosen.
-    pub fn start_trace(&mut self, option_selectors: &[String], bundle_id: &str) {
-        self.trace = MsgTrace::open(option_selectors, bundle_id);
+    /// Turn the message trace on if any selectors were chosen or
+    /// `capture_every` (`--capture-frames=`) is not 0.
+    pub fn start_trace(
+        &mut self,
+        option_selectors: &[String],
+        capture_every: u32,
+        bundle_id: &str,
+    ) {
+        self.trace = MsgTrace::open(option_selectors, capture_every, bundle_id);
     }
+}
 
-    /// Count a presented frame for the message trace.
-    pub fn trace_note_frame_presented(&mut self) {
-        if let Some(trace) = self.trace.as_mut() {
-            trace.frame = trace.frame.wrapping_add(1);
-        }
+/// A frame [trace_present_frame] chose to save: the trace frame number and
+/// the whole milliseconds since startup that name the file.
+#[derive(Copy, Clone, Debug)]
+pub struct FrameCaptureTicket {
+    frame: u32,
+    ms: u64,
+}
+
+/// Whether the frame numbered `frame` is saved: every `every`th frame
+/// (counting from frame 0; `every` = 0 is off), and the first frame after a
+/// call of a selector with the `png` marker (`pending`).
+fn capture_due(frame: u32, every: u32, pending: bool) -> bool {
+    pending || (every != 0 && frame.is_multiple_of(every))
+}
+
+/// Called by `present_renderbuffer` (the CAEAGLLayer fast path) for each
+/// frame it presents. Counts the frame for the trace's frame column and says
+/// whether to read it back and save it.
+///
+/// The frame is numbered with the frame column of the trace lines written
+/// while it was drawn, i.e. the count before this one: the first frame
+/// presented is frame 0. So `f000042_*.png` shows the drawing done during
+/// the lines with frame 42, and the frame saved for a `png` selector has the
+/// frame number of the line that called it.
+pub fn trace_present_frame(env: &mut Environment) -> Option<FrameCaptureTicket> {
+    let ms = u64::try_from(env.startup_time.elapsed().as_millis()).unwrap_or(u64::MAX);
+    let trace = env.objc.trace.as_mut()?;
+    let frame = trace.frame;
+    trace.frame = trace.frame.wrapping_add(1);
+    if trace.capture.is_none() {
+        return None;
     }
+    if !capture_due(frame, trace.capture_every, trace.capture_pending) {
+        return None;
+    }
+    trace.capture_pending = false;
+    Some(FrameCaptureTicket { frame, ms })
+}
+
+/// Hand a frame read back for `ticket` to the frame capture worker. `rgba`
+/// is `width` by `height` RGBA8 pixels, bottom row first.
+pub fn trace_capture_frame(
+    env: &mut Environment,
+    ticket: FrameCaptureTicket,
+    width: u32,
+    height: u32,
+    rgba: Vec<u8>,
+) {
+    if let Some(capture) = env.objc.trace.as_mut().and_then(|t| t.capture.as_mut()) {
+        capture.send(ticket.frame, ticket.ms, width, height, rgba);
+    }
+}
+
+/// Called where a frame is presented without going through
+/// `present_renderbuffer` (`path` names the way). Frames are not captured
+/// there, and the trace's frame number does not advance, so when frame
+/// capture is on this is logged once.
+pub fn trace_note_uncaptured_present(env: &mut Environment, path: &str) {
+    let Some(trace) = env.objc.trace.as_mut() else {
+        return;
+    };
+    if trace.capture.is_none() || trace.uncaptured_path_logged {
+        return;
+    }
+    trace.uncaptured_path_logged = true;
+    log!(
+        "Frame capture: a frame was presented through {}, where frames are not captured and the trace's frame number does not advance (only the CAEAGLLayer fast path is captured)",
+        path
+    );
+}
+
+/// The markers of `selector` if it is one of the traced ones. The trace must
+/// be on.
+fn selector_markers(env: &mut Environment, selector: SEL) -> Option<Markers> {
+    let mem = &*env.mem;
+    let MsgTrace {
+        selectors, cache, ..
+    } = env.objc.trace.as_mut()?;
+    *cache.entry(selector).or_insert_with(|| {
+        if selector.is_null() {
+            return None;
+        }
+        selector
+            .try_as_str(mem)
+            .and_then(|s| selectors.get(s).copied())
+    })
 }
 
 /// Whether `selector` is one of the traced ones. The trace must be on.
 fn selector_is_traced(env: &mut Environment, selector: SEL) -> bool {
-    let mem = &*env.mem;
-    let Some(MsgTrace {
-        selectors, cache, ..
-    }) = env.objc.trace.as_mut()
-    else {
-        return false;
-    };
-    *cache.entry(selector).or_insert_with(|| {
-        !selector.is_null()
-            && selector
-                .try_as_str(mem)
-                .is_some_and(|s| selectors.contains(s))
-    })
+    selector_markers(env, selector).is_some()
+}
+
+/// Act on a traced call's markers once its line is written.
+fn note_markers(env: &mut Environment, markers: Markers) {
+    if let Some(trace) = env.objc.trace.as_mut() {
+        trace.capture_pending |= markers.png;
+    }
 }
 
 /// The class name as written in the trace, with `+` for a metaclass.
@@ -312,9 +514,9 @@ pub(super) fn trace_send(
     super2: Option<Class>,
     variant: SendVariant,
 ) {
-    if !selector_is_traced(env, selector) {
+    let Some(markers) = selector_markers(env, selector) else {
         return;
-    }
+    };
 
     let origin = if env.objc.message_type_info.is_some() {
         "host"
@@ -347,6 +549,7 @@ pub(super) fn trace_send(
         variant,
         receiver.to_bits(),
     );
+    note_markers(env, markers);
 }
 
 /// Write one trace line from the current registers. The arguments are taken
@@ -506,6 +709,9 @@ fn trace_imp_trampoline(env: &mut Environment) {
         SendVariant::Normal,
         receiver.to_bits(),
     );
+    if let Some(markers) = selector_markers(env, selector) {
+        note_markers(env, markers);
+    }
 
     env.cpu.branch(real);
 }
@@ -535,8 +741,48 @@ fn fmt_f32(bits: u32) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{returns_struct, touch_row, TrampolineCache};
+    use super::{
+        capture_due, parse_selector_line, returns_struct, touch_row, Markers, TrampolineCache,
+    };
     use crate::window::FingerId;
+
+    #[test]
+    fn selector_lines_take_markers() {
+        let png = Markers { png: true };
+        let none = Markers::default();
+        assert_eq!(parse_selector_line(""), None);
+        assert_eq!(parse_selector_line("   # only a comment"), None);
+        assert_eq!(
+            parse_selector_line("tLoop:"),
+            Some(("tLoop:".to_string(), none, vec![]))
+        );
+        assert_eq!(
+            parse_selector_line("  powerFire png  # the tower's shot"),
+            Some(("powerFire".to_string(), png, vec![]))
+        );
+        assert_eq!(
+            parse_selector_line("schedule:interval:\tpng"),
+            Some(("schedule:interval:".to_string(), png, vec![]))
+        );
+        assert_eq!(
+            parse_selector_line("powerFire PNG jpg png"),
+            Some((
+                "powerFire".to_string(),
+                png,
+                vec!["PNG".to_string(), "jpg".to_string()]
+            ))
+        );
+    }
+
+    #[test]
+    fn frames_are_due_every_n_and_after_a_marker() {
+        assert!(!capture_due(5, 0, false));
+        assert!(capture_due(5, 0, true));
+        assert!(capture_due(0, 10, false));
+        assert!(!capture_due(5, 10, false));
+        assert!(capture_due(20, 10, false));
+        assert!(capture_due(7, 1, false));
+    }
 
     #[test]
     fn touch_rows_are_tab_separated() {

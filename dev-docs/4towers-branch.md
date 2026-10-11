@@ -56,7 +56,7 @@ These are stubs. Nothing talks to Game Center.
 
 Two kinds of call are traced. Ordinary message sends go through `objc_msgSend` and show up as `send` (or `stret`, `super2`). Methods run by cocos2d's scheduler (`schedule:interval:` timers such as `charging:` or `tLoop:`) do not: the scheduler asks for the method's address once with `methodForSelector:` and calls it directly from then on. For a traced selector, `methodForSelector:` and `instanceMethodForSelector:` hand back a small stub instead, which writes the line and then jumps into the real method, so those calls show up as `imp`. A method that returns a struct or a union is left unwrapped and its `imp` calls are not traced, because such a method can be called with the return buffer in the receiver's register and the stub cannot tell; touchHLE logs it once. Nothing changes for selectors that are not traced, or when the trace is off.
 
-You can also list selectors one per line in `trace_selectors.txt` next to the other touchHLE files (`#` starts a comment). The option and the file add up. With no selectors nothing is traced and nothing is written. `trace.log` is replaced each run.
+You can also list selectors one per line in `trace_selectors.txt` next to the other touchHLE files (`#` starts a comment). The option and the file add up. A line in the file can carry marker words after the selector, separated by spaces: the only one so far is `png` (see Frames below). A word that is not a marker is ignored and logged once. With no selectors, and without `--capture-frames=`, nothing is traced and nothing is written. `trace.log` is replaced each run.
 
 - **Windows:** `trace.log` is written in the folder you run `touchHLE.exe` from, next to `touchHLE_log.txt`.
 - **Android:** the command line is not available, so either put `trace_selectors.txt` in touchHLE's files folder, or add the option to the game's line in `touchHLE_options.txt`. `trace.log` lands in the same folder, which is the app's `files` folder: `Android/data/org.touchhle.android.unofficial/files/` for this fork's own APK, or `Android/data/com.lambdamugames.fourtowers/files/` for the remake repo's standalone 4Towers APK (for example `adb pull /sdcard/Android/data/com.lambdamugames.fourtowers/files/trace.log`).
@@ -78,6 +78,26 @@ These come with the message trace: they are written only while it is on, into th
 | `x`, `y` | the position in guest points (the screen is 320 x 480 points), unrotated: what the game's `UITouch` reports, whatever the window's rotation or scale |
 
 An event with two fingers gives two rows with the same `frame`, `ms` and `phase`. The rows are written as the events reach the game's run loop, each event in one write, so a crash keeps every row before it.
+
+### Frames
+
+Two ways to save the picture the game presented, as PNG files:
+
+- `--capture-frames=N` (N of 1 or more; absent or 0 is off) saves every Nth frame: frames 0, N, 2N and so on. Like any option it can go on the game's line in `touchHLE_options.txt`. It turns the trace on by itself, so `trace.log` and `input.log` are written even with no selectors.
+- A `png` marker on a line of `trace_selectors.txt`, for example `powerFire png`, saves the first frame presented after each call of that selector: the frame that shows its result. Several calls before the next frame give one picture.
+
+Each picture is `frames/f{frame}_{ms}.png` in the same folder as `trace.log`, for example `frames/f000042_15873.png`:
+
+- `frame` has at least six digits and is the `frame` column of the `trace.log` (and `input.log`) rows whose drawing the picture shows. The first frame presented is frame 0. A picture saved for a `png` selector carries the same frame number as the row of the call that asked for it.
+- `ms` is the whole milliseconds since touchHLE started (the `ms` clock of `trace.log`, cut to a whole number) when the frame was presented.
+
+The picture is the game's own renderbuffer as the game drew it, 8-bit RGB with the alpha channel dropped: 320 x 480 for 4Towers, not rotated, without the window's letterbox or the virtual cursor. With `--scale-hack=N` it is the scaled renderbuffer, N times as wide and N times as high. Earlier pictures (files named like these) are removed from `frames/` when a run that saves frames starts, so the folder matches that run's `trace.log`.
+
+What it costs: the read-back (`glReadPixels`) runs on the emulator thread and waits for the GPU to finish the frame, a few milliseconds per saved frame, which the game sees as time passing (its clocks are wall-clock). Flipping, encoding and writing happen on one worker thread. If the worker falls eight frames behind, further frames are dropped and the log says how many. Frames still queued when touchHLE stops abruptly are lost. A picture is roughly 100-250 KB (an estimate, not yet measured on 4Towers), so every 10th frame at 30 fps is roughly 25 MB a minute.
+
+Only frames presented straight from a full-screen `CAEAGLLayer` (touchHLE's fast path) are saved. When the game presents through the Core Animation compositor instead (a UIKit view on top of the game's layer, `--force-composition`, or no full-screen layer), no picture is saved and the `frame` number does not advance; touchHLE logs this once. A `png` marker waiting at that point is served by the next fast-path frame.
+
+On Android the `frames` folder is next to `trace.log` in the app's files folder; the standalone launcher's Share Log does not share it yet.
 
 ## Builds
 

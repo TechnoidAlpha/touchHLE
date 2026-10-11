@@ -42,6 +42,10 @@ hound = "3.5.0"
 mach_object = "0.1.17"
 plist = "1.8.0"
 zip = { version = "0.6.4", default-features = false, features = ["deflate"] }
+# The PNG files of the frame capture (src/frame_capture.rs). Both were
+# already in Cargo.lock through zip; these are the locked versions.
+flate2 = { version = "1.0.25", default-features = false, features = ["rust_backend"] }
+crc32fast = "1.3.2"
 rusttype = "0.9.3"
 # Needed so we can access underlying OwnedFace from rusttype
 # (bump version if rusttype is updated!)

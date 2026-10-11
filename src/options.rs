@@ -65,6 +65,9 @@ pub struct Options {
     /// Selectors for the message trace (`--trace-selectors=`), see
     /// src/objc/trace.rs.
     pub trace_selectors: Vec<String>,
+    /// `--capture-frames=N`: save every Nth presented frame as a PNG file
+    /// while the message trace is on (0 is off). See src/objc/trace.rs.
+    pub capture_frames: u32,
     /// `--bundle-files-ignore-case`, see
     /// [crate::fs::Fs::set_bundle_files_ignore_case].
     pub bundle_files_ignore_case: bool,
@@ -102,6 +105,7 @@ impl Default for Options {
             ignore_gl_errors: false,
             zero_stack_after_guest_to_host_call: None,
             trace_selectors: Vec::new(),
+            capture_frames: 0,
             bundle_files_ignore_case: false,
         }
     }
@@ -266,6 +270,10 @@ impl Options {
                     .filter(|s| !s.is_empty())
                     .map(String::from),
             );
+        } else if let Some(value) = arg.strip_prefix("--capture-frames=") {
+            self.capture_frames = value
+                .parse()
+                .map_err(|_| "Invalid value for --capture-frames=".to_string())?;
         } else if arg == "--bundle-files-ignore-case" {
             self.bundle_files_ignore_case = true;
         } else if arg == "--ignore-gl-errors" {

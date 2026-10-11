@@ -351,6 +351,10 @@ pub const CLASSES: ClassExports = objc_classes! {
             }
         };
         present_pixels(env, drawable, pixels_vec, width, height);
+        crate::objc::trace_note_uncaptured_present(
+            env,
+            "the slow EAGL path (no fullscreen CAEAGLLayer)",
+        );
     }
 
     if let Some(sleep_for) = sleep_for {
@@ -542,13 +546,44 @@ unsafe fn read_renderbuffer(gles: &mut dyn GLES, mut pixel_buffer: Vec<u8>) -> (
     (pixel_buffer, width_u32, height_u32)
 }
 
+/// Reads the `width` by `height` pixels of the bound framebuffer for frame
+/// capture: RGBA8, bottom row first. The pack alignment is set to 4 for the
+/// read (rows of RGBA8 are then tightly packed) and put back.
+///
+/// The provided context must be current.
+unsafe fn read_bound_framebuffer(gles: &mut dyn GLES, width: GLsizei, height: GLsizei) -> Vec<u8> {
+    let size = usize::try_from(width).unwrap_or(0) * usize::try_from(height).unwrap_or(0) * 4;
+    let mut pixels = vec![0u8; size];
+    if size == 0 {
+        return pixels;
+    }
+    let old_pack_alignment = get_int(gles, gles11::PACK_ALIGNMENT);
+    if old_pack_alignment != 4 {
+        gles.PixelStorei(gles11::PACK_ALIGNMENT, 4);
+    }
+    gles.ReadPixels(
+        0,
+        0,
+        width,
+        height,
+        gles11::RGBA,
+        gles11::UNSIGNED_BYTE,
+        pixels.as_mut_ptr() as *mut _,
+    );
+    if old_pack_alignment != 4 {
+        gles.PixelStorei(gles11::PACK_ALIGNMENT, old_pack_alignment);
+    }
+    pixels
+}
+
 /// Copies the pixels in a renderbuffer bound to `GL_RENDERBUFFER_BINDING_OES`
 /// (which should be provided by the app) to a texture and presents it with
 /// [present_frame], trying to avoid noticeably modifying OpenGL ES state while
 /// doing so. The front and back buffers are then swapped.
 unsafe fn present_renderbuffer(env: &mut Environment) {
-    // Frame number for the message trace (--trace-selectors=).
-    env.objc.trace_note_frame_presented();
+    // Frame number for the message trace (--trace-selectors=), and whether
+    // this frame is saved (--capture-frames=, png markers).
+    let capture = crate::objc::trace_present_frame(env);
 
     // Save these for when we need to draw the frame
     let viewport = env.window.as_mut().unwrap().viewport();
@@ -588,6 +623,13 @@ unsafe fn present_renderbuffer(env: &mut Environment) {
         gles11::RENDERBUFFER_OES,
         renderbuffer,
     );
+
+    // Frame capture: read the app's renderbuffer back while it is attached.
+    // Only the copy happens here; the frame capture thread does the rest.
+    let mut captured = None;
+    if let Some(ticket) = capture {
+        captured = Some((ticket, read_bound_framebuffer(gles, width, height)));
+    }
 
     // Create a texture with a copy of the pixels in the framebuffer
     let mut texture: GLuint = 0;
@@ -760,6 +802,13 @@ unsafe fn present_renderbuffer(env: &mut Environment) {
     // Restore the other bindings
     gles.BindTexture(gles11::TEXTURE_2D, old_texture_2d);
     gles.BindFramebufferOES(gles11::FRAMEBUFFER_OES, old_framebuffer);
+
+    std::mem::drop(gles_boxed);
+    if let Some((ticket, rgba)) = captured {
+        let width = u32::try_from(width).unwrap_or(0);
+        let height = u32::try_from(height).unwrap_or(0);
+        crate::objc::trace_capture_frame(env, ticket, width, height, rgba);
+    }
 
     // { let err = gles.GetError(); if err != 0 { panic!("{:#x}", err); } }
 }

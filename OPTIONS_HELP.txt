@@ -248,6 +248,20 @@ Debugging options:
         (down, move or up), finger and x, y in guest points. Lines starting
         with # are its header. It is replaced on each run.
 
+    --capture-frames=N
+        Saves every Nth presented frame as a PNG file,
+        frames/f<frame>_<ms>.png in the user data directory, where frame is
+        the trace.log frame number the picture belongs to (at least six
+        digits) and ms the whole milliseconds since startup. N must be 1 or
+        more; 0 is off. This turns the message trace on even with no
+        selectors. A line in trace_selectors.txt can also end in the word
+        png, for example "powerFire png", to save the first frame presented
+        after each call of that selector. The picture is the app's own
+        renderbuffer, unrotated, as 8-bit RGB (with --scale-hack, that many
+        times larger). Only frames presented directly from a full-screen
+        CAEAGLLayer are saved. Earlier frames in that folder are removed
+        when the run starts. Each picture is roughly 100-250 KB.
+
 Other options:
     --preferred-languages=...
         Specifies a list of preferred languages to be reported to the app.

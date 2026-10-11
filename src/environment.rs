@@ -698,8 +698,11 @@ impl Environment {
 
         // Selector-filtered message trace (--trace-selectors=), off unless any
         // selectors were chosen.
-        env.objc
-            .start_trace(&env.options.trace_selectors, env.bundle.bundle_identifier());
+        env.objc.start_trace(
+            &env.options.trace_selectors,
+            env.options.capture_frames,
+            env.bundle.bundle_identifier(),
+        );
 
         env.set_up_initial_env_vars();
         dyld::Dyld::do_late_linking(&mut env);
