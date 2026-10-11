@@ -294,6 +294,15 @@ Other options:
     --allow-network-access
         Allow apps running in touchHLE to access the Internet and the local network.
 
+    --bundle-files-ignore-case
+        When the app asks for a file in its bundle that is not there under that
+        exact name, use the one bundle file whose name differs only in letter
+        case, if there is exactly one. Off by default, because the iPhone's
+        filesystem is case-sensitive, so on a real device the file is missing
+        too. 4Towers asks for "Powerup.mp3" while its bundle holds
+        "PowerUp.mp3", so with this option touchHLE plays a sound that the
+        game probably never played on the phone.
+
     --ignore-gl-errors
         Ignore host OpenGL errors as queried by glGetError function.
         This only affects return value of glGetError as seen by the guest

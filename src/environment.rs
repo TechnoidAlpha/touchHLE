@@ -298,11 +298,13 @@ impl Environment {
     /// Loads the binary and sets up the emulator.
     pub fn new(
         bundle: bundle::Bundle,
-        fs: fs::Fs,
+        mut fs: fs::Fs,
         mut options: options::Options,
         app_args: Vec<String>,
     ) -> Result<Environment, String> {
         let startup_time = Instant::now();
+
+        fs.set_bundle_files_ignore_case(options.bundle_files_ignore_case);
 
         // Enforces the one (real) Environment limit. See `with_yielder` for
         // why this is needed.

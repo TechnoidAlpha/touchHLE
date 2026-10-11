@@ -158,7 +158,10 @@ impl FsNode {
 /// For a file name that is missing from a directory: the read-only file (in
 /// practice, one from the app bundle) whose name matches apart from letter
 /// case, if exactly one does. 4Towers asks for "Powerup.mp3" while its bundle
-/// holds "PowerUp.mp3". Logs once per name.
+/// holds "PowerUp.mp3". Logs once per name. Only used when
+/// `--bundle-files-ignore-case` is on (see
+/// [Fs::set_bundle_files_ignore_case]), because the iPhone's filesystem is
+/// case-sensitive.
 fn read_only_file_ignoring_case<'a>(
     children: &'a HashMap<String, FsNode>,
     name: &str,
@@ -547,6 +550,8 @@ pub struct Fs {
     root: FsNode,
     working_directory: GuestPathBuf,
     home_directory: GuestPathBuf,
+    /// See [Self::set_bundle_files_ignore_case].
+    bundle_files_ignore_case: bool,
 }
 impl Fs {
     /// Construct a filesystem containing a home directory for the app, its
@@ -737,6 +742,7 @@ impl Fs {
             root,
             working_directory,
             home_directory,
+            bundle_files_ignore_case: false,
         };
         assert!(fs.lookup_node(&bundle_guest_path).is_some());
         (fs, bundle_guest_path)
@@ -748,7 +754,17 @@ impl Fs {
             root: FsNode::dir(),
             working_directory: GuestPathBuf::from(String::new()),
             home_directory: GuestPathBuf::from(String::new()),
+            bundle_files_ignore_case: false,
         }
+    }
+
+    /// With `on`, a read-only file (in practice, a bundle file) that is
+    /// missing under its exact name is found under a name that differs only
+    /// in letter case, for lookups and for opening it to read. Off by default,
+    /// as on the iPhone, whose filesystem is case-sensitive
+    /// (`--bundle-files-ignore-case`).
+    pub fn set_bundle_files_ignore_case(&mut self, on: bool) {
+        self.bundle_files_ignore_case = on;
     }
 
     /// Get the absolute path of the guest app's (sandboxed) home directory.
@@ -798,7 +814,9 @@ impl Fs {
             };
             node = match children.get(*component) {
                 Some(child) => child,
-                None if i + 1 == resolved_path_components.len() => {
+                None if self.bundle_files_ignore_case
+                    && i + 1 == resolved_path_components.len() =>
+                {
                     read_only_file_ignoring_case(children, component)?
                 }
                 None => return None,
@@ -1091,6 +1109,9 @@ impl Fs {
         assert!((!truncate && !create) || write || append);
 
         let path = path.as_ref();
+        // A file opened only to read may be found under a name that differs
+        // in case, as for the other lookups (see read_only_file_ignoring_case).
+        let ignore_case = self.bundle_files_ignore_case && !(write || append || create);
 
         let (parent_node, new_filename) =
             self.lookup_parent_node(path).ok_or(FsError::DoesNotExist)?;
@@ -1103,7 +1124,11 @@ impl Fs {
         };
 
         // Open an existing file if possible
-        if let Some(existing_file) = children.get(&new_filename) {
+        let existing_file = match children.get(&new_filename) {
+            None if ignore_case => read_only_file_ignoring_case(children, &new_filename),
+            found => found,
+        };
+        if let Some(existing_file) = existing_file {
             if create && exclusive {
                 // TODO: This should also return an error if the last
                 // component is a symlink, but the FS currently doesn't

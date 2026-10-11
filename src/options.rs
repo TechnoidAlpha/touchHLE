@@ -65,6 +65,9 @@ pub struct Options {
     /// Selectors for the message trace (`--trace-selectors=`), see
     /// src/objc/trace.rs.
     pub trace_selectors: Vec<String>,
+    /// `--bundle-files-ignore-case`, see
+    /// [crate::fs::Fs::set_bundle_files_ignore_case].
+    pub bundle_files_ignore_case: bool,
 }
 
 impl Default for Options {
@@ -99,6 +102,7 @@ impl Default for Options {
             ignore_gl_errors: false,
             zero_stack_after_guest_to_host_call: None,
             trace_selectors: Vec::new(),
+            bundle_files_ignore_case: false,
         }
     }
 }
@@ -262,6 +266,8 @@ impl Options {
                     .filter(|s| !s.is_empty())
                     .map(String::from),
             );
+        } else if arg == "--bundle-files-ignore-case" {
+            self.bundle_files_ignore_case = true;
         } else if arg == "--ignore-gl-errors" {
             self.ignore_gl_errors = true;
         } else if let Some(value) = arg.strip_prefix("--zero-stack-after-guest-to-host-call=") {
