@@ -347,6 +347,10 @@ jobs:
         CC_x86_64_pc_windows_gnu: gcc
         CXX_x86_64_pc_windows_gnu: g++
         AR_x86_64_pc_windows_gnu: ar
+        # GCC 15 defaults to C23 (SDL2 2.26 uses bool and false as names) and
+        # no longer pulls in <cstdint> for OpenAL Soft's uint8_t.
+        CFLAGS_x86_64_pc_windows_gnu: -std=gnu17
+        CXXFLAGS_x86_64_pc_windows_gnu: -include cstdint
         CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER: gcc
     # The same bundle as the MSVC job, plus any MinGW runtime DLLs the exe
     # needs.
