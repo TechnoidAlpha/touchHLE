@@ -235,10 +235,9 @@ pub struct Window {
     /// blocks this thread (see [Self::poll_for_events]), but the app runs
     /// on until then; on a computer (F9) it keeps running.
     backgrounded: bool,
-    /// Set when the background event is queued, cleared once UIKit has
-    /// handled it (see [Self::background_handled]). While set, SDL is not
-    /// polled.
-    background_unhandled: bool,
+    /// When the background event was queued, until UIKit has handled it
+    /// (see [Self::background_handled]). While set, SDL is not polled.
+    background_unhandled: Option<Instant>,
     /// Set once touchHLE is quitting: on a quit or terminate event from the
     /// host, or when UIKit's exit starts (see [Self::set_quitting]).
     quitting: bool,
@@ -395,7 +394,7 @@ impl Window {
             last_polled: Instant::now() - Duration::from_secs(1),
             lifecycle_events: VecDeque::new(),
             backgrounded: false,
-            background_unhandled: false,
+            background_unhandled: None,
             quitting: false,
             presents_skipped: 0,
             make_current_failure_logged: std::cell::Cell::new(false),
@@ -463,7 +462,7 @@ impl Window {
         // could land before (or in the middle of) the app's save: this
         // returns at once, and the loop below stops as soon as the event is
         // queued (a poll after SDL's sentinel has been taken pumps again).
-        if self.background_unhandled {
+        if self.background_unhandled.is_some() {
             return;
         }
         let now = Instant::now();
@@ -537,7 +536,7 @@ impl Window {
         loop {
             use sdl2::event::Event as E;
             // See the top of this function.
-            if self.background_unhandled {
+            if self.background_unhandled.is_some() {
                 break;
             }
             let event = if let Some(e) = previous_event.take() {
@@ -848,7 +847,7 @@ impl Window {
                     let coords = transform_input_coords(self, abs_coords, false);
                     log_dbg!("Finger event x {}, y {}, coords {:?}", x, y, coords);
                     let mut map = HashMap::from([(FingerId::Touch(finger_id), coords)]);
-                    while !self.background_unhandled {
+                    while self.background_unhandled.is_none() {
                         let Some(next) = self.event_pump.poll_event() else {
                             break;
                         };
@@ -987,7 +986,7 @@ impl Window {
             Event::AppWillTerminate => self.quitting = true,
             Event::AppDidEnterBackground => {
                 self.backgrounded = true;
-                self.background_unhandled = true;
+                self.background_unhandled = Some(Instant::now());
                 self.presents_skipped = 0;
                 self.make_current_failure_logged.set(false);
             }
@@ -1041,7 +1040,16 @@ impl Window {
     /// and, on Android, may now block this thread (see
     /// [Self::poll_for_events]).
     pub fn background_handled(&mut self) {
-        self.background_unhandled = false;
+        // On Android SDL waits 0.5 s from about the pause signal for its
+        // context backup, which comes two polls after this, so this is the
+        // number to check on a phone.
+        if let Some(queued) = self.background_unhandled.take() {
+            log!(
+                "Lifecycle: the background event was handled {} ms after it \
+                 arrived.",
+                queued.elapsed().as_millis()
+            );
+        }
     }
 
     /// Called by UIKit when it starts to exit, so that no foreground event
