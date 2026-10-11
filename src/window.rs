@@ -949,10 +949,32 @@ impl Window {
                     );
                 }
                 self.backgrounded = false;
+                self.release_gl_context();
             }
             _ => (),
         }
         self.lifecycle_events.push_back(event);
+    }
+
+    /// Make no GL context current, so the next use of one makes it current
+    /// again for real. Called when touchHLE comes back from the background.
+    ///
+    /// On Android, SDL makes the context it saved current again on the new
+    /// surface before touchHLE sees the foreground event, but only if SDL
+    /// does not think that context is current already. A GL call made in the
+    /// background, after SDL's backup, makes the guest's context current
+    /// with no surface (or the dying one) and SDL still records it as
+    /// current, so SDL's restore does nothing and every later make-current
+    /// sees the context as current and skips the call: nothing would ever
+    /// draw to the new surface. With no context current, the next guest GL
+    /// call (or the compositor) binds its context to the window's surface as
+    /// it is now. On a computer (F10) this only costs one make-current.
+    fn release_gl_context(&mut self) {
+        if let Err(e) = self.video_ctx.gl_release_current_context() {
+            log!("Lifecycle: could not release the GL context: {}", e);
+        } else {
+            log!("Lifecycle: released the GL context.");
+        }
     }
 
     /// Whether the host has sent touchHLE to the background. While it is, the
