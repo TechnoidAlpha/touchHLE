@@ -54,9 +54,9 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (id)init {
-    // initWithNibName:bundle: returns id; asking for () here made touchHLE's message
-    // type check panic the first time the game made a view controller (MainMenu::init),
-    // which looked like a crash a few seconds after the title screen.
+    // initWithNibName:bundle: returns id. Asking for () here made the message
+    // type check panic the first time the game made a view controller
+    // (MainMenu::init), which looked like a crash just after the title screen.
     let this: id = msg![env; this initWithNibName:nil bundle:nil];
     this
 }
