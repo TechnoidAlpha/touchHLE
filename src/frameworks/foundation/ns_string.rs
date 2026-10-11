@@ -1786,6 +1786,36 @@ pub fn from_u16_vec(env: &mut Environment, from: Vec<u16>) -> id {
     string
 }
 
+/// For the message trace's `str` peeks (see `crate::objc::trace`): the text
+/// of `string` if it is one of touchHLE's own strings, read from its host
+/// object without calling the guest and without panicking. That covers
+/// every `_touchHLE_NSString` and `_touchHLE_NSMutableString`, including the
+/// constant strings of the app binary (their isa is rewritten to
+/// `_touchHLE_NSString_CFConstantString_UTF8` or `_UTF16` at load, see
+/// [register_constant_strings]). [None] for anything else: a nil or unknown
+/// pointer, an object of another class, or a guest subclass of `NSString`
+/// that keeps its text itself.
+///
+/// A UTF-8 string is borrowed whole. Of a UTF-16 string at most `max_units`
+/// code units are decoded, and an unpaired surrogate becomes U+FFFD.
+pub fn host_string_text(objc: &ObjC, string: id, max_units: usize) -> Option<Cow<'_, str>> {
+    let mut host_object = objc.get_host_object(string)?;
+    // A host object may wrap its superclass's, as in [ObjC::borrow]. A
+    // bound, in case a chain loops.
+    for _ in 0..16 {
+        if let Some(found) = host_object.as_any().downcast_ref::<StringHostObject>() {
+            return Some(match found {
+                StringHostObject::Utf8(utf8) => Cow::Borrowed(utf8.as_ref()),
+                StringHostObject::Utf16(utf16) => Cow::Owned(String::from_utf16_lossy(
+                    &utf16[..utf16.len().min(max_units)],
+                )),
+            });
+        }
+        host_object = host_object.as_superclass()?;
+    }
+    None
+}
+
 /// Shortcut for host code, provides a view of a string in UTF-8.
 /// Warning: This may panic if the string is not valid UTF-16!
 ///

@@ -24,8 +24,10 @@
 //!   `self.sprPoint.+4:f32` is the y of a `CGPoint` ivar.
 //! - `->` reads the 4-byte pointer at the address so far and carries on in
 //!   the object it points at; it must be followed by an ivar or an offset.
-//! - `<type>` is `i32`, `u32`, `f32`, `u8`, `ptr` (hex) or `id` (hex and the
-//!   class name from the object's isa, or `nil`).
+//! - `<type>` is `i32`, `u32`, `f32`, `u8`, `ptr` (hex), `id` (hex and the
+//!   class name from the object's isa, or `nil`) or `str` (the text of an
+//!   `NSString`, escaped and cut, see [fmt_str]; `nil`, or `-` for an object
+//!   that is not one of touchHLE's own strings).
 //!
 //! With no step at all (`arg0:id`), the base word itself is the value.
 
@@ -61,6 +63,8 @@ pub(super) enum PeekType {
     U8,
     Ptr,
     Id,
+    /// An `NSString`'s text, see [fmt_str].
+    Str,
 }
 
 impl PeekType {
@@ -101,9 +105,10 @@ pub(super) fn parse_peek(text: &str) -> Result<PeekSpec, String> {
         "u8" => PeekType::U8,
         "ptr" => PeekType::Ptr,
         "id" => PeekType::Id,
+        "str" => PeekType::Str,
         _ => {
             return Err(format!(
-                "unknown type {ty:?} (i32, u32, f32, u8, ptr or id)"
+                "unknown type {ty:?} (i32, u32, f32, u8, ptr, id or str)"
             ))
         }
     };
@@ -202,10 +207,43 @@ pub(super) fn fmt_f32_6(value: f32) -> String {
     }
 }
 
+/// How many bytes of escaped text a `str` peek writes at most, see
+/// [fmt_str].
+pub(super) const STR_MAX_BYTES: usize = 200;
+
+/// A string's text as a `str` peek writes it, on one line and in one
+/// column: each tab, newline, carriage return and backslash is written as
+/// `\t`, `\n`, `\r` and `\\`. If the escaped text is longer than
+/// [STR_MAX_BYTES] bytes, it is cut before the first character (or escape)
+/// that would go past that and `...` is added, so the column holds at most
+/// 203 bytes and is always whole UTF-8 characters.
+pub(super) fn fmt_str(text: &str) -> String {
+    let mut out = String::new();
+    for c in text.chars() {
+        let escape = match c {
+            '\t' => Some("\\t"),
+            '\n' => Some("\\n"),
+            '\r' => Some("\\r"),
+            '\\' => Some("\\\\"),
+            _ => None,
+        };
+        let len = escape.map_or(c.len_utf8(), str::len);
+        if out.len() + len > STR_MAX_BYTES {
+            out.push_str("...");
+            break;
+        }
+        match escape {
+            Some(escape) => out.push_str(escape),
+            None => out.push(c),
+        }
+    }
+    out
+}
+
 /// A peek's value as written in its column. `word` holds the value (for
-/// `u8`, the byte). `class` is the class name of the object an `id` points
-/// at, when it could be read.
-pub(super) fn fmt_peek_value(ty: PeekType, word: u32, class: Option<&str>) -> String {
+/// `u8`, the byte). `detail` is, for an `id`, the class name of the object
+/// it points at and, for a `str`, the string's text, when it could be read.
+pub(super) fn fmt_peek_value(ty: PeekType, word: u32, detail: Option<&str>) -> String {
     match ty {
         PeekType::I32 => (word as i32).to_string(),
         PeekType::U32 => word.to_string(),
@@ -213,14 +251,17 @@ pub(super) fn fmt_peek_value(ty: PeekType, word: u32, class: Option<&str>) -> St
         PeekType::F32 => fmt_f32_6(f32::from_bits(word)),
         PeekType::Ptr => format!("{word:#010x}"),
         PeekType::Id if word == 0 => "nil".to_string(),
-        PeekType::Id => format!("{word:#010x}:{}", class.unwrap_or("?")),
+        PeekType::Id => format!("{word:#010x}:{}", detail.unwrap_or("?")),
+        PeekType::Str if word == 0 => "nil".to_string(),
+        PeekType::Str => detail.map_or_else(|| "-".to_string(), fmt_str),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        fmt_f32_6, fmt_peek_value, looks_like_peek, parse_peek, PeekBase, PeekStep, PeekType,
+        fmt_f32_6, fmt_peek_value, fmt_str, looks_like_peek, parse_peek, PeekBase, PeekStep,
+        PeekType, STR_MAX_BYTES,
     };
 
     fn ivar(name: &str) -> PeekStep {
@@ -284,6 +325,13 @@ mod tests {
                 PeekType::F32,
             ),
             ("arg0:id", PeekBase::Arg0, vec![], PeekType::Id),
+            ("arg0:str", PeekBase::Arg0, vec![], PeekType::Str),
+            (
+                "self.string_->+0x4:str",
+                PeekBase::Receiver,
+                vec![ivar("string_"), PeekStep::Deref, PeekStep::Bytes(4)],
+                PeekType::Str,
+            ),
         ];
         for (text, base, steps, ty) in cases {
             let spec = parse_peek(text).unwrap_or_else(|e| panic!("{text}: {e}"));
@@ -299,6 +347,8 @@ mod tests {
         let cases = [
             ("self.hp", "no :type"),
             ("self.hp:f64", "unknown type"),
+            ("arg0:string", "unknown type"),
+            ("arg0:STR", "unknown type"),
             ("self.hp:", "unknown type"),
             ("this.hp:f32", "must start with"),
             ("selfish.hp:f32", "must start with"),
@@ -377,7 +427,56 @@ mod tests {
             fmt_peek_value(PeekType::Id, 0x2000, Some("+SharedData")),
             "0x00002000:+SharedData"
         );
+        assert_eq!(f(PeekType::Str, 0), "nil");
+        assert_eq!(f(PeekType::Str, 0x1000), "-");
+        assert_eq!(
+            fmt_peek_value(PeekType::Str, 0x1000, Some("Wave 3\tof 20")),
+            r"Wave 3\tof 20"
+        );
+        assert_eq!(fmt_peek_value(PeekType::Str, 0x1000, Some("")), "");
         assert_eq!(PeekType::U8.size(), 1);
         assert_eq!(PeekType::Id.size(), 4);
+        assert_eq!(PeekType::Str.size(), 4);
+    }
+
+    #[test]
+    fn strings_are_escaped_onto_one_line() {
+        assert_eq!(fmt_str("Gold: 250"), "Gold: 250");
+        assert_eq!(fmt_str("a\tb\nc\rd\\e"), r"a\tb\nc\rd\\e");
+        assert_eq!(fmt_str("\r\n"), r"\r\n");
+        // A backslash already followed by a letter stays two characters.
+        assert_eq!(fmt_str(r"C:\new"), r"C:\\new");
+        // Everything else, quotes and non-ASCII text included, is kept.
+        assert_eq!(fmt_str("\"R\u{e9}\" 50%"), "\"R\u{e9}\" 50%");
+        assert_eq!(fmt_str(""), "");
+    }
+
+    #[test]
+    fn long_strings_are_cut_on_a_char_boundary() {
+        let a = |n: usize| "a".repeat(n);
+        // Exactly the limit: kept whole, no marker.
+        assert_eq!(fmt_str(&a(STR_MAX_BYTES)), a(STR_MAX_BYTES));
+        // One byte more: cut to the limit, then the marker.
+        assert_eq!(
+            fmt_str(&a(STR_MAX_BYTES + 1)),
+            format!("{}...", a(STR_MAX_BYTES))
+        );
+        // A two-byte character that would straddle the limit is left out
+        // whole, so the text stays valid UTF-8.
+        let straddle = format!("{}\u{e9}", a(STR_MAX_BYTES - 1));
+        assert_eq!(fmt_str(&straddle), format!("{}...", a(STR_MAX_BYTES - 1)));
+        // An escape is never split either.
+        let escaped = format!("{}\n", a(STR_MAX_BYTES - 1));
+        assert_eq!(fmt_str(&escaped), format!("{}...", a(STR_MAX_BYTES - 1)));
+        // Escapes count as the two bytes they are written as.
+        let tabs = "\t".repeat(STR_MAX_BYTES);
+        assert_eq!(
+            fmt_str(&tabs),
+            format!("{}...", r"\t".repeat(STR_MAX_BYTES / 2))
+        );
+        // A four-byte character is never split.
+        let cut = fmt_str(&"\u{1f3f0}".repeat(60));
+        assert_eq!(cut, format!("{}...", "\u{1f3f0}".repeat(50)));
+        assert!(cut.len() <= STR_MAX_BYTES + 3);
     }
 }

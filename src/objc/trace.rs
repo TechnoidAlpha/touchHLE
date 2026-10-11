@@ -38,7 +38,10 @@
 //! the next traced call. A read never panics and never calls the guest (see
 //! [peek_columns]); one that fails writes `-` and is logged once per
 //! selector and peek. An item of `--trace-selectors=` takes the same words
-//! as a line, with `;` between them (`dmg:;self.hp:f32`).
+//! as a line, with `;` between them (`dmg:;self.hp:f32`). A `str` peek
+//! writes what an `NSString` says, from touchHLE's own host object for it
+//! (see [ns_string::host_string_text]), so `setString: arg0:str` shows the
+//! text a label is given.
 //!
 //! Two kinds of call are traced:
 //!
@@ -71,6 +74,7 @@ use crate::abi::GuestFunction;
 use crate::cpu::Cpu;
 use crate::dyld::HostFunction;
 use crate::frame_capture::{FrameCapture, FRAMES_DIR};
+use crate::frameworks::foundation::ns_string;
 use crate::mem::{ConstPtr, ConstVoidPtr, GuestUSize, Mem, Ptr};
 use crate::window::{Coords, FingerId};
 use crate::Environment;
@@ -891,10 +895,25 @@ fn read_peek(objc: &ObjC, mem: &Mem, peek: &mut Peek, words: [u32; 3]) -> Result
             read_guest_word(mem, addr)?
         }
     };
-    let class = match spec.ty {
-        PeekType::Id if word != 0 => read_guest_word(mem, word)
+    let class_of = |object: u32| {
+        read_guest_word(mem, object)
             .ok()
-            .map(|isa| class_name_for_trace(objc, Ptr::from_bits(isa))),
+            .map(|isa| class_name_for_trace(objc, Ptr::from_bits(isa)))
+    };
+    if spec.ty == PeekType::Str && word != 0 {
+        // STR_MAX_BYTES + 1 code units are always enough to tell whether
+        // the escaped text has to be cut: each one is at least a byte.
+        let text = ns_string::host_string_text(objc, Ptr::from_bits(word), peek::STR_MAX_BYTES + 1)
+            .ok_or_else(|| {
+                format!(
+                    "{word:#x} is not one of touchHLE's strings (class {})",
+                    class_of(word).as_deref().unwrap_or("unknown")
+                )
+            })?;
+        return Ok(peek::fmt_peek_value(spec.ty, word, Some(&text)));
+    }
+    let class = match spec.ty {
+        PeekType::Id if word != 0 => class_of(word),
         _ => None,
     };
     Ok(peek::fmt_peek_value(spec.ty, word, class.as_deref()))

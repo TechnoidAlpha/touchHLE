@@ -87,8 +87,25 @@ The grammar of one peek, a single word with no spaces:
 - `.name` is the instance variable `name` of the object, found by name on its class chain in the class table touchHLE built from the binary's Objective-C metadata. It may only come straight after the base or after `->`: a field is not an object.
 - `.+0xNN` (or decimal `.+NN`) moves NN bytes further on, from the object or from the field reached so far, so `self.sprPoint.+4:f32` is the y of a `CGPoint` ivar and `self.+0x150:f32` reads a raw offset.
 - `->` reads the 4-byte pointer reached so far and carries on in the object it points at, whose class is read from its own isa: `->name` or `->+0xNN`. It is not C's `->`: the base is already the object, so `self->hp` reads the pointer at `self` (the isa) and then looks for `hp` on the class object, which gives `-` with "has no ivar hp". Write `self.hp:f32`.
-- `:<type>` is `i32`, `u32`, `f32`, `u8` (a `BOOL` or `char` ivar), `ptr` (hex) or `id` (hex, a colon and the class name read from the object's isa, for example `0x0012a4c0:Creeps`, or `nil`).
-- With no step at all, the base word itself is the value: `arg0:id` names the class of the first argument.
+- `:<type>` is one of:
+
+| type | read as | written as |
+| --- | --- | --- |
+| `i32` | 4 bytes, signed | decimal |
+| `u32` | 4 bytes, unsigned | decimal |
+| `f32` | 4 bytes, a float | six significant digits |
+| `u8` | 1 byte (a `BOOL` or `char` ivar) | decimal |
+| `ptr` | 4 bytes | `0x` and eight hex digits |
+| `id` | 4 bytes, an object pointer | hex, a colon and the class name read from the object's isa, for example `0x0012a4c0:Creeps`, or `nil` |
+| `str` | 4 bytes, an `NSString` pointer | the string's text, escaped and cut (below), or `nil`, or `-` |
+
+- With no step at all, the base word itself is the value: `arg0:id` names the class of the first argument, and `arg0:str` is the text of a string passed as the first argument.
+
+A `str` peek writes what the string says, so a label's text can be read off the trace. The text comes from touchHLE's own record of the string, without calling the game, so it works for every string touchHLE made (`stringWithFormat:` and the rest) and for the constant strings in the game's binary (an `@"..."` in the source becomes a constant `CFString`, which touchHLE turns into one of its own strings when it loads the binary). Anything else gives `-`, with the reason logged once: an object that is not a string, or a string class the game defines itself (it keeps its text where touchHLE cannot see it). The text is written on one line and in one column:
+
+- A tab, newline, carriage return and backslash are written as `\t`, `\n`, `\r` and `\\`. Nothing else is changed.
+- At most 200 bytes of that escaped text are written. A longer text is cut before the first character, or escape, that would go past 200 bytes, so a character or an escape is never split, and `...` is added: the column holds at most 203 bytes. A text that is exactly 200 bytes is written whole, without `...`.
+- A string held as UTF-16 with a broken surrogate pair shows U+FFFD there.
 
 Rows:
 
@@ -96,7 +113,17 @@ Rows:
 - Values: `f32` with six significant digits (C's `%g`, with the exponent written `1.5e-7`), integers in decimal, `ptr` as `0x` and eight hex digits.
 - Peeks are read when the call starts, **before the method runs**. A row of `dmg:` shows the hit points before that hit; the state after it is in the peeks of the next traced call (for example a peek on `checkHp`, which `dmg:` calls).
 
-No-panic rule: a peek only reads memory, through touchHLE's non-panicking reader, and the class table. It never sends a message or calls the game. A nil base, a pointer into the null page or past the end of memory, an object whose isa is not a known class, or a class chain without that ivar gives `-` in the column, and the reason is logged once per selector and peek; the run carries on. Reads need not be aligned. A wrong type is not detected: it gives a wrong number, not a `-`. The offset of each ivar is looked up once per class and cached, so a row with four peeks costs a few extra memory reads.
+No-panic rule: a peek only reads memory, through touchHLE's non-panicking reader, and the class table. It never sends a message or calls the game. A nil base, a pointer into the null page or past the end of memory, an object whose isa is not a known class, or a class chain without that ivar gives `-` in the column, and the reason is logged once per selector and peek; the run carries on. Reads need not be aligned. A wrong type is not detected: it gives a wrong number, not a `-` (except `str`, which gives `-` for anything that is not a string). The offset of each ivar is looked up once per class and cached, so a row with four peeks costs a few extra memory reads.
+
+A list for the labels of 4Towers' HUD is below. cocos2d's labels take their text as an `NSString` in the first argument, and every `labelWithString:...` the game calls goes through the matching `initWithString:...`, so these catch each label as it is made (`CCLabelTTF`, then `CCLabelBMFont` and `CCLabelAtlas`), and `setString:` each change of its text. The `self` column of an `init` row is the label's address, which the label's later rows share. An `init` may also send `setString:` itself, which gives a second row with the same text.
+
+```
+initWithString:dimensions:alignment:fontName:fontSize: arg0:str
+initWithString:fontName:fontSize: arg0:str
+initWithString:fntFile: arg0:str
+initWithString:charMapFile:itemWidth:itemHeight:startCharMap: arg0:str
+setString: arg0:str
+```
 
 A list for 4Towers, from the decompile's field list (the offsets in the comments are the armv7 binary's, in case a name lookup ever fails):
 
