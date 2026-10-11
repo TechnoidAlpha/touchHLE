@@ -1041,8 +1041,10 @@ impl Window {
     /// [Self::poll_for_events]).
     pub fn background_handled(&mut self) {
         // On Android SDL waits 0.5 s from about the pause signal for its
-        // context backup, which comes two polls after this, so this is the
-        // number to check on a phone.
+        // context backup, which comes three polls after this (one drains
+        // what is left before the sentinel, one pumps and marks the pause,
+        // one backs up and blocks), so this is the number to check on a
+        // phone.
         if let Some(queued) = self.background_unhandled.take() {
             log!(
                 "Lifecycle: the background event was handled {} ms after it \
