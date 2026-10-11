@@ -51,7 +51,7 @@ const MAX_NOTES: usize = 50;
 
 /// The columns of a node line, in order. See dev-docs/4towers-branch.md,
 /// "Scene dump", for what each holds.
-pub(super) const COLUMNS: [&str; 42] = [
+pub(super) const COLUMNS: [&str; 43] = [
     // Every node (CCNode).
     "class",
     "depth",
@@ -75,6 +75,7 @@ pub(super) const COLUMNS: [&str; 42] = [
     "r",
     "g",
     "b",
+    "opacity_rgb",
     // CCSprite.
     "flip_x",
     "flip_y",
@@ -103,6 +104,8 @@ pub(super) const COLUMNS: [&str; 42] = [
 ];
 
 /// Classes whose instances have `opacity_` and a `ccColor3B color_`.
+/// `CCSprite` and `CCAtlasNode` also have `colorUnmodified_` and
+/// `opacityModifyRGB_`, and `CCLabelBMFont` has `opacityModifyRGB_`.
 const COLOR_CLASSES: [&str; 4] = ["CCSprite", "CCAtlasNode", "CCLabelBMFont", "CCLayerColor"];
 
 /// Classes whose text is in `string_`.
@@ -290,6 +293,24 @@ fn node_texture<M: SceneMemory + ?Sized>(
     }
 }
 
+/// The ivar that holds the colour the game set on `node`, which is what
+/// its `color` returns. With `opacityModifyRGB_` on (cocos2d's default for
+/// a `CCSprite` and a `CCAtlasNode`), `setColor:` keeps the colour in
+/// `colorUnmodified_` and multiplies `color_` by `opacity_ / 255`
+/// (`CCSprite.c` and `CCAtlasNode.c` in the decompile). A class without
+/// `colorUnmodified_` keeps it in `color_`.
+fn set_color_ivar<M: SceneMemory + ?Sized>(m: &mut M, node: u32) -> Result<&'static str, String> {
+    if m.ivar_addr(node, "colorUnmodified_").is_err() {
+        return Ok("color_");
+    }
+    let addr = m.ivar_addr(node, "opacityModifyRGB_")?;
+    Ok(if m.bytes(addr, 1)?[0] != 0 {
+        "colorUnmodified_"
+    } else {
+        "color_"
+    })
+}
+
 /// One line of the dump for `node`, `depth` levels below the running
 /// scene: the [COLUMNS], tab-separated, the class name indented by two
 /// spaces per level. A column that does not apply to the node's class, or
@@ -335,11 +356,17 @@ pub(super) fn node_line<M: SceneMemory + ?Sized>(
 
     if has(&COLOR_CLASSES) {
         columns.push(field(m, node, "opacity_", 0, Ty::U8));
-        for i in 0..3 {
-            columns.push(field(m, node, "color_", i, Ty::U8));
+        match set_color_ivar(m, node) {
+            Ok(ivar) => {
+                for i in 0..3 {
+                    columns.push(field(m, node, ivar, i, Ty::U8));
+                }
+            }
+            Err(_) => dashes(&mut columns, 3),
         }
+        columns.push(field(m, node, "opacityModifyRGB_", 0, Ty::U8));
     } else {
-        dashes(&mut columns, 4);
+        dashes(&mut columns, 5);
     }
 
     if has(&["CCSprite"]) {
@@ -859,6 +886,8 @@ mod tests {
                 ("CCLabelTTF", "fontName_", 100),
                 ("CCLabelTTF", "fontSize_", 104),
                 ("CCLabelTTF", "dimensions_", 108),
+                ("CCSprite", "colorUnmodified_", 120),
+                ("CCSprite", "opacityModifyRGB_", 124),
                 ("CCArray", "data", 4),
                 ("CCTexture2D", "name_", 4),
                 ("CCTexture2D", "size_", 8),
@@ -1011,7 +1040,7 @@ mod tests {
         let line = column_line();
         assert!(line.starts_with("class\tdepth\taddr\ttag\tz\tx\ty\t"));
         assert!(line.ends_with("\tdim_w\tdim_h\n"));
-        assert_eq!(columns(&line).len(), 42);
+        assert_eq!(columns(&line).len(), 43);
     }
 
     #[test]
@@ -1036,8 +1065,12 @@ mod tests {
         g.put(g.ivar(0x6000, "visible_"), &[1]);
         g.put_f32(g.ivar(0x6000, "contentSize_"), 64.0);
         g.put_f32(g.ivar(0x6000, "contentSize_") + 4, 32.0);
-        g.put(g.ivar(0x6000, "opacity_"), &[255]);
-        g.put(g.ivar(0x6000, "color_"), &[255, 128, 0]);
+        // Opacity 128 with opacityModifyRGB_ on: color_ is the colour set
+        // times 128/255, and the colour set is in colorUnmodified_.
+        g.put(g.ivar(0x6000, "opacity_"), &[128]);
+        g.put(g.ivar(0x6000, "color_"), &[128, 64, 0]);
+        g.put(g.ivar(0x6000, "colorUnmodified_"), &[255, 128, 0]);
+        g.put(g.ivar(0x6000, "opacityModifyRGB_"), &[1]);
         g.put_f32(g.ivar(0x6000, "rect_"), 0.0);
         g.put_f32(g.ivar(0x6000, "rect_") + 4, 32.0);
         g.put_f32(g.ivar(0x6000, "rect_") + 8, 64.0);
@@ -1095,10 +1128,11 @@ mod tests {
                 "1",
                 "64",
                 "32",
-                "255",
+                "128",
                 "255",
                 "128",
                 "0",
+                "1",
                 "0",
                 "0",
                 "0",
@@ -1126,10 +1160,10 @@ mod tests {
         let label = columns(lines[3]);
         assert_eq!(label[0], "    CCLabelTTF");
         // No texture: nil, and '-' for the rest of the texture columns.
-        assert_eq!(label[27], "nil");
-        assert!(label[28..37].iter().all(|&c| c == "-"));
+        assert_eq!(label[28], "nil");
+        assert!(label[29..38].iter().all(|&c| c == "-"));
         // The text escaped as a str peek writes it.
-        assert_eq!(&label[37..], ["Gold:\\t120", "Futura", "14", "0", "0"]);
+        assert_eq!(&label[38..], ["Gold:\\t120", "Futura", "14", "0", "0"]);
     }
 
     #[test]
@@ -1148,12 +1182,46 @@ mod tests {
         g.object(0x8800, &["CCTexture2D", "NSObject"]);
         g.put_word(0x5004, 0x8800);
         let line = node_line(&mut g, 0x4000, 0, &HashMap::new());
-        assert_eq!(columns(&line)[26], "1");
-        assert_eq!(columns(&line)[27], "0x00008800");
+        assert_eq!(columns(&line)[27], "1");
+        assert_eq!(columns(&line)[28], "0x00008800");
         // Without the atlas, the sprite's own texture_.
         g.put_word(g.ivar(0x4000, "textureAtlas_"), 0);
         let line = node_line(&mut g, 0x4000, 0, &HashMap::new());
-        assert_eq!(columns(&line)[27], "0x00008000");
+        assert_eq!(columns(&line)[28], "0x00008000");
+    }
+
+    #[test]
+    fn the_colour_is_the_one_the_game_set() {
+        let rgb = |line: &str| -> Vec<String> {
+            columns(line)[16..21]
+                .iter()
+                .map(|c| c.to_string())
+                .collect()
+        };
+        let mut g = FakeGuest::new();
+        g.node(0x4000, &SPRITE, &[]);
+        g.put(g.ivar(0x4000, "opacity_"), &[128]);
+        g.put(g.ivar(0x4000, "color_"), &[128, 128, 128]);
+        g.put(g.ivar(0x4000, "colorUnmodified_"), &[255, 255, 255]);
+        // opacityModifyRGB_ on: what [sprite color] returns, not color_.
+        g.put(g.ivar(0x4000, "opacityModifyRGB_"), &[1]);
+        let line = node_line(&mut g, 0x4000, 0, &HashMap::new());
+        assert_eq!(rgb(&line), ["128", "255", "255", "255", "1"]);
+        // Off: color_ is the colour set.
+        g.put(g.ivar(0x4000, "opacityModifyRGB_"), &[0]);
+        let line = node_line(&mut g, 0x4000, 0, &HashMap::new());
+        assert_eq!(rgb(&line), ["128", "128", "128", "128", "0"]);
+        // A class with color_ only (CCLayerColor): color_, and '-' for
+        // opacityModifyRGB_.
+        g.offsets.insert(
+            "CCLayerColor".to_string(),
+            HashMap::from([("opacity_", 60), ("color_", 61)]),
+        );
+        g.node(0x5000, &["CCLayerColor", "CCLayer", "CCNode"], &[]);
+        g.put(g.ivar(0x5000, "opacity_"), &[200]);
+        g.put(g.ivar(0x5000, "color_"), &[10, 20, 30]);
+        let line = node_line(&mut g, 0x5000, 0, &HashMap::new());
+        assert_eq!(rgb(&line), ["200", "10", "20", "30", "-"]);
     }
 
     #[test]

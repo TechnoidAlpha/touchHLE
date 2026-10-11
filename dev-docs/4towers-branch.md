@@ -319,7 +319,8 @@ The columns, in order. `f32` is written with six significant digits as in peeks,
 | `visible` | u8 | `visible_` | every node |
 | `width`, `height` | f32 | `contentSize_` (a `CGSize`, points) | every node |
 | `opacity` | u8 | `opacity_` | `CCSprite`, `CCAtlasNode`, `CCLabelBMFont`, `CCLayerColor` |
-| `r`, `g`, `b` | u8 | `color_` (a `ccColor3B`) | the same |
+| `r`, `g`, `b` | u8 | the colour the game set, as `color` returns it: `colorUnmodified_` when the node has it and `opacityModifyRGB_` is on, otherwise `color_` (a `ccColor3B`) | the same |
+| `opacity_rgb` | u8 | `opacityModifyRGB_`: 1 when cocos2d draws the colour multiplied by the opacity | `CCSprite`, `CCAtlasNode`, `CCLabelBMFont` (`-` for `CCLayerColor`) |
 | `flip_x`, `flip_y` | u8 | `flipX_`, `flipY_` | `CCSprite` |
 | `rect_x`, `rect_y`, `rect_w`, `rect_h` | f32 | `rect_` (a `CGRect`, the part of the texture shown, in points) | `CCSprite` |
 | `batch` | u8 | `usesBatchNode_` | `CCSprite` |
@@ -338,6 +339,8 @@ The columns, in order. `f32` is written with six significant digits as in peeks,
 **The `-` rule.** Which columns apply is decided by the node's class chain: a column whose "for" names a class applies when the node's class is that class or a subclass of it (the names are matched as in Receiver class above). A column that does not apply is `-`. One that applies but cannot be read is also `-`: a field the class chain does not have, a nil or unreadable pointer, an object whose class touchHLE does not know. A text that is nil is `nil`. The walk goes on after a `-`.
 
 **The texture.** A `CCSprite` drawn by a batch node (`usesBatchNode_` set) shows the batch's texture, read through its `textureAtlas_` (a `CCTextureAtlas`) and that atlas's `texture_`; any other sprite (a `CCLabelTTF` is one) shows its own `texture_`. A `CCAtlasNode` (so `CCLabelAtlas`) and a `CCSpriteBatchNode` (so `CCLabelBMFont`) show their `textureAtlas_`'s `texture_`. If what is found is not a `CCTexture2D`, `tex` has its address and the other texture columns are `-`. `tex_file` is `-` for a texture the cache does not hold: a `CCLabelTTF`'s text is drawn into a texture of its own that never goes into the cache, and so is any texture the game made from an image it built itself. A sprite with `tex` of `nil`, or a texture with a `tex_name` of 0, is one that draws without a picture.
+
+**The colour.** A `CCSprite` (so a `CCLabelTTF`) and a `CCAtlasNode` start with `opacityModifyRGB_` on. Then `setColor:` keeps the colour in `colorUnmodified_` and stores `color_` multiplied by `opacity_ / 255`, and `setOpacity:` does the same again (`CCSprite.c` and `CCAtlasNode.c` in the decompile), so a white sprite at opacity 128 has a `color_` of 128,128,128. `r`, `g` and `b` are the colour as set (255,255,255 there), as `[sprite color]` returns it; the colour drawn is that times `opacity` / 255 when `opacity_rgb` is 1. A `CCLabelBMFont` has no `colorUnmodified_` and keeps the colour as set in `color_`.
 
 **Text.** `text`, `font` and `tex_file` are written as a `str` peek writes a string (see Peeks above): tabs, newlines, carriage returns and backslashes escaped, cut at 200 bytes with `...`. A string of a class the game defines itself is `-`.
 
