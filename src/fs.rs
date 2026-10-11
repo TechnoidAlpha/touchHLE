@@ -155,6 +155,36 @@ impl FsNode {
     }
 }
 
+/// For a file name that is missing from a directory: the read-only file (in
+/// practice, one from the app bundle) whose name matches apart from letter
+/// case, if exactly one does. 4Towers asks for "Powerup.mp3" while its bundle
+/// holds "PowerUp.mp3". Logs once per name.
+fn read_only_file_ignoring_case<'a>(
+    children: &'a HashMap<String, FsNode>,
+    name: &str,
+) -> Option<&'a FsNode> {
+    let mut found = children.iter().filter(|(child_name, child)| {
+        matches!(
+            child,
+            FsNode::File {
+                writeable: false,
+                ..
+            }
+        ) && child_name.eq_ignore_ascii_case(name)
+    });
+    let (found_name, node) = found.next()?;
+    if found.next().is_some() {
+        return None;
+    }
+    static LOGGED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+    let mut logged = LOGGED.lock().unwrap();
+    if !logged.iter().any(|logged_name| logged_name == name) {
+        log!("No file named {name:?}, using {found_name:?} (only the case differs)");
+        logged.push(name.to_string());
+    }
+    Some(node)
+}
+
 // Put well-known paths in the guest filesystem here.
 
 /// Path of the applications directory in the guest filesystem.
@@ -758,7 +788,7 @@ impl Fs {
     /// [Self::lookup_node] with a pre-resolved path.
     fn lookup_node_inner(&self, resolved_path_components: &[&str]) -> Option<&FsNode> {
         let mut node = &self.root;
-        for component in resolved_path_components {
+        for (i, component) in resolved_path_components.iter().enumerate() {
             let FsNode::Directory {
                 children,
                 writeable: _,
@@ -766,7 +796,13 @@ impl Fs {
             else {
                 return None;
             };
-            node = children.get(*component)?
+            node = match children.get(*component) {
+                Some(child) => child,
+                None if i + 1 == resolved_path_components.len() => {
+                    read_only_file_ignoring_case(children, component)?
+                }
+                None => return None,
+            };
         }
         Some(node)
     }
