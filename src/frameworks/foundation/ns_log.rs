@@ -37,12 +37,15 @@ fn NSLogv(
         arg,
     );
     // TODO: Should we include a timestamp, like the real NSLog?
+    let message = String::from_utf8_lossy(&res);
     echo!(
         "{}[{}] {}",
         env.bundle.executable_path().file_name().unwrap(),
         env.current_thread,
-        String::from_utf8_lossy(&res)
+        message
     );
+    // The same line as a row of the message trace, if it is on.
+    crate::objc::trace_app_log(env, &message);
 }
 
 pub const FUNCTIONS: FunctionExports = &[export_c_func!(NSLog(_, _)), export_c_func!(NSLogv(_, _))];

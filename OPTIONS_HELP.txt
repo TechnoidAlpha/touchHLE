@@ -237,10 +237,11 @@ Debugging options:
         milliseconds since startup, thread, whether the app or touchHLE sent
         it, how it was called, receiver class, selector, the first two
         argument words (as hex and as a float), four stack words, the link
-        register and the receiver's address. Selectors can also be listed one
-        per line in trace_selectors.txt in the user data directory (# starts
-        a comment); the option and the file add up. trace.log is replaced on
-        each run.
+        register and the receiver's address. Each line the app prints with
+        NSLog is also written as a row with origin "nslog" and the message in
+        the selector column. Selectors can also be listed one per line in
+        trace_selectors.txt in the user data directory (# starts a comment);
+        the option and the file add up. trace.log is replaced on each run.
 
         While the trace is on, input.log in the same folder gets one
         tab-separated row per finger for every touch event the app receives:

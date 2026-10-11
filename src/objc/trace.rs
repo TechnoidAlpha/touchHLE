@@ -45,7 +45,9 @@
 //!
 //! While the trace is on, every touch event the app receives is also written
 //! to `input.log` in the user data directory (see [trace_touches]), on the
-//! same clock and with the same frame numbers as `trace.log`.
+//! same clock and with the same frame numbers as `trace.log`, and every line
+//! the app prints with `NSLog` becomes a `trace.log` row with origin `nslog`
+//! (see [trace_app_log]).
 
 use super::{id, nil, Class, ClassHostObject, ObjC, IMP, SEL};
 use crate::abi::GuestFunction;
@@ -252,6 +254,7 @@ impl MsgTrace {
              # self is the receiver's address\n\
              # no imp lines for methods that return a struct or a union\n\
              # frame capture (frames/f<frame>_<ms>.png): {}; png after: {}\n\
+             # origin nslog: a line the app printed with NSLog, in the selector column\n\
              frame\tms\tthread\torigin\tvariant\tclass\tselector\targ0\targ0_f32\targ1\targ1_f32\tsp0\tsp1\tsp2\tsp3\tlr\tself\n",
             crate::branding(),
             if crate::branding().is_empty() { "" } else { " " },
@@ -606,6 +609,31 @@ fn write_line(
     let _ = trace.out.write_all(line.as_bytes());
 }
 
+/// One `trace.log` row for a line the app printed with `NSLog`: the frame,
+/// ms and thread as for any row, origin `nslog`, `-` for the variant and the
+/// class, the message in the selector column with each tab, carriage return
+/// and newline turned into a space, and `-` in the ten columns after it.
+fn nslog_row(frame: u32, ms: f64, thread: usize, message: &str) -> String {
+    let message = message.replace(['\t', '\r', '\n'], " ");
+    let rest = ["-"; 10].join("\t");
+    format!("{frame}\t{ms:.3}\t{thread}\tnslog\t-\t-\t{message}\t{rest}\n")
+}
+
+/// Called by `NSLog` with each line it prints (after the
+/// `touchHLE_log.txt` line is written). When the trace is on, the line also
+/// goes into `trace.log` as a row with origin `nslog` (see [nslog_row]), so
+/// the app's own messages sit on the trace's timeline. One unbuffered write,
+/// like every other row.
+pub fn trace_app_log(env: &mut Environment, message: &str) {
+    let elapsed_ms = env.startup_time.elapsed().as_secs_f64() * 1000.0;
+    let thread = env.current_thread;
+    let Some(trace) = env.objc.trace.as_mut() else {
+        return;
+    };
+    let row = nslog_row(trace.frame, elapsed_ms, thread, message);
+    let _ = trace.out.write_all(row.as_bytes());
+}
+
 /// The host side of every trampoline (see [trace_wrap_imp]).
 const TRAMPOLINE_FUNCTION: HostFunction = &(trace_imp_trampoline as fn(&mut Environment));
 
@@ -742,9 +770,22 @@ fn fmt_f32(bits: u32) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        capture_due, parse_selector_line, returns_struct, touch_row, Markers, TrampolineCache,
+        capture_due, nslog_row, parse_selector_line, returns_struct, touch_row, Markers,
+        TrampolineCache,
     };
     use crate::window::FingerId;
+
+    #[test]
+    fn nslog_rows_fill_every_column() {
+        let row = nslog_row(7, 1234.5, 0, "Wave\tspawner\r\nfinished\n");
+        assert_eq!(
+            row,
+            "7\t1234.500\t0\tnslog\t-\t-\tWave spawner  finished \t\
+             -\t-\t-\t-\t-\t-\t-\t-\t-\t-\n"
+        );
+        // As many columns as the header names.
+        assert_eq!(row.trim_end_matches('\n').split('\t').count(), 17);
+    }
 
     #[test]
     fn selector_lines_take_markers() {
