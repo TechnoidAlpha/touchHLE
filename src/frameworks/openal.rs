@@ -127,17 +127,19 @@ pub fn set_devices_paused(env: &mut Environment, paused: bool) {
         return;
     }
     state.devices_paused = paused;
-    let mut devices: Vec<*mut ALCdevice> = state.devices.values().copied().collect();
-    if let Some(device) = env.framework_state.audio_toolbox.al_device() {
-        devices.push(device);
-    }
+    let devices: Vec<*mut ALCdevice> = state.devices.values().copied().collect();
+    let internal_device = env.framework_state.audio_toolbox.al_device();
     log!(
         "Lifecycle: {} {} OpenAL device(s).",
         if paused { "pausing" } else { "resuming" },
-        devices.len()
+        devices.len() + usize::from(internal_device.is_some())
     );
+    // The app's own devices: their ALC error is left for the app to read.
     for device in devices {
-        unsafe { al::set_device_paused(device, paused) };
+        unsafe { al::set_device_paused(device, paused, false) };
+    }
+    if let Some(device) = internal_device {
+        unsafe { al::set_device_paused(device, paused, true) };
     }
 }
 
@@ -170,7 +172,7 @@ fn alcOpenDevice(env: &mut Environment, devicename: ConstPtr<u8>) -> MutPtr<Gues
 
     if State::get(env).devices_paused {
         // Opened in the background: it stays quiet until the app is back.
-        unsafe { al::set_device_paused(res, true) };
+        unsafe { al::set_device_paused(res, true, false) };
     }
 
     let guest_res = env.mem.alloc_and_write(GuestALCdevice { _filler: 0 });

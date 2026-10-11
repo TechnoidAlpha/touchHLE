@@ -52,9 +52,13 @@ fn device_pause_fns() -> Option<(DevicePauseFn, DevicePauseFn)> {
 /// on where they were when the device resumes. Does nothing (and logs once)
 /// if the OpenAL in use does not have the extension.
 ///
+/// With `check_error`, the device's ALC error is read and logged afterwards.
+/// Reading it clears it, so that is only for touchHLE's own device: the
+/// error state of a device the app opened is the app's to read.
+///
 /// # Safety
 /// `device` must be an open device.
-pub unsafe fn set_device_paused(device: *mut ALCdevice, paused: bool) {
+pub unsafe fn set_device_paused(device: *mut ALCdevice, paused: bool, check_error: bool) {
     let Some((pause, resume)) = device_pause_fns() else {
         return;
     };
@@ -62,6 +66,9 @@ pub unsafe fn set_device_paused(device: *mut ALCdevice, paused: bool) {
         pause(device);
     } else {
         resume(device);
+    }
+    if !check_error {
+        return;
     }
     let error = al_sys::alcGetError(device);
     if error != 0 {
