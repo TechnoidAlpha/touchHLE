@@ -2,7 +2,7 @@ name: Build touchHLE
 
 on:
   push:
-    branches: [ "trunk", "4towers", "4towers-trace" ]
+    branches: [ "trunk", "4towers", "4towers-trace", "4towers-gnu-ci" ]
   workflow_dispatch:
   pull_request:
     branches: [ "trunk" ]
@@ -277,3 +277,97 @@ jobs:
       with:
         name: TestApp_built_on_Windows
         path: tests/TestApp.app
+
+  # Fork-only: the same sources built with the GNU toolchain (MinGW-w64 from
+  # MSYS2) instead of MSVC. MSVC builds crash on Intel Iris Xe a few seconds
+  # after 4Towers' title screen; a GNU build does not. See
+  # dev-docs/4towers-branch.md.
+  build-windows-gnu:
+
+    runs-on: windows-latest
+
+    steps:
+    # actions/checkout really doesn't work well with git-describe for some
+    # reason (most likely it strips the annotation off the tag somehow).
+    - name: Checkout touchHLE
+      shell: bash # windows :)
+      run: |
+        mkdir -p "$GITHUB_WORKSPACE"
+        git clone "https://github.com/$GITHUB_REPOSITORY" "$GITHUB_WORKSPACE"
+        cd "$GITHUB_WORKSPACE"
+        git fetch origin "$GITHUB_REF"
+        git checkout "$GITHUB_SHA" # avoid race condition if branch/tag changes
+    - name: Get Submodules
+      run: git submodule update --init
+    - name: Try to get cached copy of Boost
+      id: cache-boost
+      uses: actions/cache@v3
+      with:
+        path: vendor\boost
+        key: boost_1_81_0
+    - if: ${{ steps.cache-boost.outputs.cache-hit != 'true' }}
+      name: Download Boost
+      run: curl -L -o boost_1_81_0.7z "https://archives.boost.io/release/1.81.0/source/boost_1_81_0.7z"
+    - if: ${{ steps.cache-boost.outputs.cache-hit != 'true' }}
+      name: Extract Boost
+      run: 7z -ovendor x boost_1_81_0.7z && ren vendor\boost_1_81_0 boost
+    - name: Try to get cached copy of cmake
+      id: cache-cmake
+      uses: actions/cache@v3
+      with:
+        path: vendor/cmake
+        key: cmake_3_31_6_windows
+    - if: ${{ steps.cache-cmake.outputs.cache-hit != 'true' }}
+      name: Download Cmake
+      run: curl -L -O "https://github.com/Kitware/CMake/releases/download/v3.31.6/cmake-3.31.6-windows-x86_64.zip"
+    - if: ${{ steps.cache-cmake.outputs.cache-hit != 'true' }}
+      name: Extract Cmake
+      run: 7z -ovendor x "cmake-3.31.6-windows-x86_64.zip" && ren vendor\cmake-3.31.6-windows-x86_64 cmake
+    - name: Install MinGW-w64 toolchain
+      id: msys2
+      uses: msys2/setup-msys2@v2
+      with:
+        msystem: MINGW64
+        update: false
+        install: >-
+          mingw-w64-x86_64-toolchain
+          mingw-w64-x86_64-ninja
+    - name: Install x86_64 GNU Rust toolchain
+      run: rustup target add x86_64-pc-windows-gnu
+    # The dynarmic wrapper looks for fmt, mcl and Zydis in a "Release" folder
+    # on Windows, which is where a multi-config generator puts them.
+    - name: Build
+      shell: pwsh
+      run: |
+        $env:PATH = "${{ steps.msys2.outputs.msys2-location }}\mingw64\bin;$env:PATH"
+        cargo build --release --target x86_64-pc-windows-gnu
+      env:
+        CMAKE: ${{ github.workspace }}\vendor\cmake\bin\cmake
+        CMAKE_GENERATOR: Ninja Multi-Config
+        CC_x86_64_pc_windows_gnu: gcc
+        CXX_x86_64_pc_windows_gnu: g++
+        AR_x86_64_pc_windows_gnu: ar
+        CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER: gcc
+    # The same bundle as the MSVC job, plus any MinGW runtime DLLs the exe
+    # needs.
+    - name: Create bundle
+      shell: bash
+      run: |
+        cd dev-scripts && ./make-windows-bundle.sh ../target/x86_64-pc-windows-gnu/release/touchHLE.exe && mv touchHLE_windows_bundle/ ..
+        cd ..
+        MINGW_BIN="$(cygpath -u '${{ steps.msys2.outputs.msys2-location }}')/mingw64/bin"
+        for pass in 1 2 3; do
+          for f in touchHLE_windows_bundle/*.exe touchHLE_windows_bundle/*.dll; do
+            [ -f "$f" ] || continue
+            for dll in $("$MINGW_BIN/objdump" -p "$f" | sed -n 's/.*DLL Name: //p' | tr -d '\r'); do
+              if [ -f "$MINGW_BIN/$dll" ] && [ ! -f "touchHLE_windows_bundle/$dll" ]; then
+                cp "$MINGW_BIN/$dll" touchHLE_windows_bundle/
+              fi
+            done
+          done
+        done
+        ls -la touchHLE_windows_bundle
+    - uses: actions/upload-artifact@v4
+      with:
+        name: touchHLE_windows_x86_64_gnu
+        path: touchHLE_windows_bundle/
