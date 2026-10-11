@@ -6,11 +6,12 @@
 //! `UIFont`.
 
 use super::ui_graphics::UIGraphicsGetCurrentContext;
-use crate::font::{Font, TextAlignment, WrapMode};
+use crate::font::{face_names, FaceNames, Font, TextAlignment, WrapMode};
 use crate::frameworks::core_graphics::cg_bitmap_context::CGBitmapContextDrawer;
 use crate::frameworks::core_graphics::{CGFloat, CGPoint, CGRect, CGSize};
 use crate::frameworks::foundation::ns_string::to_rust_string;
 use crate::frameworks::foundation::NSInteger;
+use crate::fs::GuestPath;
 use crate::objc::{autorelease, id, msg, objc_classes, ClassExports, HostObject};
 use crate::Environment;
 use std::collections::HashMap;
@@ -21,9 +22,24 @@ pub(super) struct State {
     fonts: HashMap<FontKind, Font>,
     sans_regular_ja: Option<Font>,
     sans_bold_ja: Option<Font>,
+    /// Fonts loaded from the app bundle, see [find_bundle_font]. A
+    /// [FontKind::Bundle] is an index into this.
+    bundle_fonts: Vec<Font>,
+    /// What each name passed to `fontWithName:size:` found in the bundle:
+    /// an index into `bundle_fonts`, or [None] if nothing.
+    bundle_font_for_name: HashMap<String, Option<usize>>,
+    /// The bundle font file and face index behind each of `bundle_fonts`, so
+    /// a face asked for under two names is loaded once.
+    bundle_font_for_face: HashMap<(String, u32), usize>,
+    /// The font files in the bundle's root and the names of their faces,
+    /// read the first time a name has to be looked up that way.
+    bundle_face_names: Option<Vec<(String, FaceNames)>>,
 }
 impl State {
     fn get_font_by_kind(&mut self, font_kind: FontKind) -> &Font {
+        if let FontKind::Bundle(index) = font_kind {
+            return &self.bundle_fonts[index];
+        }
         self.fonts
             .entry(font_kind)
             .or_insert_with(|| match font_kind {
@@ -39,6 +55,7 @@ impl State {
                 FontKind::SerifBold => Font::serif_bold(),
                 FontKind::SerifBoldItalic => Font::serif_bold_italic(),
                 FontKind::SerifItalic => Font::serif_italic(),
+                FontKind::Bundle(_) => unreachable!(),
             })
     }
 }
@@ -57,6 +74,9 @@ enum FontKind {
     SerifBold,
     SerifBoldItalic,
     SerifItalic,
+    /// A font file shipped in the app bundle, loaded by
+    /// `fontWithName:size:`. The index is into [State]'s `bundle_fonts`.
+    Bundle(usize),
 }
 
 struct UIFontHostObject {
@@ -136,11 +156,14 @@ pub const CLASSES: ClassExports = objc_classes! {
 + (id)fontWithName:(id)fontName // NSString*
             size:(CGFloat)fontSize {
     let font_name = to_rust_string(env, fontName).to_string();
-    let host_object = UIFontHostObject {
-        kind: get_equivalent_font(&font_name).unwrap_or_else(|| {
+    let kind = get_equivalent_font(&font_name)
+        .or_else(|| find_bundle_font(env, &font_name))
+        .unwrap_or_else(|| {
             log!("No replacement found for font {}. Using system font instead.", font_name);
             FontKind::SansRegular
-        }),
+        });
+    let host_object = UIFontHostObject {
+        kind,
         size: fontSize,
     };
     let new = env.objc.alloc_object(this, Box::new(host_object), &mut env.mem);
@@ -204,7 +227,7 @@ fn get_font<'a>(state: &'a mut State, kind: FontKind, text: &str) -> &'a Font {
            (0x3400..=0x4DBF).contains(&c) { // more kanji
             match kind {
                 // CJK has no italic equivalent
-                FontKind::MonoRegular | FontKind::MonoItalic | FontKind::SansRegular | FontKind::SansItalic | FontKind::SerifRegular | FontKind::SerifItalic => {
+                FontKind::MonoRegular | FontKind::MonoItalic | FontKind::SansRegular | FontKind::SansItalic | FontKind::SerifRegular | FontKind::SerifItalic | FontKind::Bundle(_) => {
                     if state.sans_regular_ja.is_none() {
                         state.sans_regular_ja = Some(Font::sans_regular_ja());
                     }
@@ -417,6 +440,181 @@ pub fn draw_in_rect(
     text_size
 }
 
+/// The file names to look for in the bundle's root for a name passed to
+/// `fontWithName:size:`, in order: the name itself (4Towers passes
+/// "Alien-Encounters-Bold.ttf"), then with `.ttf`, `.otf` and `.ttc` added
+/// (it also passes "Alien-Encounters-Solid-Bold" and "Futura"). Empty for a
+/// name that is empty or has a `/` in it.
+fn font_file_candidates(name: &str) -> Vec<String> {
+    if name.is_empty() || name.contains('/') {
+        return Vec::new();
+    }
+    let mut candidates = vec![name.to_string()];
+    for extension in [".ttf", ".otf", ".ttc"] {
+        candidates.push(format!("{name}{extension}"));
+    }
+    candidates
+}
+
+/// Whether a bundle file name ends in a font extension (`.ttf`, `.otf` or
+/// `.ttc`, any case).
+fn is_font_file_name(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    [".ttf", ".otf", ".ttc"]
+        .iter()
+        .any(|extension| lower.ends_with(extension))
+}
+
+/// The face whose PostScript name, else full name, else family name is
+/// exactly `name`. The faces are searched in the order given, so with two
+/// matches the first file (and the first face in it) wins. Returns the index
+/// into `faces` and the face index within that file.
+fn match_face_by_name(name: &str, faces: &[(String, FaceNames)]) -> Option<(usize, u32)> {
+    let fields: [fn(&FaceNames) -> &Vec<String>; 3] =
+        [|f| &f.postscript, |f| &f.full, |f| &f.family];
+    fields.iter().find_map(|field| {
+        faces
+            .iter()
+            .position(|(_, face)| field(face).iter().any(|n| n == name))
+            .map(|i| (i, faces[i].1.index))
+    })
+}
+
+/// For a name `fontWithName:size:` does not know: a font file shipped in the
+/// app bundle's root, loaded through the guest filesystem.
+///
+/// First the file names from [font_file_candidates], matching the case
+/// exactly, then (with `--bundle-files-ignore-case`) the same names through
+/// the filesystem's case-insensitive fallback. A `.ttc` found by file name
+/// gives its first face. Then the PostScript, full and family names inside
+/// every `.ttf`, `.otf` and `.ttc` in the bundle root (see
+/// [match_face_by_name]).
+///
+/// The result is cached per name, and which file was taken is logged once
+/// per name.
+fn find_bundle_font(env: &mut Environment, name: &str) -> Option<FontKind> {
+    if let Some(&found) = env
+        .framework_state
+        .uikit
+        .ui_font
+        .bundle_font_for_name
+        .get(name)
+    {
+        return found.map(FontKind::Bundle);
+    }
+
+    let found = find_bundle_font_uncached(env, name);
+    let state = &mut env.framework_state.uikit.ui_font;
+    state.bundle_font_for_name.insert(name.to_string(), found);
+    found.map(FontKind::Bundle)
+}
+
+/// The search behind [find_bundle_font], without the cache.
+fn find_bundle_font_uncached(env: &mut Environment, name: &str) -> Option<usize> {
+    let bundle_path = env.bundle.bundle_path().to_owned();
+    let mut files: Vec<String> = match env.fs.enumerate(&bundle_path) {
+        Ok(names) => names.map(String::from).collect(),
+        Err(()) => return None,
+    };
+    files.retain(|file| env.fs.is_file(&bundle_path.join(file)));
+    files.sort();
+
+    // By file name.
+    let candidates = font_file_candidates(name);
+    let exact = candidates.iter().find(|c| files.contains(c)).cloned();
+    let by_file = exact.or_else(|| {
+        if !env.options.bundle_files_ignore_case {
+            return None;
+        }
+        // With this option on, the filesystem takes a name that differs only
+        // in case (and logs it).
+        candidates
+            .into_iter()
+            .find(|c| env.fs.is_file(&bundle_path.join(c)))
+    });
+    if let Some(file) = by_file {
+        if let Some(index) = load_bundle_font(env, &bundle_path, &file, 0) {
+            log!(
+                "Font {:?}: using {:?} from the app bundle (by file name)",
+                name,
+                file
+            );
+            return Some(index);
+        }
+    }
+
+    // By the names inside the font files.
+    if env
+        .framework_state
+        .uikit
+        .ui_font
+        .bundle_face_names
+        .is_none()
+    {
+        let mut all = Vec::new();
+        for file in files.iter().filter(|file| is_font_file_name(file)) {
+            let Ok(bytes) = env.fs.read(bundle_path.join(file)) else {
+                continue;
+            };
+            for face in face_names(&bytes) {
+                all.push((file.clone(), face));
+            }
+        }
+        env.framework_state.uikit.ui_font.bundle_face_names = Some(all);
+    }
+    let faces = env
+        .framework_state
+        .uikit
+        .ui_font
+        .bundle_face_names
+        .as_ref()
+        .unwrap();
+    let (i, face_index) = match_face_by_name(name, faces)?;
+    let file = faces[i].0.clone();
+    let index = load_bundle_font(env, &bundle_path, &file, face_index)?;
+    log!(
+        "Font {:?}: using {:?} (face {}) from the app bundle (by the name inside the font)",
+        name,
+        file,
+        face_index
+    );
+    Some(index)
+}
+
+/// Load face `face_index` of the bundle file `file` (once) and return its
+/// index in [State]'s `bundle_fonts`.
+fn load_bundle_font(
+    env: &mut Environment,
+    bundle_path: &GuestPath,
+    file: &str,
+    face_index: u32,
+) -> Option<usize> {
+    let key = (file.to_string(), face_index);
+    if let Some(&index) = env
+        .framework_state
+        .uikit
+        .ui_font
+        .bundle_font_for_face
+        .get(&key)
+    {
+        return Some(index);
+    }
+    let bytes = env.fs.read(bundle_path.join(file)).ok()?;
+    let Some(font) = Font::from_bundle_bytes(bytes, face_index) else {
+        log!(
+            "Bundle file {:?} (face {}) could not be read as a font",
+            file,
+            face_index
+        );
+        return None;
+    };
+    let state = &mut env.framework_state.uikit.ui_font;
+    state.bundle_fonts.push(font);
+    let index = state.bundle_fonts.len() - 1;
+    state.bundle_font_for_face.insert(key, index);
+    Some(index)
+}
+
 fn get_equivalent_font(system_font: &str) -> Option<FontKind> {
     // Maps every font found in every font family in an iOS 2 Simulator
     match system_font {
@@ -481,5 +679,93 @@ fn get_equivalent_font(system_font: &str) -> Option<FontKind> {
         "Georgia-BoldItalic" => None,
         "Georgia-Italic" => None,
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{font_file_candidates, is_font_file_name, match_face_by_name};
+    use crate::font::FaceNames;
+
+    #[test]
+    fn font_file_candidates_add_the_extensions() {
+        assert_eq!(
+            font_file_candidates("Alien-Encounters-Solid-Bold"),
+            [
+                "Alien-Encounters-Solid-Bold",
+                "Alien-Encounters-Solid-Bold.ttf",
+                "Alien-Encounters-Solid-Bold.otf",
+                "Alien-Encounters-Solid-Bold.ttc",
+            ]
+        );
+        assert_eq!(
+            font_file_candidates("Alien-Encounters-Bold.ttf")[0],
+            "Alien-Encounters-Bold.ttf"
+        );
+        assert!(font_file_candidates("").is_empty());
+        assert!(font_file_candidates("../Ozone.ttf").is_empty());
+    }
+
+    #[test]
+    fn font_files_are_found_by_extension() {
+        assert!(is_font_file_name("Ozone.ttf"));
+        assert!(is_font_file_name("DisplayOTF.otf"));
+        assert!(is_font_file_name("Futura.TTC"));
+        assert!(!is_font_file_name("Default.png"));
+    }
+
+    fn face(index: u32, postscript: &str, full: &str, family: &str) -> FaceNames {
+        FaceNames {
+            index,
+            postscript: vec![postscript.to_string()],
+            full: vec![full.to_string()],
+            family: vec![family.to_string()],
+        }
+    }
+
+    #[test]
+    fn faces_match_postscript_then_full_then_family() {
+        let faces = vec![
+            (
+                "Alien-Encounters-Bold.ttf".to_string(),
+                face(
+                    0,
+                    "AlienEncountersBold",
+                    "Alien Encounters Bold",
+                    "Alien Encounters",
+                ),
+            ),
+            (
+                "Futura.ttc".to_string(),
+                face(0, "Futura-Medium", "Futura Medium", "Futura"),
+            ),
+            (
+                "Futura.ttc".to_string(),
+                face(1, "Futura-MediumItalic", "Futura Medium Italic", "Futura"),
+            ),
+            (
+                "Odd.ttf".to_string(),
+                face(0, "Futura", "Futura Odd", "Futura Odd"),
+            ),
+        ];
+        assert_eq!(
+            match_face_by_name("AlienEncountersBold", &faces),
+            Some((0, 0))
+        );
+        assert_eq!(
+            match_face_by_name("Alien Encounters Bold", &faces),
+            Some((0, 0))
+        );
+        assert_eq!(
+            match_face_by_name("Futura-MediumItalic", &faces),
+            Some((2, 1))
+        );
+        // A PostScript name wins over an earlier family name.
+        assert_eq!(match_face_by_name("Futura", &faces), Some((3, 0)));
+        assert_eq!(match_face_by_name("Futura Medium", &faces), Some((1, 0)));
+        // Without it, the first face of the family.
+        assert_eq!(match_face_by_name("Alien Encounters", &faces), Some((0, 0)));
+        assert_eq!(match_face_by_name("futura", &faces), None);
+        assert_eq!(match_face_by_name("Helvetica", &faces), None);
     }
 }

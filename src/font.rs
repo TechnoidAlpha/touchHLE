@@ -112,6 +112,27 @@ impl Font {
         }
     }
 
+    /// A font file shipped in the app bundle: a `.ttf`, an `.otf` or face
+    /// `index` of a `.ttc` collection. Returns [None] if it cannot be parsed.
+    ///
+    /// Unlike the bundled Liberation fonts, which stand in for Helvetica with
+    /// an eyeballed factor, this is the font the app asked for, so it is
+    /// sized the way iPhone OS sizes fonts: the point size is the em size.
+    /// RustType's [Scale] is the height from descender to ascender instead,
+    /// hence the factor.
+    pub fn from_bundle_bytes(bytes: Vec<u8>, index: u32) -> Option<Font> {
+        let font = rusttype::Font::try_from_vec_and_index(bytes, index)?;
+        let units_per_em = f32::from(font.units_per_em());
+        let v_metrics = font.v_metrics_unscaled();
+        let height = v_metrics.ascent - v_metrics.descent;
+        let scale_factor = if units_per_em > 0.0 && height > 0.0 {
+            height / units_per_em
+        } else {
+            1.0
+        };
+        Some(Font { font, scale_factor })
+    }
+
     pub fn mono_regular() -> Font {
         Self::from_resource_file("LiberationMono-Regular.ttf")
     }
@@ -629,4 +650,63 @@ impl Font {
             draw_glyph(raster_glyph);
         }
     }
+}
+
+/// The names one face of a font file gives itself in its `name` table.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct FaceNames {
+    /// Index of the face in a `.ttc` collection, 0 otherwise.
+    pub index: u32,
+    /// PostScript names (name ID 6), e.g. `Futura-Medium`.
+    pub postscript: Vec<String>,
+    /// Full names (name ID 4), e.g. `Futura Medium`.
+    pub full: Vec<String>,
+    /// Family names (name ID 1), e.g. `Futura`.
+    pub family: Vec<String>,
+}
+
+/// The names of every face in a font file (`.ttf`, `.otf` or `.ttc`), in
+/// face order. Empty if the file cannot be parsed. Names stored as Unicode
+/// (Windows or Unicode platform) and as plain ASCII on the Macintosh
+/// platform are read; old fonts such as the Futura collection 4Towers ships
+/// only have the latter.
+pub fn face_names(bytes: &[u8]) -> Vec<FaceNames> {
+    use owned_ttf_parser::{name_id, Face, PlatformId};
+
+    let count = owned_ttf_parser::fonts_in_collection(bytes).unwrap_or(1);
+    let mut faces = Vec::new();
+    for index in 0..count {
+        let Ok(face) = Face::from_slice(bytes, index) else {
+            continue;
+        };
+        let mut names = FaceNames {
+            index,
+            ..Default::default()
+        };
+        for name in face.names() {
+            let list = match name.name_id {
+                name_id::POST_SCRIPT_NAME => &mut names.postscript,
+                name_id::FULL_NAME => &mut names.full,
+                name_id::FAMILY => &mut names.family,
+                _ => continue,
+            };
+            let text = if name.is_unicode() {
+                name.to_string()
+            } else if name.platform_id == PlatformId::Macintosh
+                && name.encoding_id == 0
+                && name.name.is_ascii()
+            {
+                Some(String::from_utf8_lossy(name.name).into_owned())
+            } else {
+                None
+            };
+            if let Some(text) = text {
+                if !text.is_empty() && !list.contains(&text) {
+                    list.push(text);
+                }
+            }
+        }
+        faces.push(names);
+    }
+    faces
 }
