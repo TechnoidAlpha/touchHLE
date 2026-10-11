@@ -74,18 +74,18 @@ A selector can be narrowed to one class of receiver by ending the word with `@` 
 - It applies to every row of the selector: `send`, `stret`, `super2` and `imp` alike. For a `super2` row it is the receiver's own class that is matched, not the superclass named in the `class` column. A scheduled selector gets its `imp` stub whatever the class; the stub checks the receiver at each call and writes nothing for a receiver that does not match.
 - The same selector may be listed more than once, with different classes, or with and without one: a call is traced if any of its lines takes the receiver. A `png` marker counts only for calls its own line takes. Peeks belong to the selector, not to a line, so every traced row of the selector has the peeks of all its lines (one `# peeks` line per selector, as below).
 - The `# selectors:` line of the header lists the words as written, `@` and class included. A word with nothing before the `@`, or nothing (or another `@`) after it, is not understood: its line is ignored and logged.
-- An item of `--trace-selectors=` takes the same words: `--trace-selectors=setPosition:@CCLabelTTF,setString:;arg0:str`.
+- An item of `--trace-selectors=` takes the same words: `--trace-selectors=setPosition:@CCLabelTTF,setString:@CCLabelTTF;arg0:str`.
 
 The class of each receiver is looked up once per selector, so a filter costs a hash lookup per call after the first.
 
 What each label says and where it is, for 4Towers' HUD:
 
 ```
-initWithString:dimensions:alignment:fontName:fontSize: arg0:str
+initWithString:dimensions:alignment:fontName:fontSize:@CCLabelTTF arg0:str
 setPosition:@CCLabelTTF
 ```
 
-The first line writes the text of each `CCLabelTTF` made with a box (`labelWithString:dimensions:alignment:fontName:fontSize:` goes through it), with the new label's address in `self`. The second writes each move of a `CCLabelTTF`, and of no other node. `setPosition:` takes a `CGPoint`, which arrives as two floats in r2 and r3, so the `arg0_f32` and `arg1_f32` columns already are its x and y in points, and its `self` is the label's address, which joins it to the label's text. Add `setString: arg0:str` for the changes of text (see the list of label selectors under Peeks).
+The first line writes the text of each `CCLabelTTF` made with a box (`labelWithString:dimensions:alignment:fontName:fontSize:` goes through it), with the new label's address in `self`. The `@CCLabelTTF` on it is needed: a `CCLabelTTF` draws its text into a texture, and its `setString:` (which each of its `init`s sends, and which runs again at every change of text) makes that texture by sending the same selector to a new `CCTexture2D` (cocos2d's text category on `CCTexture2D` has `initWithString:dimensions:alignment:fontName:fontSize:` and `initWithString:fontName:fontSize:`). Without the class, each label's creation and each change of its text also writes a row with `CCTexture2D` in the `class` column and the texture's address in `self`, which no row of the label shares. The second line writes each move of a `CCLabelTTF`, and of no other node. `setPosition:` takes a `CGPoint`, which arrives as two floats in r2 and r3, so the `arg0_f32` and `arg1_f32` columns already are its x and y in points, and its `self` is the label's address, which joins it to the label's text. Add `setString:@CCLabelTTF arg0:str` for the changes of text (see the list of label selectors under Peeks).
 
 ### Peeks
 
@@ -137,15 +137,19 @@ Rows:
 
 No-panic rule: a peek only reads memory, through touchHLE's non-panicking reader, and the class table. It never sends a message or calls the game. A nil base, a pointer into the null page or past the end of memory, an object whose isa is not a known class, or a class chain without that ivar gives `-` in the column, and the reason is logged once per selector and peek; the run carries on. Reads need not be aligned. A wrong type is not detected: it gives a wrong number, not a `-` (except `str`, which gives `-` for anything that is not a string). The offset of each ivar is looked up once per class and cached, so a row with four peeks costs a few extra memory reads.
 
-A list for the labels of 4Towers' HUD is below. cocos2d's labels take their text as an `NSString` in the first argument, and every `labelWithString:...` the game calls goes through the matching `initWithString:...`, so these catch each label as it is made (`CCLabelTTF`, then `CCLabelBMFont` and `CCLabelAtlas`), and `setString:` each change of its text. The `self` column of an `init` row is the label's address, which the label's later rows share. An `init` may also send `setString:` itself, which gives a second row with the same text.
+A list for the labels of 4Towers' HUD is below. cocos2d's labels take their text as an `NSString` in the first argument, and every `labelWithString:...` the game calls goes through the matching `initWithString:...`, so these catch each label as it is made (`CCLabelTTF`, then `CCLabelBMFont` and `CCLabelAtlas`), and `setString:` each change of its text. The `self` column of an `init` row is the label's address, which the label's later rows share. Each of these `init`s also sends `setString:` to the new label, which gives a second row with the same text.
 
 ```
-initWithString:dimensions:alignment:fontName:fontSize: arg0:str
-initWithString:fontName:fontSize: arg0:str
-initWithString:fntFile: arg0:str
-initWithString:charMapFile:itemWidth:itemHeight:startCharMap: arg0:str
-setString: arg0:str
+initWithString:dimensions:alignment:fontName:fontSize:@CCLabelTTF arg0:str
+initWithString:fontName:fontSize:@CCLabelTTF arg0:str
+initWithString:fntFile:@CCLabelBMFont arg0:str
+initWithString:charMapFile:itemWidth:itemHeight:startCharMap:@CCLabelAtlas arg0:str
+setString:@CCLabelTTF arg0:str
+setString:@CCLabelBMFont arg0:str
+setString:@CCLabelAtlas arg0:str
 ```
+
+Keep the classes (see Receiver class above). Without them the two `CCLabelTTF` `init` lines also take each label's texture: `CCLabelTTF`'s `setString:` sends one of those two selectors to a new `CCTexture2D`, so each label's creation and each change of its text gives one more row, with `CCTexture2D` in the `class` column and the texture's address in `self`, which never joins to the label's rows. A bare `setString:` would also take other receivers: an `NSMutableString`'s (cocos2d's TMX map reader uses one) and a `CCMenuItemLabel`'s, which passes the text on to its label (the label's own `setString:` is a row of its own, with the label's address).
 
 A list for 4Towers, from the decompile's field list (the offsets in the comments are the armv7 binary's, in case a name lookup ever fails):
 
