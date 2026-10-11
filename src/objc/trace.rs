@@ -423,10 +423,8 @@ pub fn trace_present_frame(env: &mut Environment) -> Option<FrameCaptureTicket> 
     let trace = env.objc.trace.as_mut()?;
     let frame = trace.frame;
     trace.frame = trace.frame.wrapping_add(1);
-    if trace.capture.is_none() {
-        return None;
-    }
-    if !capture_due(frame, trace.capture_every, trace.capture_pending) {
+    let due = capture_due(frame, trace.capture_every, trace.capture_pending);
+    if trace.capture.is_none() || !due {
         return None;
     }
     trace.capture_pending = false;
