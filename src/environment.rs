@@ -702,6 +702,7 @@ impl Environment {
             &env.options.trace_selectors,
             env.options.capture_frames,
             env.options.capture_frames_max,
+            env.options.dump_scene_every,
             env.bundle.bundle_identifier(),
         );
 

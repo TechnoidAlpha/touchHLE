@@ -172,6 +172,9 @@ pub enum Event {
     /// User pressed F12, requesting that execution be paused and the debugger
     /// take over.
     EnterDebugger,
+    /// User pressed F11 (or the Android wrapper sent it), asking for a scene
+    /// dump of the message trace (see `trace_request_scene_dump`).
+    DumpScene,
     TextInput(TextInputEvent),
 }
 
@@ -911,6 +914,16 @@ impl Window {
                     // the event but it's stuck in the queue.
                     echo!("F12 pressed, EnterDebugger event queued.");
                     Event::EnterDebugger
+                }
+                // A scene dump for the message trace. The Android wrapper
+                // sends KEYCODE_F11, which SDL maps to the same keycode.
+                E::KeyDown {
+                    keycode: Some(sdl2::keyboard::Keycode::F11),
+                    repeat: false,
+                    ..
+                } => {
+                    echo!("F11 pressed, DumpScene event queued.");
+                    Event::DumpScene
                 }
                 E::KeyDown {
                     keycode: Some(sdl2::keyboard::Keycode::Backspace),

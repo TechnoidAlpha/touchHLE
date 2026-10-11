@@ -11,8 +11,8 @@
 //! Selectors come from the `--trace-selectors=` option and from the file
 //! `trace_selectors.txt` in the user data directory (one per line, `#` starts
 //! a comment); the two add up. The trace is on when there is at least one
-//! selector or `--capture-frames=` is set. When it is off, the only cost per
-//! message is one `Option::is_some` check.
+//! selector or `--capture-frames=` or `--dump-scene-every=` is set. When it
+//! is off, the only cost per message is one `Option::is_some` check.
 //!
 //! A line of `trace_selectors.txt` may add marker words after the selector,
 //! separated by spaces (see [parse_selector_line]). The only one is `png`:
@@ -73,8 +73,17 @@
 //! same clock and with the same frame numbers as `trace.log`, and every line
 //! the app prints with `NSLog` becomes a `trace.log` row with origin `nslog`
 //! (see [trace_app_log]).
+//!
+//! A scene dump (see [scene]) writes what cocos2d has on screen, one line
+//! per node, to `scene/s{frame:06}_{ms}.txt`, with a `mark` row in
+//! `trace.log` and the frame's picture in `frames/`. It is asked for with
+//! F11 (see [trace_request_scene_dump]), with the `scene` marker on a line
+//! of `trace_selectors.txt`, and every Nth frame with
+//! `--dump-scene-every=N`, and is taken when the next frame is presented
+//! (see [trace_present_frame]).
 
 mod peek;
+mod scene;
 
 use super::{id, nil, Class, ClassHostObject, ObjC, IMP, SEL};
 use crate::abi::GuestFunction;
@@ -119,6 +128,8 @@ pub(super) enum SendVariant {
 struct Markers {
     /// `png`: save the first frame presented after each call.
     png: bool,
+    /// `scene`: dump the scene when the next frame is presented.
+    scene: bool,
     /// The selector's peeks: an index into [MsgTrace::peek_sets], or [None]
     /// if it has none.
     peeks: Option<usize>,
@@ -132,6 +143,8 @@ struct Filter {
     class: Option<String>,
     /// `png` on any of those lines.
     png: bool,
+    /// `scene` on any of those lines.
+    scene: bool,
 }
 
 /// A traced selector: who it is traced for, and its peeks.
@@ -147,17 +160,22 @@ struct Traced {
 
 impl Traced {
     /// Add a line of this selector with receiver class `class` and the
-    /// `png` marker if `png`. A class listed twice gets one filter.
-    fn add(&mut self, class: Option<&str>, png: bool) {
+    /// `png` and `scene` markers if `png` and `scene`. A class listed twice
+    /// gets one filter.
+    fn add(&mut self, class: Option<&str>, png: bool, scene: bool) {
         match self
             .filters
             .iter_mut()
             .find(|f| f.class.as_deref() == class)
         {
-            Some(filter) => filter.png |= png,
+            Some(filter) => {
+                filter.png |= png;
+                filter.scene |= scene;
+            }
             None => self.filters.push(Filter {
                 class: class.map(str::to_string),
                 png,
+                scene,
             }),
         }
     }
@@ -169,10 +187,12 @@ impl Traced {
 
     /// The markers of a call whose receiver's class chain (its class, then
     /// each superclass) has the names `chain`, or [None] if no filter takes
-    /// it. `png` is set if a filter that takes it has `png`.
+    /// it. `png` (`scene`) is set if a filter that takes it has `png`
+    /// (`scene`).
     fn markers_for<S: AsRef<str>>(&self, chain: &[S]) -> Option<Markers> {
         let mut taken = false;
         let mut png = false;
+        let mut scene = false;
         for filter in &self.filters {
             let takes = filter
                 .class
@@ -181,10 +201,12 @@ impl Traced {
             if takes {
                 taken = true;
                 png |= filter.png;
+                scene |= filter.scene;
             }
         }
         taken.then_some(Markers {
             png,
+            scene,
             peeks: self.peeks,
         })
     }
@@ -243,6 +265,36 @@ pub struct MsgTrace {
     /// Whether the "frames are not captured on this path" message has been
     /// logged.
     uncaptured_path_logged: bool,
+    /// `--capture-frames-max=`, for a capture started by a scene dump.
+    capture_max: u32,
+    /// Set once the frame capture was started, or failed to start, or
+    /// finished: a scene dump never starts it (and empties `frames/`)
+    /// again, see [start_capture_for_scene].
+    capture_no_restart: bool,
+    /// The scene dumps, see [scene].
+    scene: SceneDumps,
+}
+
+/// The state of the scene dumps (see [scene] and [trace_present_frame]).
+#[derive(Default)]
+struct SceneDumps {
+    /// `--dump-scene-every=N`: dump the scene every Nth frame. 0 is off.
+    every: u32,
+    /// Why a dump was asked for since the last frame (F11, a `scene`
+    /// selector), each reason once, in order.
+    pending: Vec<String>,
+    /// The `scene` folder once it is ready (earlier dumps removed), or
+    /// `Err` if making it ready failed (then no dump is written).
+    dir: Option<Result<std::path::PathBuf, ()>>,
+    /// The address of the static variable that held the `CCDirector` last
+    /// time, see [scene::find_singleton].
+    director_slot: Option<u32>,
+    /// The same for the `CCTextureCache`.
+    texture_cache_slot: Option<u32>,
+    /// Whether a missing director has been logged.
+    no_director_logged: bool,
+    /// Whether a missing texture cache has been logged.
+    no_texture_cache_logged: bool,
 }
 
 /// The trampolines handed out for traced selectors, keyed both ways: by what
@@ -294,6 +346,8 @@ struct SelectorLine {
     error: Option<String>,
     /// The `png` marker.
     png: bool,
+    /// The `scene` marker.
+    scene: bool,
     /// The peek specs, in the order given.
     peeks: Vec<PeekSpec>,
     /// Words that are neither a marker nor a peek: ignored, logged once.
@@ -305,9 +359,9 @@ struct SelectorLine {
 /// One line of `trace_selectors.txt`: the selector, optionally followed by
 /// `@ClassName` in the same word, then optional marker words and peek specs
 /// in any order, separated by spaces or tabs; `#` starts a comment. Returns
-/// [None] for a blank or comment-only line. The only marker is `png`; a
-/// word starting with `self`, `arg0` or `arg1` is a peek (see [peek]); any
-/// other word is ignored, and logged once by the caller.
+/// [None] for a blank or comment-only line. The markers are `png` and
+/// `scene`; a word starting with `self`, `arg0` or `arg1` is a peek (see
+/// [peek]); any other word is ignored, and logged once by the caller.
 fn parse_selector_line(line: &str) -> Option<SelectorLine> {
     let line = line.split('#').next().unwrap();
     let mut words = line.split_whitespace();
@@ -333,6 +387,8 @@ fn parse_selector_line(line: &str) -> Option<SelectorLine> {
     for word in words {
         if word == "png" {
             parsed.png = true;
+        } else if word == "scene" {
+            parsed.scene = true;
         } else if peek::looks_like_peek(word) {
             match peek::parse_peek(word) {
                 Ok(spec) => parsed.peeks.push(spec),
@@ -353,6 +409,15 @@ fn capture_cap(capture_max: u32) -> String {
     }
 }
 
+/// `--dump-scene-every=` in words, for the trace header and the log.
+fn periodic_scene(every: u32) -> String {
+    match every {
+        0 => "no periodic dump".to_string(),
+        1 => "every frame".to_string(),
+        n => format!("every {n}th frame"),
+    }
+}
+
 /// `--capture-frames=` in words, for the trace header and the log.
 fn periodic_capture(capture_every: u32) -> String {
     match capture_every {
@@ -364,12 +429,14 @@ fn periodic_capture(capture_every: u32) -> String {
 
 impl MsgTrace {
     /// Gather the selectors from the option and the file, and open the log if
-    /// there are any or `capture_every` is not 0. At most `capture_max`
-    /// frames are saved (0: no cap). Returns [None] when the trace is off.
+    /// there are any or `capture_every` or `scene_every` is not 0. At most
+    /// `capture_max` frames are saved (0: no cap). Returns [None] when the
+    /// trace is off.
     fn open(
         option_selectors: &[String],
         capture_every: u32,
         capture_max: u32,
+        scene_every: u32,
         bundle_id: &str,
     ) -> Option<MsgTrace> {
         let base = crate::paths::user_data_base_path();
@@ -396,6 +463,7 @@ impl MsgTrace {
         // header, and those with png.
         let mut list: Vec<String> = Vec::new();
         let mut png_words: HashSet<String> = HashSet::new();
+        let mut scene_words: HashSet<String> = HashSet::new();
         let mut traced: Vec<Traced> = Vec::new();
         let mut by_name: HashMap<String, usize> = HashMap::new();
         let mut peek_sets: Vec<PeekSet> = Vec::new();
@@ -412,7 +480,7 @@ impl MsgTrace {
             for word in &line.unknown {
                 if unknown_logged.insert(word.clone()) {
                     log!(
-                        "Warning: {} has an unknown marker {:?} (after {}), ignored; the only marker is png, and a peek starts with self, arg0 or arg1",
+                        "Warning: {} has an unknown marker {:?} (after {}), ignored; the markers are png and scene, and a peek starts with self, arg0 or arg1",
                         source,
                         word,
                         line.selector
@@ -434,12 +502,15 @@ impl MsgTrace {
             if line.png {
                 png_words.insert(line.word.clone());
             }
+            if line.scene {
+                scene_words.insert(line.word.clone());
+            }
             let index = *by_name.entry(line.selector.clone()).or_insert_with(|| {
                 traced.push(Traced::default());
                 traced.len() - 1
             });
             let entry = &mut traced[index];
-            entry.add(line.class.as_deref(), line.png);
+            entry.add(line.class.as_deref(), line.png, line.scene);
             if line.peeks.is_empty() {
                 continue;
             }
@@ -461,12 +532,17 @@ impl MsgTrace {
                 }
             }
         }
-        if traced.is_empty() && capture_every == 0 {
+        if traced.is_empty() && capture_every == 0 && scene_every == 0 {
             return None;
         }
         let png_after: Vec<&str> = list
             .iter()
             .filter(|s| png_words.contains(*s))
+            .map(String::as_str)
+            .collect();
+        let scene_after: Vec<&str> = list
+            .iter()
+            .filter(|s| scene_words.contains(*s))
             .map(String::as_str)
             .collect();
 
@@ -501,6 +577,8 @@ impl MsgTrace {
              # a captured frame is read back on the emulator thread, so the calls\n\
              # around it are timed a little slower than without capture\n\
              # origin nslog: a line the app printed with NSLog, in the selector column\n\
+             # origin mark: a scene dump (scene/s<frame>_<ms>.txt, its picture in frames/),\n\
+             # the reason in the selector column; dumps: {}; scene after: {}; F11\n\
              # peeks: a row of a selector named in a '# peeks' line has one more column\n\
              # per peek after self, in that line's order; other rows end at self, so\n\
              # the column count differs per selector. Peeks are read when the call\n\
@@ -520,6 +598,12 @@ impl MsgTrace {
                 png_after.join(",")
             },
             capture_cap(capture_max),
+            periodic_scene(scene_every),
+            if scene_after.is_empty() {
+                "none".to_string()
+            } else {
+                scene_after.join(",")
+            },
             peek_lines,
         );
         if let Err(e) = out.write_all(header.as_bytes()) {
@@ -568,6 +652,12 @@ impl MsgTrace {
             capture_every,
             capture_pending: false,
             uncaptured_path_logged: false,
+            capture_max,
+            capture_no_restart: capture_every > 0 || !png_after.is_empty(),
+            scene: SceneDumps {
+                every: scene_every,
+                ..SceneDumps::default()
+            },
         })
     }
 }
@@ -642,16 +732,24 @@ pub fn trace_touches(env: &mut Environment, phase: &str, touches: &HashMap<Finge
 
 impl ObjC {
     /// Turn the message trace on if any selectors were chosen or
-    /// `capture_every` (`--capture-frames=`) is not 0. `capture_max` is
+    /// `capture_every` (`--capture-frames=`) or `scene_every`
+    /// (`--dump-scene-every=`) is not 0. `capture_max` is
     /// `--capture-frames-max=`.
     pub fn start_trace(
         &mut self,
         option_selectors: &[String],
         capture_every: u32,
         capture_max: u32,
+        scene_every: u32,
         bundle_id: &str,
     ) {
-        self.trace = MsgTrace::open(option_selectors, capture_every, capture_max, bundle_id);
+        self.trace = MsgTrace::open(
+            option_selectors,
+            capture_every,
+            capture_max,
+            scene_every,
+            bundle_id,
+        );
     }
 }
 
@@ -679,11 +777,24 @@ fn capture_due(frame: u32, every: u32, pending: bool) -> bool {
 /// presented is frame 0. So `f000042_*.png` shows the drawing done during
 /// the lines with frame 42, and the frame saved for a `png` selector has the
 /// frame number of the line that called it.
+///
+/// A scene dump asked for since the last frame (F11, a `scene` selector),
+/// or due by `--dump-scene-every=`, is written here, before the picture is
+/// read back, under the same frame number (see [write_scene_dump]), and the
+/// picture is saved with it.
 pub fn trace_present_frame(env: &mut Environment) -> Option<FrameCaptureTicket> {
-    let ms = u64::try_from(env.startup_time.elapsed().as_millis()).unwrap_or(u64::MAX);
+    let elapsed = env.startup_time.elapsed();
+    let ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX);
     let trace = env.objc.trace.as_mut()?;
     let frame = trace.frame;
     trace.frame = trace.frame.wrapping_add(1);
+    if let Some(reason) = scene_due(frame, trace.scene.every, &mut trace.scene.pending) {
+        // The picture goes with the dump.
+        trace.capture_pending = true;
+        start_capture_for_scene(trace);
+        write_scene_dump(env, frame, elapsed.as_secs_f64() * 1000.0, ms, &reason);
+    }
+    let trace = env.objc.trace.as_mut()?;
     let due = capture_due(frame, trace.capture_every, trace.capture_pending);
     // Past the cap nothing is read back, so the frame costs nothing more.
     if !due || trace.capture.as_mut().is_none_or(FrameCapture::at_cap) {
@@ -691,6 +802,157 @@ pub fn trace_present_frame(env: &mut Environment) -> Option<FrameCaptureTicket> 
     }
     trace.capture_pending = false;
     Some(FrameCaptureTicket { frame, ms })
+}
+
+/// Whether the frame numbered `frame` gets a scene dump, and why: the
+/// reasons asked for since the last frame (`pending`, which is emptied),
+/// and `periodic` every `every`th frame (counting from frame 0; `every` = 0
+/// is off), joined with `, `. [None] if no dump is due.
+fn scene_due(frame: u32, every: u32, pending: &mut Vec<String>) -> Option<String> {
+    let mut reasons = std::mem::take(pending);
+    if every != 0 && frame.is_multiple_of(every) {
+        reasons.push("periodic".to_string());
+    }
+    (!reasons.is_empty()).then(|| reasons.join(", "))
+}
+
+/// Add `reason` to the reasons for the next scene dump, unless it is there.
+fn add_scene_reason(pending: &mut Vec<String>, reason: &str) {
+    if !pending.iter().any(|r| r == reason) {
+        pending.push(reason.to_string());
+    }
+}
+
+/// Start the frame capture for a scene dump's picture, if it is not on: a
+/// run with neither `--capture-frames=` nor a `png` marker starts it at its
+/// first dump. It is started at most once a run, so `frames/` is emptied of
+/// an earlier run's pictures at most once.
+fn start_capture_for_scene(trace: &mut MsgTrace) {
+    if trace.capture.is_some() || trace.capture_no_restart {
+        return;
+    }
+    trace.capture_no_restart = true;
+    let dir = crate::paths::user_data_base_path().join(FRAMES_DIR);
+    match FrameCapture::start(dir.clone(), trace.capture_max) {
+        Ok(capture) => {
+            log!(
+                "Frame capture on for the scene dumps' pictures ({}), writing to {}",
+                capture_cap(trace.capture_max),
+                dir.display()
+            );
+            trace.capture = Some(capture);
+        }
+        Err(e) => log!(
+            "Warning: frame capture is off, scene dumps have no picture: {}",
+            e
+        ),
+    }
+}
+
+/// Write a scene dump of frame `frame`, presented `ms` milliseconds after
+/// startup (`whole_ms` cut to a whole number), asked for by `reason`: a
+/// `mark` row in `trace.log` (see [mark_row]) and the dump in
+/// `scene/s{frame:06}_{whole_ms}.txt` (see [scene]). The `scene` folder is
+/// emptied of an earlier run's dumps before the first. Only reads guest
+/// memory and the class table: nothing here calls the guest. A dump that
+/// cannot be written is logged and the run goes on.
+fn write_scene_dump(env: &mut Environment, frame: u32, ms: f64, whole_ms: u64, reason: &str) {
+    let thread = env.current_thread;
+    let viewport = env.window.as_ref().map(|window| window.viewport());
+    // Taken out while it is used, so the class table can be read alongside.
+    let Some(mut trace) = env.objc.trace.take() else {
+        return;
+    };
+    let file_name = scene::scene_file_name(frame, whole_ms);
+    let row = mark_row(
+        frame,
+        ms,
+        thread,
+        &format!("scene: {reason} ({}/{file_name})", scene::SCENE_DIR),
+    );
+    let _ = trace.out.write_all(row.as_bytes());
+
+    let dir = trace
+        .scene
+        .dir
+        .get_or_insert_with(|| {
+            let dir = crate::paths::user_data_base_path().join(scene::SCENE_DIR);
+            match scene::prepare_dir(&dir) {
+                Ok(()) => {
+                    log!("Scene dumps on, writing to {}", dir.display());
+                    Ok(dir)
+                }
+                Err(e) => {
+                    log!("Warning: scene dumps are off: {}", e);
+                    Err(())
+                }
+            }
+        })
+        .clone();
+    if let Ok(dir) = dir {
+        let SceneDumps {
+            director_slot,
+            texture_cache_slot,
+            no_director_logged,
+            no_texture_cache_logged,
+            ..
+        } = &mut trace.scene;
+        let mut guest = scene::GuestScene::new(&env.objc, &env.mem);
+        let mut find = |slot: &mut Option<u32>, class: &str| {
+            env.bins
+                .first()
+                .and_then(|bin| scene::find_singleton(&mut guest, bin, slot, class))
+        };
+        let director = find(director_slot, "CCDirector");
+        let texture_cache = find(texture_cache_slot, "CCTextureCache");
+        if director.is_none() && !std::mem::replace(no_director_logged, true) {
+            log!("Scene dump: no CCDirector found yet, nothing is walked (logged once)");
+        }
+        let files = texture_cache.and_then(|cache| scene::texture_files(&mut guest, cache));
+        if files.is_none() && !std::mem::replace(no_texture_cache_logged, true) {
+            log!("Scene dump: the CCTextureCache's textures could not be read, tex_file is - (logged once)");
+        }
+        let info = scene::DumpInfo {
+            frame,
+            ms: whole_ms,
+            trigger: reason,
+            viewport,
+            textures: files.as_ref().map(HashMap::len),
+        };
+        let text = scene::dump_text(&mut guest, &info, director, &files.unwrap_or_default());
+        let path = dir.join(&file_name);
+        match std::fs::write(&path, text) {
+            Ok(()) if reason != "periodic" => {
+                log!("Scene dump ({}) written to {}", reason, path.display())
+            }
+            Ok(()) => (),
+            Err(e) => log!("Warning: could not write {}: {}", path.display(), e),
+        }
+    }
+    env.objc.trace = Some(trace);
+}
+
+/// Called when F11 is pressed (or the Android wrapper sends it): ask for a
+/// scene dump, taken when the next frame is presented (see
+/// [trace_present_frame]). When the trace is off nothing is written, and
+/// that is logged once.
+pub fn trace_request_scene_dump(env: &mut Environment, reason: &str) {
+    static TRACE_OFF_LOGGED: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+    let Some(trace) = env.objc.trace.as_mut() else {
+        if !TRACE_OFF_LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            log!(
+                "Scene dump ({}) not taken: the message trace is off; a selector, --capture-frames= or --dump-scene-every= turns it on (logged once)",
+                reason
+            );
+        }
+        return;
+    };
+    add_scene_reason(&mut trace.scene.pending, reason);
+    log!(
+        "Scene dump asked for ({}), taken when the next frame is presented",
+        reason
+    );
 }
 
 /// How long [trace_finish] waits for the frame capture worker.
@@ -701,7 +963,13 @@ const FINISH_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
 /// [FINISH_WAIT]. A stop that does not go through that path (a crash, a
 /// killed process) can still lose the last few frames.
 pub fn trace_finish(env: &mut Environment) {
-    if let Some(capture) = env.objc.trace.as_mut().and_then(|t| t.capture.take()) {
+    let Some(trace) = env.objc.trace.as_mut() else {
+        return;
+    };
+    // A scene dump after this must not start a new capture, which would
+    // empty frames/.
+    trace.capture_no_restart = true;
+    if let Some(capture) = trace.capture.take() {
         capture.finish(FINISH_WAIT);
     }
 }
@@ -810,10 +1078,18 @@ fn class_chain_names(objc: &ObjC, class: Class) -> Vec<String> {
     names
 }
 
-/// Act on a traced call's markers once its line is written.
-fn note_markers(env: &mut Environment, markers: Markers) {
+/// Act on a traced call's markers once its line is written: `png` asks for
+/// the next frame's picture, `scene` for a scene dump at the next frame,
+/// with `selector <name>` as the reason.
+fn note_markers(env: &mut Environment, markers: Markers, selector: SEL) {
+    let reason = markers
+        .scene
+        .then(|| format!("selector {}", selector.try_as_str(&env.mem).unwrap_or("?")));
     if let Some(trace) = env.objc.trace.as_mut() {
         trace.capture_pending |= markers.png;
+        if let Some(reason) = reason {
+            add_scene_reason(&mut trace.scene.pending, &reason);
+        }
     }
 }
 
@@ -875,7 +1151,7 @@ pub(super) fn trace_send(
         receiver.to_bits(),
         markers.peeks,
     );
-    note_markers(env, markers);
+    note_markers(env, markers, selector);
 }
 
 /// Write one trace line from the current registers. The arguments are taken
@@ -1151,6 +1427,17 @@ pub fn trace_app_log(env: &mut Environment, message: &str) {
     let _ = trace.out.write_all(row.as_bytes());
 }
 
+/// One `trace.log` row for a scene dump: the frame, ms and thread as for
+/// any row, origin `mark`, `-` for the variant and the class, `text` (the
+/// reason and the file) in the selector column with each tab, carriage
+/// return and newline turned into a space, and `-` in the ten columns after
+/// it, like an `nslog` row (see [nslog_row]).
+fn mark_row(frame: u32, ms: f64, thread: usize, text: &str) -> String {
+    let text = text.replace(['\t', '\r', '\n'], " ");
+    let rest = ["-"; 10].join("\t");
+    format!("{frame}\t{ms:.3}\t{thread}\tmark\t-\t-\t{text}\t{rest}\n")
+}
+
 /// The host side of every trampoline (see [trace_wrap_imp]).
 const TRAMPOLINE_FUNCTION: HostFunction = &(trace_imp_trampoline as fn(&mut Environment));
 
@@ -1262,7 +1549,7 @@ fn trace_imp_trampoline(env: &mut Environment) {
         receiver.to_bits(),
         markers.peeks,
     );
-    note_markers(env, markers);
+    note_markers(env, markers, selector);
 
     env.cpu.branch(real);
 }
@@ -1429,16 +1716,17 @@ mod tests {
         Filter {
             class: class.map(str::to_string),
             png,
+            scene: false,
         }
     }
 
     #[test]
     fn lines_of_one_selector_add_up_per_class() {
         let mut traced = Traced::default();
-        traced.add(Some("CCLabelTTF"), false);
-        traced.add(Some("CCLabelBMFont"), true);
-        traced.add(Some("CCLabelTTF"), true);
-        traced.add(None, false);
+        traced.add(Some("CCLabelTTF"), false, false);
+        traced.add(Some("CCLabelBMFont"), true, false);
+        traced.add(Some("CCLabelTTF"), true, false);
+        traced.add(None, false, false);
         assert_eq!(
             traced.filters,
             vec![
@@ -1449,8 +1737,8 @@ mod tests {
         );
         assert!(traced.by_class());
         let mut plain = Traced::default();
-        plain.add(None, false);
-        plain.add(None, true);
+        plain.add(None, false, false);
+        plain.add(None, true, false);
         assert_eq!(plain.filters, vec![filter(None, true)]);
         assert!(!plain.by_class());
     }
@@ -1471,6 +1759,7 @@ mod tests {
             traced.markers_for(&label),
             Some(Markers {
                 png: false,
+                scene: false,
                 peeks: Some(2)
             })
         );
@@ -1479,6 +1768,7 @@ mod tests {
             traced.markers_for(&item),
             Some(Markers {
                 png: true,
+                scene: false,
                 peeks: Some(2)
             })
         );
@@ -1507,6 +1797,7 @@ mod tests {
             any.markers_for::<&str>(&[]),
             Some(Markers {
                 png: true,
+                scene: false,
                 peeks: None
             })
         );
@@ -1627,5 +1918,66 @@ mod tests {
         let looped = names(0x30c);
         assert_eq!(looped.len(), 64);
         assert!(looped.iter().all(|name| name == "Loop"));
+    }
+
+    #[test]
+    fn mark_rows_fill_every_column() {
+        let row = super::mark_row(42, 15873.25, 0, "scene: key F11\t(scene/x.txt)\n");
+        assert_eq!(
+            row,
+            "42\t15873.250\t0\tmark\t-\t-\tscene: key F11 (scene/x.txt) \t\
+             -\t-\t-\t-\t-\t-\t-\t-\t-\t-\n"
+        );
+        // As many columns as the header names, like an nslog row.
+        assert_eq!(row.trim_end_matches('\n').split('\t').count(), 17);
+        assert_eq!(
+            row.split('\t').count(),
+            nslog_row(42, 15873.25, 0, "x").split('\t').count()
+        );
+    }
+
+    #[test]
+    fn selector_lines_take_the_scene_marker() {
+        let line = parse_selector_line("powerFire scene png self.lvl:i32").unwrap();
+        assert!(line.scene);
+        assert!(line.png);
+        assert_eq!(line.peeks.len(), 1);
+        assert!(line.unknown.is_empty());
+        let line = parse_selector_line("startWave@Game;scene".replace(';', " ").as_str()).unwrap();
+        assert!(line.scene);
+        assert!(!line.png);
+        assert!(!parse_selector_line("tLoop:").unwrap().scene);
+        assert_eq!(
+            parse_selector_line("tLoop: SCENE").unwrap().unknown,
+            ["SCENE"]
+        );
+        // The marker is per receiver class, like png.
+        let mut traced = Traced::default();
+        traced.add(Some("CCLabelTTF"), false, true);
+        traced.add(None, false, false);
+        let label = ["CCLabelTTF", "CCSprite", "CCNode", "NSObject"];
+        assert!(traced.markers_for(&label).unwrap().scene);
+        assert!(!traced.markers_for(&["Creeps", "NSObject"]).unwrap().scene);
+    }
+
+    #[test]
+    fn scene_dumps_are_due_when_asked_and_every_n() {
+        let mut pending = Vec::new();
+        assert_eq!(super::scene_due(5, 0, &mut pending), None);
+        assert_eq!(
+            super::scene_due(20, 10, &mut pending).as_deref(),
+            Some("periodic")
+        );
+        assert_eq!(super::scene_due(21, 10, &mut pending), None);
+        super::add_scene_reason(&mut pending, "key F11");
+        super::add_scene_reason(&mut pending, "selector powerFire");
+        super::add_scene_reason(&mut pending, "key F11");
+        assert_eq!(
+            super::scene_due(30, 10, &mut pending).as_deref(),
+            Some("key F11, selector powerFire, periodic")
+        );
+        // Asked for once: the next frame has no dump.
+        assert!(pending.is_empty());
+        assert_eq!(super::scene_due(31, 10, &mut pending), None);
     }
 }

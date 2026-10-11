@@ -297,6 +297,19 @@ Debugging options:
         last about 17 minutes and grow by about 27 MB a minute). 0 is no
         cap.
 
+    --dump-scene-every=N
+        Writes what a cocos2d app has on screen every Nth presented frame:
+        one line per node of the running scene (class, position, scale,
+        texture and its file, a label's text and more), read from memory
+        without calling the app, to scene/s<frame>_<ms>.txt in the user
+        data directory, with the frame's picture in frames/ and a row of
+        origin "mark" in trace.log. N must be 1 or more; 0 is off. This
+        turns the message trace on even with no selectors. F11 asks for one
+        dump at the next frame, and a line in trace_selectors.txt can end
+        in the word scene, for example "startWave scene", for one after
+        each call of that selector. Earlier dumps in that folder are
+        removed when the first dump of a run is written.
+
 Other options:
     --preferred-languages=...
         Specifies a list of preferred languages to be reported to the app.

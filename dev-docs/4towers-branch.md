@@ -113,7 +113,7 @@ Two kinds of call are traced. Ordinary message sends go through `objc_msgSend` a
 
 Every line the game prints with `NSLog` (the lines starting `4Towers_3[0] ` in `touchHLE_log.txt`, which stays as it was) also becomes a `trace.log` row while the trace is on, so the few markers the game prints itself (the wave spawner finishing, pause choices, saves) sit on the trace's timeline. Such a row has the usual `frame`, `ms` and `thread`, `nslog` in the `origin` column, `-` in `variant` and `class`, the message in the `selector` column (tabs, carriage returns and newlines turned into spaces, so a row is always one line), and `-` in the ten columns after it (`arg0` to `self`). A parser that reads `arg0` and the rest as numbers should check the `origin` first. Rows with origin `lifecycle` (going to the background and back, see [Home and back](#home-and-back)) have the same shape.
 
-You can also list selectors one per line in `trace_selectors.txt` next to the other touchHLE files (`#` starts a comment). The option and the file add up. A selector can be narrowed to one class of receiver (`setPosition:@CCLabelTTF`, see Receiver class below). A line in the file can carry marker words and peeks after the selector, separated by spaces: the only marker so far is `png` (see Frames below), and peeks are described below. A word that is neither is ignored and logged once. With no selectors, and without `--capture-frames=`, nothing is traced and nothing is written. `trace.log` is replaced each run.
+You can also list selectors one per line in `trace_selectors.txt` next to the other touchHLE files (`#` starts a comment). The option and the file add up. A selector can be narrowed to one class of receiver (`setPosition:@CCLabelTTF`, see Receiver class below). A line in the file can carry marker words and peeks after the selector, separated by spaces: the markers are `png` (see Frames below) and `scene` (see Scene dump below), and peeks are described below. A word that is neither is ignored and logged once. With no selectors, and without `--capture-frames=` or `--dump-scene-every=`, nothing is traced and nothing is written. `trace.log` is replaced each run.
 
 - **Windows:** `trace.log` is written in the folder you run `touchHLE.exe` from, next to `touchHLE_log.txt`.
 - **Android:** the command line is not available, so either put `trace_selectors.txt` in touchHLE's files folder, or add the option to the game's line in `touchHLE_options.txt`. `trace.log` lands in the same folder, which is the app's `files` folder: `Android/data/org.touchhle.android.unofficial/files/` for this fork's own APK, or `Android/data/com.lambdamugames.fourtowers/files/` for the remake repo's standalone 4Towers APK (for example `adb pull /sdcard/Android/data/com.lambdamugames.fourtowers/files/trace.log`).
@@ -241,10 +241,11 @@ An event with two fingers gives two rows with the same `frame`, `ms` and `phase`
 
 ### Frames
 
-Two ways to save the picture the game presented, as PNG files:
+Three ways to save the picture the game presented, as PNG files:
 
 - `--capture-frames=N` (N of 1 or more; absent or 0 is off) saves every Nth frame: frames 0, N, 2N and so on. Like any option it can go on the game's line in `touchHLE_options.txt`. It turns the trace on by itself, so `trace.log` and `input.log` are written even with no selectors.
 - A `png` marker on a line of `trace_selectors.txt`, for example `powerFire png`, saves the first frame presented after each call of that selector: the frame that shows its result. Several calls before the next frame give one picture.
+- A scene dump (see Scene dump below) saves the picture of the frame it describes.
 
 Each picture is `frames/f{frame}_{ms}.png` in the same folder as `trace.log`, for example `frames/f000042_15873.png`:
 
@@ -266,3 +267,90 @@ On Android the `frames` folder is next to `trace.log` in the app's files folder;
 The build workflow on this branch clones this fork instead of upstream and also runs on pushes here (and to the `4towers-trace` working branch), so GitHub Actions builds the branch for Windows, macOS and Android. That is the only change to it.
 
 The `4towers-gnu-ci` branch adds a second Windows job, `build-windows-gnu`, which builds the same sources for `x86_64-pc-windows-gnu` with the MinGW-w64 toolchain from MSYS2 and uploads `touchHLE_windows_x86_64_gnu` (the usual Windows bundle plus the MinGW runtime DLLs the exe needs). Every MSVC-built touchHLE, this fork's CI builds and upstream v0.3.0 alike, crashes with an access violation (0xC0000005) a few seconds after 4Towers' title screen on a laptop with Intel Iris Xe graphics, while a GNU-built exe plays the game. The MSVC job is unchanged.
+
+## Scene dump
+
+The trace shows calls and fields, and the frames show pixels. A scene dump says what is on screen as cocos2d objects: one line per node of the running scene, with its class, place, scale, texture (and the file it came from), a label's text and more, read from the game's memory at the moment a frame is presented. It answers where each HUD element sits and which texture rect a sprite shows, and it names a node whose texture is missing.
+
+### Asking for one
+
+All three need the message trace on (see Message trace above), and all three do the same thing at the next frame:
+
+- **F11** on a computer. On Android a key event with `KEYCODE_F11`, which SDL turns into the same key, does the same, so the standalone launcher can send it as it sends F9 and F10. Each press is logged ("F11 pressed, DumpScene event queued." and "Scene dump asked for (key F11), taken when the next frame is presented"). With the trace off, F11 writes nothing and that is logged once.
+- **The `scene` marker** on a line of `trace_selectors.txt`, like `png`: `startWave scene` dumps the scene at the first frame presented after each call of `startWave`. It follows the line's receiver class (`setString:@CCLabelTTF scene`), and in `--trace-selectors=` it is written `startWave;scene`.
+- **`--dump-scene-every=N`** (N of 1 or more; absent or 0 is off) dumps frames 0, N, 2N and so on. Like `--capture-frames=`, it turns the trace on by itself, and it can go on the game's line in `touchHLE_options.txt`.
+
+A dump is taken when the next frame is presented on the CAEAGLLayer fast path, the same moment a `png` marker's picture is taken, so the dump shows the state the frame was drawn from and never the middle of a call. Several requests before one frame give one dump. A frame presented through the Core Animation compositor gives no dump, and a request waiting then is served by the next fast-path frame.
+
+### What each dump writes
+
+1. A `trace.log` row with origin `mark`, laid out like an `nslog` row: the usual `frame`, `ms` and `thread`, `-` in `variant` and `class`, then in the `selector` column `scene:`, the reasons and the file, for example `scene: key F11 (scene/s000042_15873.txt)`, and `-` in the ten columns after it. The reasons are `key F11`, `selector <name>` and `periodic`, joined by `, ` when one frame has several.
+2. The frame's picture, `frames/f{frame:06}_{ms}.png`, as a `png` marker saves it (see Frames above). A run with neither `--capture-frames=` nor a `png` marker starts the frame capture at its first dump (which empties `frames/` of an earlier run's pictures, once). `--capture-frames-max=` still applies: past the cap a dump has no picture.
+3. The dump, `scene/s{frame:06}_{ms}.txt`, in a `scene` folder next to `frames/` (the app's files folder on Android). `frame` and `ms` are those of the picture, so `s000042_15873.txt` goes with `f000042_15873.png` and with the `trace.log` rows of frame 42. The first dump of a run removes the dumps an earlier run left in that folder.
+
+### The file
+
+Tab-separated text:
+
+- Line 1 names the columns (below). It does not start with `#`.
+- Line 2 starts with `# ` and holds `key=value` pairs, separated by tabs: `frame`, `ms`, `trigger` (the reasons), `director` (address and class, for example `0x0012a4c0:CCDirectorTimer`), `paused` (its `isPaused_`), `running_scene` and `next_scene` (`runningScene_` and `nextScene_`, address and class, or `nil`), `win_size` (`winSizeInPoints_`, width and height), `viewport` (the window's area that shows the game, `x,y,width,height` in host pixels) and `textures` (how many textures the texture cache holds). `-` for what cannot be read.
+- Then one line per node.
+- Then notes, each on a line starting with `# `: what was cut by a cap, and children that could not be read.
+- Last, `# nodes=N`, the number of node lines.
+
+To read it: take the first line as the column names and skip every other line that starts with `#`. A node line never starts with `#` (it starts with spaces or a class name).
+
+The nodes come in depth-first order from the director's `runningScene_` (depth 0): each node, then its children, each child's own children before the next child. Children are in the order of the node's `children_` array, which cocos2d keeps sorted by `zOrder_` (ties in the order they were added). cocos2d draws a node's children with a negative `z` before the node itself and the others after it.
+
+The columns, in order. `f32` is written with six significant digits as in peeks, integers in decimal, addresses as `0x` and eight hex digits:
+
+| column | type | read from | for |
+| --- | --- | --- | --- |
+| `class` | text | the node's isa, indented by two spaces per level | every node |
+| `depth` | integer | levels below the running scene | every node |
+| `addr` | address | the node's address, the same as the trace's `self` column | every node |
+| `tag` | i32 | `tag_` | every node |
+| `z` | i32 | `zOrder_` | every node |
+| `x`, `y` | f32 | `position_` (a `CGPoint`, points, in the parent's space) | every node |
+| `anchor_x`, `anchor_y` | f32 | `anchorPoint_` | every node |
+| `rel_anchor` | u8 | `isRelativeAnchorPoint_` | every node |
+| `scale_x`, `scale_y` | f32 | `scaleX_`, `scaleY_` | every node |
+| `rotation` | f32 | `rotation_` (degrees) | every node |
+| `visible` | u8 | `visible_` | every node |
+| `width`, `height` | f32 | `contentSize_` (a `CGSize`, points) | every node |
+| `opacity` | u8 | `opacity_` | `CCSprite`, `CCAtlasNode`, `CCLabelBMFont`, `CCLayerColor` |
+| `r`, `g`, `b` | u8 | `color_` (a `ccColor3B`) | the same |
+| `flip_x`, `flip_y` | u8 | `flipX_`, `flipY_` | `CCSprite` |
+| `rect_x`, `rect_y`, `rect_w`, `rect_h` | f32 | `rect_` (a `CGRect`, the part of the texture shown, in points) | `CCSprite` |
+| `batch` | u8 | `usesBatchNode_` | `CCSprite` |
+| `tex` | address | the texture: `nil` if there is none | `CCSprite`, `CCAtlasNode`, `CCSpriteBatchNode` |
+| `tex_name` | u32 | the texture's `name_`, its GL texture name | the same |
+| `tex_w`, `tex_h` | u32 | `width_`, `height_`: the texture's size in pixels | the same |
+| `tex_size_w`, `tex_size_h` | f32 | `size_`: the size of the picture in it, in pixels | the same |
+| `tex_format` | i32 | `format_`, cocos2d's `CCTexture2DPixelFormat` as stored | the same |
+| `tex_max_s`, `tex_max_t` | f32 | `maxS_`, `maxT_` | the same |
+| `tex_file` | text | the key the texture cache holds the texture under: the file name the game asked for | the same |
+| `text` | text | `string_` | `CCLabelTTF`, `CCLabelAtlas`, `CCLabelBMFont` |
+| `font` | text | `fontName_` | `CCLabelTTF` |
+| `font_size` | f32 | `fontSize_` | `CCLabelTTF` |
+| `dim_w`, `dim_h` | f32 | `dimensions_` (the label's box, 0 by 0 for none) | `CCLabelTTF` |
+
+**The `-` rule.** Which columns apply is decided by the node's class chain: a column whose "for" names a class applies when the node's class is that class or a subclass of it (the names are matched as in Receiver class above). A column that does not apply is `-`. One that applies but cannot be read is also `-`: a field the class chain does not have, a nil or unreadable pointer, an object whose class touchHLE does not know. A text that is nil is `nil`. The walk goes on after a `-`.
+
+**The texture.** A `CCSprite` drawn by a batch node (`usesBatchNode_` set) shows the batch's texture, read through its `textureAtlas_` (a `CCTextureAtlas`) and that atlas's `texture_`; any other sprite (a `CCLabelTTF` is one) shows its own `texture_`. A `CCAtlasNode` (so `CCLabelAtlas`) and a `CCSpriteBatchNode` (so `CCLabelBMFont`) show their `textureAtlas_`'s `texture_`. If what is found is not a `CCTexture2D`, `tex` has its address and the other texture columns are `-`. `tex_file` is `-` for a texture the cache does not hold: a `CCLabelTTF`'s text is drawn into a texture of its own that never goes into the cache, and so is any texture the game made from an image it built itself. A sprite with `tex` of `nil`, or a texture with a `tex_name` of 0, is one that draws without a picture.
+
+**Text.** `text`, `font` and `tex_file` are written as a `str` peek writes a string (see Peeks above): tabs, newlines, carriage returns and backslashes escaped, cut at 200 bytes with `...`. A string of a class the game defines itself is `-`.
+
+**Caps.** At most 5,000 node lines per dump; then the walk stops and a note says how many were still waiting. Nodes 32 levels below the running scene or deeper are not written (levels 0 to 31 are), and a note says how many. A node met twice (a loop in the children) is written once, with a note. At most 50 notes.
+
+### How it reads the game
+
+Only memory and touchHLE's class table are read: the dump never sends a message to the game or calls into it. Every field is found by its ivar name on the object's class chain (as peeks are), so the offsets come from the binary's Objective-C metadata, and the types come from cocos2d 0.99.5's headers and the decompile (`CCNode.c`, `CCSprite.c`, `CCTexture2D.c`, `CCLabelTTF.c`, `CCDirector.c`); a wrong type would give a wrong number, not a `-`.
+
+- **`children_`** is a `CCArray`. Its `data` ivar points at a `ccArray` struct: `num` (u32) at +0, `max` (u32) at +4 and `arr`, a pointer to `num` object pointers, at +8 (cocos2d 0.99.5's `ccCArray.h`; `CCArray::count` and `CCArray::objectAtIndex:` in `CCArray.c` read the same places). A `num` above `max` is taken as unreadable.
+- **The director.** `+[CCDirector sharedDirector]` keeps the director in a file-static variable (`DAT_001512a0` in the decompile of 4Towers, `CCDirector.c` around line 404) that is not exported, and calling `sharedDirector` would run the game's code mid-frame. So the dump looks through the app binary's `__data`, `__bss` and `__common` sections, one 4-byte word at a time, for the first word that points at an instance (not a class) of `CCDirector` or a subclass. The director is one object, so any word that points at one points at it. The address of that word is kept and checked again at each dump; if it no longer points at a director, the sections are searched again. Before the director exists there is nothing to walk, and the file says so.
+- **The texture cache** is found the same way (`+[CCTextureCache sharedTextureCache]` keeps it in `DAT_001512bc`, `CCTextureCache.c` line 172). Its `textures_` is an `NSMutableDictionary` made by touchHLE, so its keys and values are read from touchHLE's own record of the dictionary, once per dump, and each value (a `CCTexture2D`) is matched to the sprites' textures by address.
+
+The walk runs on the emulator thread while the frame is presented, so the game sees the time it takes; for a few hundred nodes that should be well under a millisecond (the first dump also searches the data sections), but it has not been measured.
+
+**Not yet checked on a running game.** The walk is covered by unit tests on a made-up memory and class table (the `ccArray` reader, the column line, the escaping, the caps); finding the singletons and reading the real cocos2d objects of 4Towers has not been tried yet.

@@ -143,6 +143,7 @@ pub fn handle_events(env: &mut Environment) -> Option<Instant> {
                     log!("Ignoring EnterDebugger event: no debugger connected.");
                 }
             }
+            Event::DumpScene => crate::objc::trace_request_scene_dump(env, "key F11"),
             Event::TextInput(text_event) => {
                 let responder = env.framework_state.uikit.ui_responder.first_responder;
                 let class = msg![env; responder class];

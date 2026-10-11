@@ -72,6 +72,9 @@ pub struct Options {
     /// `--capture-frames-max=M`: stop saving frames after M of them (0 is no
     /// cap). See src/objc/trace.rs.
     pub capture_frames_max: u32,
+    /// `--dump-scene-every=N`: dump the cocos2d scene every Nth presented
+    /// frame while the message trace is on (0 is off). See src/objc/trace.rs.
+    pub dump_scene_every: u32,
     /// `--bundle-files-ignore-case`, see
     /// [crate::fs::Fs::set_bundle_files_ignore_case].
     pub bundle_files_ignore_case: bool,
@@ -111,6 +114,7 @@ impl Default for Options {
             trace_selectors: Vec::new(),
             capture_frames: 0,
             capture_frames_max: 3000,
+            dump_scene_every: 0,
             bundle_files_ignore_case: false,
         }
     }
@@ -283,6 +287,10 @@ impl Options {
             self.capture_frames_max = value
                 .parse()
                 .map_err(|_| "Invalid value for --capture-frames-max=".to_string())?;
+        } else if let Some(value) = arg.strip_prefix("--dump-scene-every=") {
+            self.dump_scene_every = value
+                .parse()
+                .map_err(|_| "Invalid value for --dump-scene-every=".to_string())?;
         } else if arg == "--bundle-files-ignore-case" {
             self.bundle_files_ignore_case = true;
         } else if arg == "--ignore-gl-errors" {

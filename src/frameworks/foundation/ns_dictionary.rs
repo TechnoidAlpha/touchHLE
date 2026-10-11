@@ -26,7 +26,7 @@ use crate::fs::GuestPath;
 use crate::mem::{ConstPtr, MutPtr, Ptr, SafeRead};
 use crate::objc::{
     autorelease, id, msg, msg_class, nil, objc_classes, release, retain, Class, ClassExports,
-    HostObject, NSZonePtr,
+    HostObject, NSZonePtr, ObjC,
 };
 use crate::{impl_HostObject_with_superclass, Environment};
 use std::collections::hash_map::Entry;
@@ -113,6 +113,24 @@ impl DictionaryHostObject {
     pub(super) fn iter_keys(&self) -> impl Iterator<Item = id> + '_ {
         self.map.values().flatten().map(|&(key, _value)| key)
     }
+}
+
+/// The keys and values of `dict` if it is one of touchHLE's dictionaries,
+/// read from its host object without calling the guest and without
+/// panicking (for the message trace's scene dump, which reads cocos2d's
+/// texture cache). In no particular order. [None] for anything else: a nil
+/// or unknown pointer, or an object of another class.
+pub fn host_dictionary_pairs(objc: &ObjC, dict: id) -> Option<Vec<(id, id)>> {
+    let mut host_object = objc.get_host_object(dict)?;
+    // A host object may wrap its superclass's, as in [ObjC::borrow]. A
+    // bound, in case a chain loops.
+    for _ in 0..16 {
+        if let Some(found) = host_object.as_any().downcast_ref::<DictionaryHostObject>() {
+            return Some(found.map.values().flatten().copied().collect());
+        }
+        host_object = host_object.as_superclass()?;
+    }
+    None
 }
 
 // TODO: move those definitions to cf_dictionary.rs
