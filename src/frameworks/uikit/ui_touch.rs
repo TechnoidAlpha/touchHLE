@@ -118,7 +118,26 @@ pub fn handle_event(env: &mut Environment, event: Event) {
         Event::TouchesUp(touches) => ("up", touches),
         _ => unreachable!(),
     };
-    crate::objc::trace_touches(env, phase, touches);
+    // Each finger is logged with the phase the app receives it in: a "down"
+    // for a finger that is already down is handled as a move (see
+    // handle_touches_down), and a move or up for a finger that is not down
+    // is ignored, so it is not logged.
+    let current_touches = &env.framework_state.uikit.ui_touch.current_touches;
+    let mut received: [HashMap<FingerId, Coords>; 3] = Default::default();
+    for (&finger, &coords) in touches {
+        let index = match (phase, current_touches.contains_key(&finger)) {
+            ("down", false) => 0,
+            ("down", true) | ("move", true) => 1,
+            ("up", true) => 2,
+            _ => continue,
+        };
+        received[index].insert(finger, coords);
+    }
+    for (phase, touches) in ["down", "move", "up"].into_iter().zip(&received) {
+        if !touches.is_empty() {
+            crate::objc::trace_touches(env, phase, touches);
+        }
+    }
 
     // before processing anything, we mark all current touches as stationary
     let current_touches = &env.framework_state.uikit.ui_touch.current_touches;

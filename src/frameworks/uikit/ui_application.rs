@@ -465,6 +465,17 @@ pub(super) fn UIApplicationMain(
 }
 
 /// Tell the app it's about to quit and then exit.
+///
+/// The app is told what an iPhone OS 4 app with multitasking is told when
+/// the Home button sends it to the background:
+/// `applicationWillResignActive:`, then `applicationDidEnterBackground:`
+/// (if the delegate has it), and then, as the suspended app is never
+/// resumed, `applicationWillTerminate:`. Each runs to completion before the
+/// next (`msg!` runs the guest method until it returns), so whatever the
+/// app saves in them, for example with `-[NSUserDefaults synchronize]`, is
+/// written to the sandbox before touchHLE exits. The defaults are also
+/// synchronized once more at the end, for an app that changes them in these
+/// methods without synchronizing.
 pub(super) fn exit(env: &mut Environment) {
     let ui_application: id = msg_class![env; UIApplication sharedApplication];
 
@@ -501,6 +512,24 @@ pub(super) fn exit(env: &mut Environment) {
     {
         let pool: id = msg_class![env; NSAutoreleasePool new];
         let delegate: id = msg![env; ui_application delegate];
+        // 4Towers saves the level being played only here.
+        if env
+            .objc
+            .object_has_method_named(&env.mem, delegate, "applicationDidEnterBackground:")
+        {
+            log!("Sending applicationDidEnterBackground: before exiting.");
+            () = msg![env; delegate applicationDidEnterBackground:ui_application];
+        }
+
+        let notif_name = get_static_str(env, UIApplicationDidEnterBackgroundNotification);
+        () = msg![env; center postNotificationName:notif_name object:ui_application userInfo:nil];
+
+        let _: () = msg![env; pool drain];
+    };
+
+    {
+        let pool: id = msg_class![env; NSAutoreleasePool new];
+        let delegate: id = msg![env; ui_application delegate];
         if env
             .objc
             .object_has_method_named(&env.mem, delegate, "applicationWillTerminate:")
@@ -510,6 +539,11 @@ pub(super) fn exit(env: &mut Environment) {
 
         let notif_name = get_static_str(env, UIApplicationWillTerminateNotification);
         () = msg![env; center postNotificationName:notif_name object:ui_application userInfo:nil];
+
+        if !env.is_app_picker {
+            let user_defaults: id = msg_class![env; NSUserDefaults standardUserDefaults];
+            let _: bool = msg![env; user_defaults synchronize];
+        }
 
         let _: () = msg![env; pool drain];
     };

@@ -265,7 +265,8 @@ Debugging options:
         While the trace is on, input.log in the same folder gets one
         tab-separated row per finger for every touch event the app receives:
         frame, ms (the same clock and frame numbers as trace.log), phase
-        (down, move or up), finger and x, y in guest points. Lines starting
+        (down, move or up, as the app receives it), finger and x, y in guest
+        points. Lines starting
         with # are its header. It is replaced on each run.
 
     --capture-frames=N

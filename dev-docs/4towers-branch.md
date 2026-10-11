@@ -23,6 +23,7 @@ Each item is something *4Towers: Onslaught* 1.01 (iOS 4.1, cocos2d) called that 
 
 - `-[UIApplication statusBarStyle]` and `-[UIApplication statusBarFrame]`.
 - `-[UIViewController init]` and a logging stub for `presentModalViewController:animated:`.
+- Home and closing the window. touchHLE turns the Home button (Android, or any host that sends the app to the background) and closing the window into an exit. Stock touchHLE then sends `applicationWillResignActive:` and `applicationWillTerminate:`. iPhone OS 4.1 with multitasking sends `applicationDidEnterBackground:` on Home instead (the game's `Info.plist` has no `UIApplicationExitsOnSuspend`), and 4Towers writes the level being played (the `savedData` key of its `NSUserDefaults`, with `isGameRunning` set) only in that method. The exit now sends `applicationWillResignActive:`, then `applicationDidEnterBackground:` if the delegate has it (and posts `UIApplicationDidEnterBackgroundNotification`), then `applicationWillTerminate:` as before. Each method runs to the end before the next, and the game calls `synchronize` itself, so the plist in the sandbox's `Library/Preferences` is written before touchHLE exits; touchHLE also synchronizes once more at the end. At its next launch the game finds `isGameRunning` and starts inside the saved level, as a suspended iPhone app would come back. Leaving from a menu saves progress (`saveAll`) instead, as on the phone. Not yet checked on a run: the level's archive and its unarchiving at launch go through touchHLE's `NSKeyedArchiver` and `NSKeyedUnarchiver`.
 
 ## Fonts
 
@@ -125,7 +126,7 @@ These come with the message trace: they are written only while it is on, into th
 | --- | --- |
 | `frame` | frames presented so far, as in `trace.log` |
 | `ms` | milliseconds since touchHLE started, three decimals, as in `trace.log` |
-| `phase` | `down`, `move` or `up` |
+| `phase` | `down`, `move` or `up`, as the game receives it: a finger reported down while it is already down reaches the game as a move and is logged as `move`, and a move or up for a finger that is not down is ignored by touchHLE and not logged |
 | `finger` | which finger: `Mouse`, `Touch(n)` (n is the host's finger id), `VirtualCursor`, `ButtonToTouch(button)`, `StickToTouch` or `DpadToTouch` |
 | `x`, `y` | the position in guest points (the screen is 320 x 480 points), unrotated: what the game's `UITouch` reports, whatever the window's rotation or scale |
 

@@ -435,7 +435,7 @@ fn open_input_log(path: &std::path::Path, bundle_id: &str) -> Option<File> {
          # one row per finger per touch event the app receives, tab-separated\n\
          # frame and ms: the same clock and frame numbers as trace.log\n\
          # (ms since touchHLE started; frame = frames presented so far)\n\
-         # phase: down, move or up; finger: touchHLE's finger id\n\
+         # phase: down, move or up, as the app receives it; finger: touchHLE's finger id\n\
          # x, y: guest points, unrotated, as the app's UITouch has them\n\
          # frame\tms\tphase\tfinger\tx\ty\n",
         crate::branding(),
@@ -471,7 +471,8 @@ fn touch_row(frame: u32, ms: f64, phase: &str, finger: FingerId, (x, y): Coords)
 
 /// Called by UIKit for each touch event it hands to the app. When the trace
 /// is on, writes one row per finger to `input.log`: the frame, the
-/// milliseconds since startup, `phase` (`down`, `move` or `up`), the finger
+/// milliseconds since startup, `phase` (`down`, `move` or `up`, the phase
+/// the app receives the finger in, see `ui_touch::handle_event`), the finger
 /// (`Mouse`, `Touch(n)`, `VirtualCursor`, `ButtonToTouch(button)`,
 /// `StickToTouch` or `DpadToTouch`) and the position in guest points. Each
 /// event is one unbuffered write, so a crash keeps every row before it.
