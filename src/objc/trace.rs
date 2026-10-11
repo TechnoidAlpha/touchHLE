@@ -49,14 +49,17 @@
 //! the app prints with `NSLog` becomes a `trace.log` row with origin `nslog`
 //! (see [trace_app_log]).
 
+mod peek;
+
 use super::{id, nil, Class, ClassHostObject, ObjC, IMP, SEL};
 use crate::abi::GuestFunction;
 use crate::cpu::Cpu;
 use crate::dyld::HostFunction;
 use crate::frame_capture::{FrameCapture, FRAMES_DIR};
-use crate::mem::{ConstPtr, Ptr};
+use crate::mem::{ConstPtr, ConstVoidPtr, GuestUSize, Mem, Ptr};
 use crate::window::{Coords, FingerId};
 use crate::Environment;
+use peek::{PeekBase, PeekSpec, PeekStep, PeekType};
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::hash::Hash;
@@ -91,11 +94,33 @@ pub(super) enum SendVariant {
 struct Markers {
     /// `png`: save the first frame presented after each call.
     png: bool,
+    /// The selector's peeks: an index into [MsgTrace::peek_sets], or [None]
+    /// if it has none.
+    peeks: Option<usize>,
+}
+
+/// The peeks of one traced selector, in the order they were listed.
+struct PeekSet {
+    selector: String,
+    peeks: Vec<Peek>,
+}
+
+/// One peek (see [peek]) and what it has learnt while running.
+struct Peek {
+    spec: PeekSpec,
+    /// The offset of the ivar named at step `n` of the path, per class of
+    /// the object it was looked up on: [None] if that class chain has no
+    /// such ivar. Each (step, class) is looked up once.
+    ivar_offsets: HashMap<(usize, Class), Option<GuestUSize>>,
+    /// Whether a failed read has been logged (once per selector and peek).
+    failure_logged: bool,
 }
 
 pub struct MsgTrace {
     /// The traced selectors and their markers.
     selectors: HashMap<String, Markers>,
+    /// The peeks of each selector that has any, see [Markers::peeks].
+    peek_sets: Vec<PeekSet>,
     /// The markers of each (uniqued) selector pointer, or [None] if it is not
     /// traced, so the string comparison happens once per selector.
     cache: HashMap<SEL, Option<Markers>>,
@@ -157,24 +182,47 @@ impl<K: Hash + Eq, V: Copy> TrampolineCache<K, V> {
     }
 }
 
+/// What one line of `trace_selectors.txt` (or one item of
+/// `--trace-selectors=`) asks for, see [parse_selector_line].
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct SelectorLine {
+    selector: String,
+    /// The `png` marker.
+    png: bool,
+    /// The peek specs, in the order given.
+    peeks: Vec<PeekSpec>,
+    /// Words that are neither a marker nor a peek: ignored, logged once.
+    unknown: Vec<String>,
+    /// Peeks that did not parse, with the reason: ignored, logged.
+    bad_peeks: Vec<(String, String)>,
+}
+
 /// One line of `trace_selectors.txt`: the selector, then optional marker
-/// words, separated by spaces or tabs; `#` starts a comment. Returns [None]
-/// for a blank or comment-only line, otherwise the selector, its markers and
-/// any words that are not a known marker (they are ignored, and logged once
-/// by the caller). The only marker is `png`.
-fn parse_selector_line(line: &str) -> Option<(String, Markers, Vec<String>)> {
+/// words and peek specs in any order, separated by spaces or tabs; `#`
+/// starts a comment. Returns [None] for a blank or comment-only line. The
+/// only marker is `png`; a word starting with `self`, `arg0` or `arg1` is a
+/// peek (see [peek]); any other word is ignored, and logged once by the
+/// caller.
+fn parse_selector_line(line: &str) -> Option<SelectorLine> {
     let line = line.split('#').next().unwrap();
     let mut words = line.split_whitespace();
-    let selector = words.next()?.to_string();
-    let mut markers = Markers::default();
-    let mut unknown = Vec::new();
+    let mut parsed = SelectorLine {
+        selector: words.next()?.to_string(),
+        ..SelectorLine::default()
+    };
     for word in words {
-        match word {
-            "png" => markers.png = true,
-            _ => unknown.push(word.to_string()),
+        if word == "png" {
+            parsed.png = true;
+        } else if peek::looks_like_peek(word) {
+            match peek::parse_peek(word) {
+                Ok(spec) => parsed.peeks.push(spec),
+                Err(e) => parsed.bad_peeks.push((word.to_string(), e)),
+            }
+        } else {
+            parsed.unknown.push(word.to_string());
         }
     }
-    Some((selector, markers, unknown))
+    Some(parsed)
 }
 
 /// `--capture-frames=` in words, for the trace header and the log.
@@ -192,38 +240,73 @@ impl MsgTrace {
     /// trace is off.
     fn open(option_selectors: &[String], capture_every: u32, bundle_id: &str) -> Option<MsgTrace> {
         let base = crate::paths::user_data_base_path();
-        let mut lines: Vec<(String, Markers)> = option_selectors
+        // An item of the option is a line of the file with ';' between its
+        // words (an options file line cannot hold spaces in one option).
+        let mut lines: Vec<(&str, SelectorLine)> = option_selectors
             .iter()
-            .map(|s| (s.clone(), Markers::default()))
+            .filter_map(|s| parse_selector_line(&s.replace(';', " ")))
+            .map(|line| ("--trace-selectors=", line))
             .collect();
         if let Ok(file) = File::open(base.join(TRACE_SELECTORS_FILE)) {
-            let mut unknown_logged: HashSet<String> = HashSet::new();
-            for line in BufReader::new(file).lines().map_while(Result::ok) {
-                let Some((selector, markers, unknown)) = parse_selector_line(&line) else {
-                    continue;
-                };
-                for word in unknown {
-                    if unknown_logged.insert(word.clone()) {
-                        log!(
-                            "Warning: {} has an unknown marker {:?} (after {}), ignored; the only marker is png",
-                            TRACE_SELECTORS_FILE,
-                            word,
-                            selector
-                        );
-                    }
-                }
-                lines.push((selector, markers));
-            }
+            lines.extend(
+                BufReader::new(file)
+                    .lines()
+                    .map_while(Result::ok)
+                    .filter_map(|line| parse_selector_line(&line))
+                    .map(|line| (TRACE_SELECTORS_FILE, line)),
+            );
         }
-        // The same selector may be listed twice; its markers add up.
+        // The same selector may be listed twice; its markers and peeks add
+        // up.
+        let mut unknown_logged: HashSet<String> = HashSet::new();
         let mut list: Vec<String> = Vec::new();
         let mut selectors: HashMap<String, Markers> = HashMap::new();
-        for (selector, markers) in lines {
-            let entry = selectors.entry(selector.clone()).or_insert_with(|| {
-                list.push(selector);
+        let mut peek_sets: Vec<PeekSet> = Vec::new();
+        for (source, line) in lines {
+            for word in &line.unknown {
+                if unknown_logged.insert(word.clone()) {
+                    log!(
+                        "Warning: {} has an unknown marker {:?} (after {}), ignored; the only marker is png, and a peek starts with self, arg0 or arg1",
+                        source,
+                        word,
+                        line.selector
+                    );
+                }
+            }
+            for (word, reason) in &line.bad_peeks {
+                log!(
+                    "Warning: {} has a peek {:?} (after {}) that is not understood, ignored: {}",
+                    source,
+                    word,
+                    line.selector,
+                    reason
+                );
+            }
+            let entry = selectors.entry(line.selector.clone()).or_insert_with(|| {
+                list.push(line.selector.clone());
                 Markers::default()
             });
-            entry.png |= markers.png;
+            entry.png |= line.png;
+            if line.peeks.is_empty() {
+                continue;
+            }
+            let index = *entry.peeks.get_or_insert_with(|| {
+                peek_sets.push(PeekSet {
+                    selector: line.selector.clone(),
+                    peeks: Vec::new(),
+                });
+                peek_sets.len() - 1
+            });
+            let set = &mut peek_sets[index];
+            for spec in line.peeks {
+                if set.peeks.iter().all(|p| p.spec != spec) {
+                    set.peeks.push(Peek {
+                        spec,
+                        ivar_offsets: HashMap::new(),
+                        failure_logged: false,
+                    });
+                }
+            }
         }
         if selectors.is_empty() && capture_every == 0 {
             return None;
@@ -246,6 +329,13 @@ impl MsgTrace {
                 return None;
             }
         };
+        let peek_lines: String = peek_sets
+            .iter()
+            .map(|set| {
+                let specs: Vec<&str> = set.peeks.iter().map(|p| p.spec.text.as_str()).collect();
+                format!("# peeks {} {}\n", set.selector, specs.join(" "))
+            })
+            .collect();
         let header = format!(
             "# touchHLE {}{}{} message trace\n\
              # app: {}\n\
@@ -255,6 +345,12 @@ impl MsgTrace {
              # no imp lines for methods that return a struct or a union\n\
              # frame capture (frames/f<frame>_<ms>.png): {}; png after: {}\n\
              # origin nslog: a line the app printed with NSLog, in the selector column\n\
+             # peeks: a row of a selector named in a '# peeks' line has one more column\n\
+             # per peek after self, in that line's order; other rows end at self, so\n\
+             # the column count differs per selector. Peeks are read when the call\n\
+             # starts, before the method runs (the state after it is in the next\n\
+             # traced row's peeks); '-' is a peek that could not be read\n\
+             {}\
              frame\tms\tthread\torigin\tvariant\tclass\tselector\targ0\targ0_f32\targ1\targ1_f32\tsp0\tsp1\tsp2\tsp3\tlr\tself\n",
             crate::branding(),
             if crate::branding().is_empty() { "" } else { " " },
@@ -267,6 +363,7 @@ impl MsgTrace {
             } else {
                 png_after.join(",")
             },
+            peek_lines,
         );
         if let Err(e) = out.write_all(header.as_bytes()) {
             log!("Warning: could not write {}: {}", path.display(), e);
@@ -300,6 +397,7 @@ impl MsgTrace {
         };
         Some(MsgTrace {
             selectors,
+            peek_sets,
             cache: HashMap::new(),
             trampolines: TrampolineCache::new(),
             not_wrapped: HashSet::new(),
@@ -493,16 +591,15 @@ fn note_markers(env: &mut Environment, markers: Markers) {
 }
 
 /// The class name as written in the trace, with `+` for a metaclass.
-fn class_name_for_trace(env: &Environment, class: Class) -> String {
-    let is_metaclass = env
-        .objc
+fn class_name_for_trace(objc: &ObjC, class: Class) -> String {
+    let is_metaclass = objc
         .get_host_object(class)
         .and_then(|o| o.as_any().downcast_ref::<ClassHostObject>())
         .is_some_and(|c| c.is_metaclass);
     format!(
         "{}{}",
         if is_metaclass { "+" } else { "" },
-        env.objc.try_get_class_name(class).unwrap_or("?")
+        objc.try_get_class_name(class).unwrap_or("?")
     )
 }
 
@@ -540,7 +637,7 @@ pub(super) fn trace_send(
             .map_or(class, |c| c.superclass),
         None => ObjC::read_isa(receiver, &env.mem),
     };
-    let class_name = class_name_for_trace(env, class);
+    let class_name = class_name_for_trace(&env.objc, class);
     write_line(
         env,
         origin,
@@ -549,13 +646,16 @@ pub(super) fn trace_send(
         selector,
         variant,
         receiver.to_bits(),
+        markers.peeks,
     );
     note_markers(env, markers);
 }
 
 /// Write one trace line from the current registers. The arguments are taken
-/// from where `variant` puts them. `receiver` is written last, in the `self`
-/// column.
+/// from where `variant` puts them. `receiver` is written in the `self`
+/// column, and after it the columns of the selector's peeks (`peeks` is an
+/// index into [MsgTrace::peek_sets]), if it has any.
+#[allow(clippy::too_many_arguments)]
 fn write_line(
     env: &mut Environment,
     origin: &str,
@@ -564,9 +664,8 @@ fn write_line(
     selector: SEL,
     variant: SendVariant,
     receiver: u32,
+    peeks: Option<usize>,
 ) {
-    let selector_name = selector.try_as_str(&env.mem).unwrap_or("?");
-
     let regs = *env.cpu.regs();
     let sp = regs[Cpu::SP];
     let mut stack = [0u32; 4];
@@ -579,11 +678,16 @@ fn write_line(
         SendVariant::Stret => (regs[3], stack[0]),
         SendVariant::Normal | SendVariant::Super2 => (regs[2], regs[3]),
     };
+    let peeked = match peeks {
+        Some(set) => peek_columns(env, set, [receiver, arg0, arg1]),
+        None => String::new(),
+    };
 
+    let selector_name = selector.try_as_str(&env.mem).unwrap_or("?");
     let elapsed_ms = env.startup_time.elapsed().as_secs_f64() * 1000.0;
     let trace = env.objc.trace.as_mut().unwrap();
     let line = format!(
-        "{}\t{:.3}\t{}\t{}\t{}\t{}\t{}\t{:#010x}\t{}\t{:#010x}\t{}\t{:#010x}\t{:#010x}\t{:#010x}\t{:#010x}\t{:#010x}\t{:#010x}\n",
+        "{}\t{:.3}\t{}\t{}\t{}\t{}\t{}\t{:#010x}\t{}\t{:#010x}\t{}\t{:#010x}\t{:#010x}\t{:#010x}\t{:#010x}\t{:#010x}\t{:#010x}{}\n",
         trace.frame,
         elapsed_ms,
         env.current_thread,
@@ -601,10 +705,150 @@ fn write_line(
         stack[3],
         regs[Cpu::LR],
         receiver,
+        peeked,
     );
     // One unbuffered write per line, so the log is complete up to the last
     // send even if the emulator stops abruptly.
     let _ = trace.out.write_all(line.as_bytes());
+}
+
+/// The peek columns of a row: a tab and a value per peek of
+/// `peek_sets[set]`, or a tab and `-` for one that cannot be read (logged
+/// once per selector and peek). `words` is self, arg0 and arg1. Only reads
+/// guest memory, through the non-panicking [Mem::get_bytes_fallible], and
+/// the class table: nothing here calls the guest.
+fn peek_columns(env: &mut Environment, set: usize, words: [u32; 3]) -> String {
+    // Taken out while it is used, so the class table can be read alongside.
+    let Some(mut trace) = env.objc.trace.take() else {
+        return String::new();
+    };
+    let PeekSet { selector, peeks } = &mut trace.peek_sets[set];
+    let mut columns = String::new();
+    for peek in peeks.iter_mut() {
+        columns.push('\t');
+        match read_peek(&env.objc, &env.mem, peek, words) {
+            Ok(value) => columns.push_str(&value),
+            Err(why) => {
+                columns.push('-');
+                if !peek.failure_logged {
+                    peek.failure_logged = true;
+                    log!(
+                        "Message trace: peek {} of {} could not be read ({}), its column shows - (logged once)",
+                        peek.spec.text,
+                        selector,
+                        why
+                    );
+                }
+            }
+        }
+    }
+    env.objc.trace = Some(trace);
+    columns
+}
+
+/// The `count` bytes at `addr`, or why not (the null page, or past the end
+/// of guest memory). Never panics.
+fn read_guest_bytes(mem: &Mem, addr: u32, count: GuestUSize) -> Result<&[u8], String> {
+    mem.get_bytes_fallible(ConstVoidPtr::from_bits(addr), count)
+        .ok_or_else(|| format!("{count} bytes at {addr:#x} are not readable"))
+}
+
+/// The little-endian word at `addr`, which need not be aligned.
+fn read_guest_word(mem: &Mem, addr: u32) -> Result<u32, String> {
+    let bytes = read_guest_bytes(mem, addr, 4)?;
+    Ok(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+}
+
+/// The offset of the ivar `name` on the class chain starting at `class`:
+/// [None] if `class` is not a class touchHLE knows (a bad pointer), otherwise
+/// [Some] with the offset, or with [None] if no class on the chain has that
+/// ivar. Like [ObjC::object_lookup_ivar], but it cannot panic.
+fn ivar_offset(objc: &ObjC, mem: &Mem, class: Class, name: &str) -> Option<Option<GuestUSize>> {
+    let mut current = class;
+    // A bound, in case a broken chain loops.
+    for depth in 0..64 {
+        let Some(host) = objc
+            .get_host_object(current)
+            .and_then(|o| o.as_any().downcast_ref::<ClassHostObject>())
+        else {
+            return if depth == 0 { None } else { Some(None) };
+        };
+        if let Some(&(offset_ptr, _)) = host.ivars.get(name) {
+            return Some(read_guest_word(mem, offset_ptr.to_bits()).ok());
+        }
+        if host.superclass == nil {
+            break;
+        }
+        current = host.superclass;
+    }
+    Some(None)
+}
+
+/// Follow a peek's path from `words` (self, arg0, arg1) and read its value,
+/// written as its column shows it, or say why it cannot be read.
+fn read_peek(objc: &ObjC, mem: &Mem, peek: &mut Peek, words: [u32; 3]) -> Result<String, String> {
+    let Peek {
+        spec, ivar_offsets, ..
+    } = peek;
+    let base = words[match spec.base {
+        PeekBase::Receiver => 0,
+        PeekBase::Arg0 => 1,
+        PeekBase::Arg1 => 2,
+    }];
+    // The object the path is in, and the address it has reached.
+    let mut object = base;
+    let mut addr = base;
+    for (step_index, step) in spec.steps.iter().enumerate() {
+        match step {
+            PeekStep::Deref => {
+                object = read_guest_word(mem, addr)?;
+                addr = object;
+            }
+            PeekStep::Bytes(n) => {
+                addr = addr
+                    .checked_add(*n)
+                    .ok_or_else(|| format!("{addr:#x} + {n:#x} is past the end"))?;
+            }
+            PeekStep::Ivar(name) => {
+                if object == 0 {
+                    return Err(format!("nil before .{name}"));
+                }
+                let isa = read_guest_word(mem, object)?;
+                let class: Class = Ptr::from_bits(isa);
+                let offset = match ivar_offsets.get(&(step_index, class)) {
+                    Some(&offset) => offset,
+                    None => {
+                        let offset = ivar_offset(objc, mem, class, name).ok_or_else(|| {
+                            format!("{object:#x} has no class we know (isa {isa:#x})")
+                        })?;
+                        ivar_offsets.insert((step_index, class), offset);
+                        offset
+                    }
+                }
+                .ok_or_else(|| {
+                    format!("{} has no ivar {name}", class_name_for_trace(objc, class))
+                })?;
+                addr = object
+                    .checked_add(offset)
+                    .ok_or_else(|| format!("{object:#x} + {offset:#x} is past the end"))?;
+            }
+        }
+    }
+    let word = match (spec.steps.is_empty(), spec.ty) {
+        (true, _) => base,
+        (false, PeekType::U8) => read_guest_bytes(mem, addr, 1)?[0].into(),
+        (false, ty) => {
+            debug_assert_eq!(ty.size(), 4);
+            read_guest_word(mem, addr)?
+        }
+    };
+    let class = match spec.ty {
+        PeekType::Id if word != 0 => read_guest_word(mem, word)
+            .ok()
+            .map(|isa| class_name_for_trace(objc, Ptr::from_bits(isa))),
+        _ => None,
+    };
+    Ok(peek::fmt_peek_value(spec.ty, word, class.as_deref()))
 }
 
 /// One `trace.log` row for a line the app printed with `NSLog`: the frame,
@@ -678,7 +922,7 @@ pub fn trace_wrap_imp(env: &mut Environment, class: Class, selector: SEL, imp: I
         if first_time {
             log!(
                 "Message trace: calls of [{} {}] through its IMP are not traced (it returns a struct, or its types are unknown)",
-                class_name_for_trace(env, class),
+                class_name_for_trace(&env.objc, class),
                 selector.try_as_str(&env.mem).unwrap_or("?")
             );
         }
@@ -724,8 +968,9 @@ fn trace_imp_trampoline(env: &mut Environment) {
     let class_name = if receiver == nil {
         "nil".to_string()
     } else {
-        class_name_for_trace(env, ObjC::read_isa(receiver, &env.mem))
+        class_name_for_trace(&env.objc, ObjC::read_isa(receiver, &env.mem))
     };
+    let markers = selector_markers(env, selector).unwrap_or_default();
     write_line(
         env,
         "guest",
@@ -734,10 +979,9 @@ fn trace_imp_trampoline(env: &mut Environment) {
         selector,
         SendVariant::Normal,
         receiver.to_bits(),
+        markers.peeks,
     );
-    if let Some(markers) = selector_markers(env, selector) {
-        note_markers(env, markers);
-    }
+    note_markers(env, markers);
 
     env.cpu.branch(real);
 }
@@ -768,8 +1012,7 @@ fn fmt_f32(bits: u32) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        capture_due, nslog_row, parse_selector_line, returns_struct, touch_row, Markers,
-        TrampolineCache,
+        capture_due, nslog_row, parse_selector_line, returns_struct, touch_row, TrampolineCache,
     };
     use crate::window::FingerId;
 
@@ -785,32 +1028,71 @@ mod tests {
         assert_eq!(row.trim_end_matches('\n').split('\t').count(), 17);
     }
 
+    /// The selector, `png`, the peeks' texts and the unknown words of a
+    /// line, for short comparisons.
+    fn summary(line: &str) -> Option<(String, bool, Vec<String>, Vec<String>)> {
+        parse_selector_line(line).map(|l| {
+            (
+                l.selector,
+                l.png,
+                l.peeks.into_iter().map(|p| p.text).collect(),
+                l.unknown,
+            )
+        })
+    }
+
     #[test]
     fn selector_lines_take_markers() {
-        let png = Markers { png: true };
-        let none = Markers::default();
-        assert_eq!(parse_selector_line(""), None);
-        assert_eq!(parse_selector_line("   # only a comment"), None);
+        let s = |v: &[&str]| v.iter().map(|w| w.to_string()).collect::<Vec<_>>();
+        assert_eq!(summary(""), None);
+        assert_eq!(summary("   # only a comment"), None);
         assert_eq!(
-            parse_selector_line("tLoop:"),
-            Some(("tLoop:".to_string(), none, vec![]))
+            summary("tLoop:"),
+            Some(("tLoop:".into(), false, s(&[]), s(&[])))
         );
         assert_eq!(
-            parse_selector_line("  powerFire png  # the tower's shot"),
-            Some(("powerFire".to_string(), png, vec![]))
+            summary("  powerFire png  # the tower's shot"),
+            Some(("powerFire".into(), true, s(&[]), s(&[])))
         );
         assert_eq!(
-            parse_selector_line("schedule:interval:\tpng"),
-            Some(("schedule:interval:".to_string(), png, vec![]))
+            summary("schedule:interval:\tpng"),
+            Some(("schedule:interval:".into(), true, s(&[]), s(&[])))
         );
         assert_eq!(
-            parse_selector_line("powerFire PNG jpg png"),
+            summary("powerFire PNG jpg png"),
+            Some(("powerFire".into(), true, s(&[]), s(&["PNG", "jpg"])))
+        );
+    }
+
+    #[test]
+    fn selector_lines_take_peeks_in_any_order() {
+        let s = |v: &[&str]| v.iter().map(|w| w.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            summary("dmg: self.hp:f32 png self.expectedHp:f32 # a hit"),
             Some((
-                "powerFire".to_string(),
-                png,
-                vec!["PNG".to_string(), "jpg".to_string()]
+                "dmg:".into(),
+                true,
+                s(&["self.hp:f32", "self.expectedHp:f32"]),
+                s(&[])
             ))
         );
+        // An item of --trace-selectors= once ';' became a space.
+        assert_eq!(
+            summary(&"addCreeps;self.sharedData->waveNum:i32".replace(';', " ")),
+            Some((
+                "addCreeps".into(),
+                false,
+                s(&["self.sharedData->waveNum:i32"]),
+                s(&[])
+            ))
+        );
+        // A peek that does not parse is set aside with the reason.
+        let line = parse_selector_line("fireTarget: arg0.hp self.rate:f32").unwrap();
+        assert_eq!(line.peeks.len(), 1);
+        assert_eq!(line.bad_peeks.len(), 1);
+        assert_eq!(line.bad_peeks[0].0, "arg0.hp");
+        assert!(line.bad_peeks[0].1.contains("no :type"));
+        assert!(line.unknown.is_empty());
     }
 
     #[test]
