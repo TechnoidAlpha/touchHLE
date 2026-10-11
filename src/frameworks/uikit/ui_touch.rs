@@ -120,12 +120,15 @@ pub fn handle_event(env: &mut Environment, event: Event) {
     };
     // Each finger is logged with the phase the app receives it in: a "down"
     // for a finger that is already down is handled as a move (see
-    // handle_touches_down), and a move or up for a finger that is not down
-    // is ignored, so it is not logged.
+    // handle_touches_down), the other fingers of that event never reach
+    // the app, and a move or up for a finger that is not down is ignored.
+    // What does not reach the app is not logged.
     let current_touches = &env.framework_state.uikit.ui_touch.current_touches;
+    let redirected = phase == "down" && touches.keys().any(|f| current_touches.contains_key(f));
     let mut received: [HashMap<FingerId, Coords>; 3] = Default::default();
     for (&finger, &coords) in touches {
         let index = match (phase, current_touches.contains_key(&finger)) {
+            ("down", false) if redirected => continue,
             ("down", false) => 0,
             ("down", true) | ("move", true) => 1,
             ("up", true) => 2,

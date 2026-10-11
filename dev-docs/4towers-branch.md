@@ -127,7 +127,7 @@ These come with the message trace: they are written only while it is on, into th
 | --- | --- |
 | `frame` | frames presented so far, as in `trace.log` |
 | `ms` | milliseconds since touchHLE started, three decimals, as in `trace.log` |
-| `phase` | `down`, `move` or `up`, as the game receives it: a finger reported down while it is already down reaches the game as a move and is logged as `move`, and a move or up for a finger that is not down is ignored by touchHLE and not logged |
+| `phase` | `down`, `move` or `up`, as the game receives it: a finger reported down while it is already down reaches the game as a move and is logged as `move` (the other fingers of that event never reach the game and are not logged), and a move or up for a finger that is not down is ignored by touchHLE and not logged |
 | `finger` | which finger: `Mouse`, `Touch(n)` (n is the host's finger id), `VirtualCursor`, `ButtonToTouch(button)`, `StickToTouch` or `DpadToTouch` |
 | `x`, `y` | the position in guest points (the screen is 320 x 480 points), unrotated: what the game's `UITouch` reports, whatever the window's rotation or scale |
 
