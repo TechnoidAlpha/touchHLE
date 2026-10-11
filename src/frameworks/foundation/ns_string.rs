@@ -2036,6 +2036,67 @@ mod ns_string_tests {
         assert!(line_range_helper(&str5, range(6, 1), true, true) == (5, 7, 6));
         assert!(line_range_helper(&str5, range(4, 1), true, true) == (0, 5, 4));
     }
+
+    /// A host object that wraps a string's, as a subclass's would.
+    struct WrapsString {
+        superclass: StringHostObject,
+    }
+    crate::objc::impl_HostObject_with_superclass!(WrapsString);
+
+    /// [host_string_text] reads only the object table, so a bare [ObjC] with
+    /// host objects at made-up addresses is enough.
+    #[test]
+    fn host_string_text_reads_the_host_object() {
+        let at = |bits| -> id { Ptr::from_bits(bits) };
+        let utf16 = |text: &str| StringHostObject::Utf16(text.encode_utf16().collect());
+        let mut objc = ObjC::new();
+        let mut add = |bits, host_object: Box<dyn crate::objc::AnyHostObject>| {
+            objc.register_static_object(at(bits), host_object)
+        };
+        add(
+            0x1000,
+            Box::new(StringHostObject::Utf8(Cow::Borrowed("Wave 3"))),
+        );
+        add(0x1010, Box::new(utf16("Gold: 120")));
+        // An unpaired high surrogate, then an unpaired low one.
+        add(
+            0x1020,
+            Box::new(StringHostObject::Utf16(vec![0x41, 0xD800, 0x42, 0xDC00])),
+        );
+        // One pair, U+1F600.
+        add(
+            0x1030,
+            Box::new(StringHostObject::Utf16(vec![0xD83D, 0xDE00])),
+        );
+        add(
+            0x1040,
+            Box::new(WrapsString {
+                superclass: utf16("Lives: 20"),
+            }),
+        );
+        add(0x1050, Box::new(crate::objc::TrivialHostObject));
+        add(0x1060, Box::new(StringHostObject::Utf16(Vec::new())));
+        let text = |bits, max_units| host_string_text(&objc, at(bits), max_units);
+
+        // UTF-8 is borrowed whole, whatever the limit.
+        assert!(matches!(text(0x1000, 2), Some(Cow::Borrowed("Wave 3"))));
+        // UTF-16 is cut at the limit, in code units.
+        assert_eq!(text(0x1010, 200).as_deref(), Some("Gold: 120"));
+        assert_eq!(text(0x1010, 4).as_deref(), Some("Gold"));
+        assert_eq!(text(0x1010, 0).as_deref(), Some(""));
+        assert_eq!(text(0x1060, 200).as_deref(), Some(""));
+        // A broken pair shows U+FFFD, and does not panic.
+        assert_eq!(text(0x1020, 200).as_deref(), Some("A\u{FFFD}B\u{FFFD}"));
+        assert_eq!(text(0x1030, 200).as_deref(), Some("\u{1F600}"));
+        // A cut inside a pair leaves half of it, which shows U+FFFD.
+        assert_eq!(text(0x1030, 1).as_deref(), Some("\u{FFFD}"));
+        // The string's host object is found under a subclass's.
+        assert_eq!(text(0x1040, 200).as_deref(), Some("Lives: 20"));
+        // Not a string, unknown, nil.
+        assert_eq!(text(0x1050, 200), None);
+        assert_eq!(text(0x2000, 200), None);
+        assert_eq!(host_string_text(&objc, nil, 200), None);
+    }
 }
 
 /// Helper function to get bytes of a string in the specified NSStringEncoding.

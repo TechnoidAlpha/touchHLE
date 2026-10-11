@@ -1260,10 +1260,13 @@ fn fmt_f32(bits: u32) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        capture_due, nslog_row, parse_selector_line, returns_struct, touch_row, Filter, Markers,
-        Traced, TrampolineCache,
+        capture_due, class_chain_names, nslog_row, parse_selector_line, returns_struct, touch_row,
+        Class, ClassHostObject, Filter, Markers, ObjC, Ptr, Traced, TrampolineCache,
     };
+    use crate::objc::classes::InitializationStatus;
+    use crate::objc::{nil, TrivialHostObject};
     use crate::window::FingerId;
+    use std::collections::HashMap;
 
     #[test]
     fn nslog_rows_fill_every_column() {
@@ -1513,5 +1516,71 @@ mod tests {
         cache.insert(other, 0x8008, (0x2000, 0x3001));
         assert_eq!(cache.stub_for(&key), Some(0x8000));
         assert_eq!(cache.stub_for(&other), Some(0x8008));
+    }
+
+    /// A class's host object, as touchHLE keeps it, with empty method and
+    /// ivar tables.
+    fn class_object(name: &str, is_metaclass: bool, superclass: Class) -> Box<ClassHostObject> {
+        Box::new(ClassHostObject {
+            name: name.to_string(),
+            is_metaclass,
+            superclass,
+            methods: HashMap::new(),
+            guest_method_signatures: HashMap::new(),
+            ivars: HashMap::new(),
+            instance_start: 0,
+            instance_size: 0,
+            is_initialized: InitializationStatus::NotInitialized,
+        })
+    }
+
+    /// [class_chain_names] reads only the object table, so a bare [ObjC]
+    /// with classes at made-up addresses is enough.
+    #[test]
+    fn class_chain_names_walks_to_the_root() {
+        let at = |bits| -> Class { Ptr::from_bits(bits) };
+        let mut objc = ObjC::new();
+        let mut class = |bits, name, is_metaclass, superclass| {
+            objc.register_static_object(at(bits), class_object(name, is_metaclass, superclass))
+        };
+        // NSObject <- CCNode <- CCSprite <- CCLabelTTF, and their
+        // metaclasses, the root metaclass's superclass being the root class.
+        class(0x100, "NSObject", false, nil);
+        class(0x104, "CCNode", false, at(0x100));
+        class(0x108, "CCSprite", false, at(0x104));
+        class(0x10c, "CCLabelTTF", false, at(0x108));
+        class(0x200, "NSObject", true, at(0x100));
+        class(0x204, "CCNode", true, at(0x200));
+        class(0x208, "CCSprite", true, at(0x204));
+        class(0x20c, "CCLabelTTF", true, at(0x208));
+        // A class whose superclass touchHLE has no record of.
+        class(0x300, "Orphan", false, at(0x3f0));
+        // A class whose superclass is some other kind of object.
+        class(0x304, "OddParent", false, at(0x308));
+        // A class that is its own superclass.
+        class(0x30c, "Loop", false, at(0x30c));
+        objc.register_static_object(at(0x308), Box::new(TrivialHostObject));
+
+        let names = |bits| class_chain_names(&objc, at(bits));
+        assert_eq!(
+            names(0x10c),
+            ["CCLabelTTF", "CCSprite", "CCNode", "NSObject"]
+        );
+        assert_eq!(names(0x104), ["CCNode", "NSObject"]);
+        assert_eq!(names(0x100), ["NSObject"]);
+        assert_eq!(
+            names(0x20c),
+            ["CCLabelTTF", "CCSprite", "CCNode", "NSObject", "NSObject"]
+        );
+        // The walk stops where the record does, without a panic.
+        assert_eq!(names(0x300), ["Orphan"]);
+        assert_eq!(names(0x304), ["OddParent"]);
+        assert!(names(0x308).is_empty());
+        assert!(names(0x3f0).is_empty());
+        assert!(class_chain_names(&objc, nil).is_empty());
+        // A loop ends at the bound.
+        let looped = names(0x30c);
+        assert_eq!(looped.len(), 64);
+        assert!(looped.iter().all(|name| name == "Loop"));
     }
 }
