@@ -18,12 +18,15 @@
 //! as a float from the same bits), the first four words on the stack and the
 //! link register.
 
-use super::{id, Class, ClassHostObject, ObjC, SEL};
+use super::{id, nil, Class, ClassHostObject, ObjC, IMP, SEL};
+use crate::abi::GuestFunction;
 use crate::cpu::Cpu;
-use crate::mem::ConstPtr;
+use crate::dyld::HostFunction;
+use crate::mem::{ConstPtr, Ptr};
 use crate::Environment;
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
+use std::hash::Hash;
 use std::io::{BufRead, BufReader, Write};
 
 /// File in the user data directory listing selectors to trace.
@@ -51,9 +54,47 @@ pub struct MsgTrace {
     /// Whether each (uniqued) selector pointer is traced, so the string
     /// comparison happens once per selector.
     cache: HashMap<SEL, bool>,
+    /// Stubs handed out by `methodForSelector:` for traced selectors, see
+    /// [trace_wrap_imp].
+    trampolines: TrampolineCache<(Class, SEL, u32), (SEL, GuestFunction)>,
     out: File,
     /// Incremented once per presented frame.
     frame: u32,
+}
+
+/// The trampolines handed out for traced selectors, keyed both ways: by what
+/// they stand for (receiver class, selector, real IMP), so each is made once,
+/// and by the stub's address, so the stub can find where to go. Generic over
+/// the key and value so the bookkeeping can be tested without a CPU.
+struct TrampolineCache<K, V> {
+    by_target: HashMap<K, u32>,
+    by_stub: HashMap<u32, V>,
+}
+
+impl<K: Hash + Eq, V: Copy> TrampolineCache<K, V> {
+    fn new() -> Self {
+        TrampolineCache {
+            by_target: HashMap::new(),
+            by_stub: HashMap::new(),
+        }
+    }
+
+    /// The stub already made for `key`, if any.
+    fn stub_for(&self, key: &K) -> Option<u32> {
+        self.by_target.get(key).copied()
+    }
+
+    /// Record a new stub (its address without the Thumb bit).
+    fn insert(&mut self, key: K, stub: u32, value: V) {
+        let old = self.by_stub.insert(stub, value);
+        assert!(old.is_none());
+        self.by_target.insert(key, stub);
+    }
+
+    /// What the stub at `stub` stands for.
+    fn target_of(&self, stub: u32) -> Option<V> {
+        self.by_stub.get(&stub).copied()
+    }
 }
 
 impl MsgTrace {
@@ -112,6 +153,7 @@ impl MsgTrace {
         Some(MsgTrace {
             selectors,
             cache: HashMap::new(),
+            trampolines: TrampolineCache::new(),
             out,
             frame: 0,
         })
@@ -132,6 +174,37 @@ impl ObjC {
     }
 }
 
+/// Whether `selector` is one of the traced ones. The trace must be on.
+fn selector_is_traced(env: &mut Environment, selector: SEL) -> bool {
+    let mem = &*env.mem;
+    let Some(MsgTrace {
+        selectors, cache, ..
+    }) = env.objc.trace.as_mut()
+    else {
+        return false;
+    };
+    *cache.entry(selector).or_insert_with(|| {
+        !selector.is_null()
+            && selector
+                .try_as_str(mem)
+                .is_some_and(|s| selectors.contains(s))
+    })
+}
+
+/// The class name as written in the trace, with `+` for a metaclass.
+fn class_name_for_trace(env: &Environment, class: Class) -> String {
+    let is_metaclass = env
+        .objc
+        .get_host_object(class)
+        .and_then(|o| o.as_any().downcast_ref::<ClassHostObject>())
+        .is_some_and(|c| c.is_metaclass);
+    format!(
+        "{}{}",
+        if is_metaclass { "+" } else { "" },
+        env.objc.try_get_class_name(class).unwrap_or("?")
+    )
+}
+
 /// Called at the top of `objc_msgSend_inner` when the trace is on, before the
 /// message type info is taken. `receiver` is never nil here.
 pub(super) fn trace_send(
@@ -141,22 +214,7 @@ pub(super) fn trace_send(
     super2: Option<Class>,
     variant: SendVariant,
 ) {
-    let traced = {
-        let mem = &*env.mem;
-        let Some(MsgTrace {
-            selectors, cache, ..
-        }) = env.objc.trace.as_mut()
-        else {
-            return;
-        };
-        *cache.entry(selector).or_insert_with(|| {
-            !selector.is_null()
-                && selector
-                    .try_as_str(mem)
-                    .is_some_and(|s| selectors.contains(s))
-        })
-    };
-    if !traced {
+    if !selector_is_traced(env, selector) {
         return;
     }
 
@@ -181,16 +239,20 @@ pub(super) fn trace_send(
             .map_or(class, |c| c.superclass),
         None => ObjC::read_isa(receiver, &env.mem),
     };
-    let is_metaclass = env
-        .objc
-        .get_host_object(class)
-        .and_then(|o| o.as_any().downcast_ref::<ClassHostObject>())
-        .is_some_and(|c| c.is_metaclass);
-    let class_name = format!(
-        "{}{}",
-        if is_metaclass { "+" } else { "" },
-        env.objc.try_get_class_name(class).unwrap_or("?")
-    );
+    let class_name = class_name_for_trace(env, class);
+    write_line(env, origin, variant_name, &class_name, selector, variant);
+}
+
+/// Write one trace line from the current registers. The arguments are taken
+/// from where `variant` puts them.
+fn write_line(
+    env: &mut Environment,
+    origin: &str,
+    variant_name: &str,
+    class_name: &str,
+    selector: SEL,
+    variant: SendVariant,
+) {
     let selector_name = selector.try_as_str(&env.mem).unwrap_or("?");
 
     let regs = *env.cpu.regs();
@@ -232,6 +294,83 @@ pub(super) fn trace_send(
     let _ = trace.out.write_all(line.as_bytes());
 }
 
+/// The host side of every trampoline (see [trace_wrap_imp]).
+const TRAMPOLINE_FUNCTION: HostFunction = &(trace_imp_trampoline as fn(&mut Environment));
+
+/// Called from `methodForSelector:` and `instanceMethodForSelector:` with the
+/// IMP they found. When the trace is on and `selector` is traced, returns a
+/// trampoline in its place: a guest-callable stub that writes a trace line and
+/// then continues in the real IMP. Otherwise returns `imp` unchanged.
+///
+/// This is how calls that never pass through `objc_msgSend` get traced.
+/// cocos2d's `CCTimer` asks for the IMP of a scheduled selector once and then
+/// calls it directly on every tick.
+///
+/// One trampoline is made per receiver class, selector and real IMP, and kept
+/// for the rest of the run.
+pub fn trace_wrap_imp(env: &mut Environment, class: Class, selector: SEL, imp: IMP) -> IMP {
+    let IMP::Guest(real) = imp else {
+        return imp;
+    };
+    if env.objc.trace.is_none()
+        || real.addr_with_thumb_bit() == 0
+        || !selector_is_traced(env, selector)
+    {
+        return IMP::Guest(real);
+    }
+
+    let key = (class, selector, real.addr_with_thumb_bit());
+    let trampolines = &env.objc.trace.as_ref().unwrap().trampolines;
+    if let Some(stub) = trampolines.stub_for(&key) {
+        return IMP::Guest(GuestFunction::from_addr_with_thumb_bit(stub));
+    }
+
+    let stub = env.dyld.create_guest_function(
+        &mut env.mem,
+        "touchHLE_trace_imp_trampoline",
+        TRAMPOLINE_FUNCTION,
+    );
+    let stub_addr = stub.addr_without_thumb_bit();
+    env.cpu.invalidate_cache_range(stub_addr, 8);
+    let trampolines = &mut env.objc.trace.as_mut().unwrap().trampolines;
+    trampolines.insert(key, stub_addr, (selector, real));
+    IMP::Guest(stub)
+}
+
+/// Runs when the guest calls a trampoline. Writes the trace line, then sets
+/// the PC (and the Thumb state) to the real IMP, so the guest carries on
+/// inside the real method with every register (r0-r3, SP, LR) as the caller
+/// left it, and the method returns straight to the caller. The stub's own
+/// return instruction never runs.
+fn trace_imp_trampoline(env: &mut Environment) {
+    // The PC points at the instruction after the SVC, and the SVC is the
+    // first instruction of the stub.
+    let stub = env.cpu.regs()[Cpu::PC] - 4;
+    let (selector, real) = env
+        .objc
+        .trace
+        .as_ref()
+        .and_then(|trace| trace.trampolines.target_of(stub))
+        .expect("trace trampoline called with no target");
+
+    let receiver: id = Ptr::from_bits(env.cpu.regs()[0]);
+    let class_name = if receiver == nil {
+        "nil".to_string()
+    } else {
+        class_name_for_trace(env, ObjC::read_isa(receiver, &env.mem))
+    };
+    write_line(
+        env,
+        "guest",
+        "imp",
+        &class_name,
+        selector,
+        SendVariant::Normal,
+    );
+
+    env.cpu.branch(real);
+}
+
 /// The word as a float, in plain notation for ordinary magnitudes and in
 /// exponent notation otherwise (pointers read as floats are tiny or huge).
 fn fmt_f32(bits: u32) -> String {
@@ -242,5 +381,27 @@ fn fmt_f32(bits: u32) -> String {
         format!("{value}")
     } else {
         format!("{value:e}")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::TrampolineCache;
+
+    #[test]
+    fn trampoline_cache_finds_both_ways() {
+        let mut cache: TrampolineCache<(u32, u32, u32), (u32, u32)> = TrampolineCache::new();
+        let key = (0x1000, 0x2000, 0x3001);
+        assert_eq!(cache.stub_for(&key), None);
+        cache.insert(key, 0x8000, (0x2000, 0x3001));
+        assert_eq!(cache.stub_for(&key), Some(0x8000));
+        assert_eq!(cache.target_of(0x8000), Some((0x2000, 0x3001)));
+        assert_eq!(cache.target_of(0x8008), None);
+        // The same selector and IMP on another class gets its own stub.
+        let other = (0x1100, 0x2000, 0x3001);
+        assert_eq!(cache.stub_for(&other), None);
+        cache.insert(other, 0x8008, (0x2000, 0x3001));
+        assert_eq!(cache.stub_for(&key), Some(0x8000));
+        assert_eq!(cache.stub_for(&other), Some(0x8008));
     }
 }

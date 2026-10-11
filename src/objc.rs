@@ -45,6 +45,7 @@ pub use objects::{
 };
 pub use properties::todo_objc_setter;
 pub use selectors::{selector, SEL};
+pub use trace::trace_wrap_imp;
 
 use crate::mem::ConstVoidPtr;
 use crate::Environment;

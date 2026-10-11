@@ -22,8 +22,8 @@ use crate::libc::semaphore::{host_destroy_semaphore, sem_wait};
 use crate::mem::MutVoidPtr;
 use crate::objc::{
     autorelease, class_getMethodImplementation, id, msg, msg_class, msg_send,
-    msg_send_no_type_checking, nil, objc_classes, retain, Class, ClassExports, NSZonePtr, ObjC,
-    TrivialHostObject, IMP, SEL,
+    msg_send_no_type_checking, nil, objc_classes, retain, trace_wrap_imp, Class, ClassExports,
+    NSZonePtr, ObjC, TrivialHostObject, IMP, SEL,
 };
 
 pub const CLASSES: ClassExports = objc_classes! {
@@ -68,7 +68,8 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 + (IMP)instanceMethodForSelector:(SEL)selector {
-    class_getMethodImplementation(env, this, selector)
+    let imp = class_getMethodImplementation(env, this, selector);
+    trace_wrap_imp(env, this, selector, imp)
 }
 
 + (())cancelPreviousPerformRequestsWithTarget:(id)target selector:(SEL)selector object:(id)arg {
@@ -263,7 +264,10 @@ forUndefinedKey:(id)key { // NSString*
 
 - (IMP)methodForSelector:(SEL)selector {
     let class: Class = ObjC::read_isa(this, &env.mem);
-    class_getMethodImplementation(env, class, selector)
+    let imp = class_getMethodImplementation(env, class, selector);
+    // A trampoline in place of the IMP when the selector is traced, so calls
+    // made through the IMP (cocos2d's scheduler) show up in the trace.
+    trace_wrap_imp(env, class, selector, imp)
 }
 
 - (id)methodSignatureForSelector:(SEL)sel {
