@@ -20,7 +20,8 @@
 //!   `instanceMethodForSelector:` (variant `imp`). For a traced selector those
 //!   return a trampoline that writes the line and then continues in the real
 //!   method (see [trace_wrap_imp]). This is how cocos2d's scheduler calls the
-//!   selectors it was given, so scheduled timers show up.
+//!   selectors it was given, so scheduled timers show up. Methods that return
+//!   a struct or a union are not wrapped (see [trace_wrap_imp]).
 //!
 //! Each line records the presented frame number, the milliseconds since
 //! startup, the thread, whether the call came from the guest or from host
@@ -68,6 +69,9 @@ pub struct MsgTrace {
     /// Stubs handed out by `methodForSelector:` for traced selectors, see
     /// [trace_wrap_imp].
     trampolines: TrampolineCache<(Class, SEL, u32), (SEL, GuestFunction)>,
+    /// Receiver classes and selectors whose IMP was not wrapped because the
+    /// method returns a struct, so that is logged once each.
+    not_wrapped: HashSet<(Class, SEL)>,
     out: File,
     /// Incremented once per presented frame.
     frame: u32,
@@ -146,6 +150,7 @@ impl MsgTrace {
              # selectors: {}\n\
              # arg0/arg1 are r2/r3 (r3/stack0 for stret sends); sp0-sp3 are the words at sp\n\
              # self is the receiver's address\n\
+             # no imp lines for methods that return a struct or a union\n\
              frame\tms\tthread\torigin\tvariant\tclass\tselector\targ0\targ0_f32\targ1\targ1_f32\tsp0\tsp1\tsp2\tsp3\tlr\tself\n",
             crate::branding(),
             if crate::branding().is_empty() { "" } else { " " },
@@ -166,6 +171,7 @@ impl MsgTrace {
             selectors,
             cache: HashMap::new(),
             trampolines: TrampolineCache::new(),
+            not_wrapped: HashSet::new(),
             out,
             frame: 0,
         })
@@ -331,6 +337,12 @@ const TRAMPOLINE_FUNCTION: HostFunction = &(trace_imp_trampoline as fn(&mut Envi
 ///
 /// One trampoline is made per receiver class, selector and real IMP, and kept
 /// for the rest of the run.
+///
+/// The trampoline reads the receiver from r0 and the arguments from r2 and r3.
+/// A method that returns a struct may instead be called with the return
+/// buffer in r0 and everything else one register later, and nothing at the
+/// call says which, so such methods (and any whose type encoding is unknown)
+/// are returned unwrapped and their IMP calls are not traced.
 pub fn trace_wrap_imp(env: &mut Environment, class: Class, selector: SEL, imp: IMP) -> IMP {
     let IMP::Guest(real) = imp else {
         return imp;
@@ -339,6 +351,28 @@ pub fn trace_wrap_imp(env: &mut Environment, class: Class, selector: SEL, imp: I
         || real.addr_with_thumb_bit() == 0
         || !selector_is_traced(env, selector)
     {
+        return IMP::Guest(real);
+    }
+
+    let returns_plain_value = env
+        .objc
+        .class_get_method_signature(class, selector)
+        .is_some_and(|&types| !returns_struct(env.mem.cstr_at(types)));
+    if !returns_plain_value {
+        let first_time = env
+            .objc
+            .trace
+            .as_mut()
+            .unwrap()
+            .not_wrapped
+            .insert((class, selector));
+        if first_time {
+            log!(
+                "Message trace: calls of [{} {}] through its IMP are not traced (it returns a struct, or its types are unknown)",
+                class_name_for_trace(env, class),
+                selector.try_as_str(&env.mem).unwrap_or("?")
+            );
+        }
         return IMP::Guest(real);
     }
 
@@ -364,7 +398,8 @@ pub fn trace_wrap_imp(env: &mut Environment, class: Class, selector: SEL, imp: I
 /// the PC (and the Thumb state) to the real IMP, so the guest carries on
 /// inside the real method with every register (r0-r3, SP, LR) as the caller
 /// left it, and the method returns straight to the caller. The stub's own
-/// return instruction never runs.
+/// return instruction never runs. Only methods that do not return a struct get
+/// a trampoline, so the receiver is in r0 and the arguments start at r2.
 fn trace_imp_trampoline(env: &mut Environment) {
     // The PC points at the instruction after the SVC, and the SVC is the
     // first instruction of the stub.
@@ -395,6 +430,16 @@ fn trace_imp_trampoline(env: &mut Environment) {
     env.cpu.branch(real);
 }
 
+/// Whether an Objective-C method type encoding (return type first) returns a
+/// struct or a union. Leading type qualifiers such as `r` (const) are
+/// skipped.
+fn returns_struct(types: &[u8]) -> bool {
+    types
+        .iter()
+        .find(|&&c| !b"rnNoORV".contains(&c))
+        .is_some_and(|&c| c == b'{' || c == b'(')
+}
+
 /// The word as a float, in plain notation for ordinary magnitudes and in
 /// exponent notation otherwise (pointers read as floats are tiny or huge).
 fn fmt_f32(bits: u32) -> String {
@@ -410,7 +455,18 @@ fn fmt_f32(bits: u32) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::TrampolineCache;
+    use super::{returns_struct, TrampolineCache};
+
+    #[test]
+    fn returns_struct_reads_the_return_type() {
+        assert!(!returns_struct(b"v12@0:4@8"));
+        assert!(!returns_struct(b"f8@0:4"));
+        assert!(!returns_struct(b"@8@0:4"));
+        assert!(returns_struct(b"{CGPoint=ff}8@0:4"));
+        assert!(returns_struct(b"r{CGRect={CGPoint=ff}{CGSize=ff}}8@0:4"));
+        assert!(returns_struct(b"(u=if)8@0:4"));
+        assert!(!returns_struct(b"r*8@0:4"));
+    }
 
     #[test]
     fn trampoline_cache_finds_both_ways() {
