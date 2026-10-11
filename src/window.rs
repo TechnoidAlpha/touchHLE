@@ -460,7 +460,9 @@ impl Window {
         // been told: this runs from the main loop, also while the guest
         // runs, and UIKit only sees the event on the run loop's next turn.
         // So SDL is not pumped until UIKit has handled it, or the block
-        // could land before (or in the middle of) the app's save.
+        // could land before (or in the middle of) the app's save: this
+        // returns at once, and the loop below stops as soon as the event is
+        // queued (a poll after SDL's sentinel has been taken pumps again).
         if self.background_unhandled {
             return;
         }
@@ -534,6 +536,10 @@ impl Window {
         let mut previous_event: Option<sdl2::event::Event> = None;
         loop {
             use sdl2::event::Event as E;
+            // See the top of this function.
+            if self.background_unhandled {
+                break;
+            }
             let event = if let Some(e) = previous_event.take() {
                 match e {
                     E::Unknown { .. } => (),
@@ -842,7 +848,10 @@ impl Window {
                     let coords = transform_input_coords(self, abs_coords, false);
                     log_dbg!("Finger event x {}, y {}, coords {:?}", x, y, coords);
                     let mut map = HashMap::from([(FingerId::Touch(finger_id), coords)]);
-                    while let Some(next) = self.event_pump.poll_event() {
+                    while !self.background_unhandled {
+                        let Some(next) = self.event_pump.poll_event() else {
+                            break;
+                        };
                         match next {
                             E::Unknown { .. } => (),
                             _ => log_dbg!("Next possible multi-touch event: {:?}", next),
