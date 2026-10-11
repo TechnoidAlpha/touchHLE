@@ -242,6 +242,12 @@ Debugging options:
         a comment); the option and the file add up. trace.log is replaced on
         each run.
 
+        While the trace is on, input.log in the same folder gets one
+        tab-separated row per finger for every touch event the app receives:
+        frame, ms (the same clock and frame numbers as trace.log), phase
+        (down, move or up), finger and x, y in guest points. Lines starting
+        with # are its header. It is replaced on each run.
+
 Other options:
     --preferred-languages=...
         Specifies a list of preferred languages to be reported to the app.

@@ -29,12 +29,17 @@
 //! argument words (as hex and as a float from the same bits), the first four
 //! words on the stack, the link register and, last, the receiver's address
 //! (the `self` column).
+//!
+//! While the trace is on, every touch event the app receives is also written
+//! to `input.log` in the user data directory (see [trace_touches]), on the
+//! same clock and with the same frame numbers as `trace.log`.
 
 use super::{id, nil, Class, ClassHostObject, ObjC, IMP, SEL};
 use crate::abi::GuestFunction;
 use crate::cpu::Cpu;
 use crate::dyld::HostFunction;
 use crate::mem::{ConstPtr, Ptr};
+use crate::window::{Coords, FingerId};
 use crate::Environment;
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
@@ -45,6 +50,9 @@ use std::io::{BufRead, BufReader, Write};
 pub const TRACE_SELECTORS_FILE: &str = "trace_selectors.txt";
 /// File in the user data directory the trace is written to.
 pub const TRACE_LOG_FILE: &str = "trace.log";
+/// File in the user data directory the touch log is written to, see
+/// [trace_touches].
+pub const INPUT_LOG_FILE: &str = "input.log";
 
 /// Which `objc_msgSend` variant a send came through. This decides where the
 /// receiver, selector and arguments sit in the registers.
@@ -75,6 +83,9 @@ pub struct MsgTrace {
     out: File,
     /// Incremented once per presented frame.
     frame: u32,
+    /// The touch log, see [trace_touches]. [None] if it could not be
+    /// created.
+    input: Option<File>,
 }
 
 /// The trampolines handed out for traced selectors, keyed both ways: by what
@@ -167,6 +178,7 @@ impl MsgTrace {
             list.len(),
             path.display()
         );
+        let input = open_input_log(&base.join(INPUT_LOG_FILE), bundle_id);
         Some(MsgTrace {
             selectors,
             cache: HashMap::new(),
@@ -174,8 +186,76 @@ impl MsgTrace {
             not_wrapped: HashSet::new(),
             out,
             frame: 0,
+            input,
         })
     }
+}
+
+/// Create the touch log and write its header. Returns [None] (and logs why)
+/// if it cannot be written; the rest of the trace carries on without it.
+fn open_input_log(path: &std::path::Path, bundle_id: &str) -> Option<File> {
+    let header = format!(
+        "# touchHLE {}{}{} touch log\n\
+         # app: {}\n\
+         # one row per finger per touch event the app receives, tab-separated\n\
+         # frame and ms: the same clock and frame numbers as trace.log\n\
+         # (ms since touchHLE started; frame = frames presented so far)\n\
+         # phase: down, move or up; finger: touchHLE's finger id\n\
+         # x, y: guest points, unrotated, as the app's UITouch has them\n\
+         # frame\tms\tphase\tfinger\tx\ty\n",
+        crate::branding(),
+        if crate::branding().is_empty() {
+            ""
+        } else {
+            " "
+        },
+        crate::VERSION,
+        bundle_id,
+    );
+    let result = File::create(path).and_then(|mut file| {
+        file.write_all(header.as_bytes())?;
+        Ok(file)
+    });
+    match result {
+        Ok(file) => Some(file),
+        Err(e) => {
+            log!(
+                "Warning: could not write {}, no touch log: {}",
+                path.display(),
+                e
+            );
+            None
+        }
+    }
+}
+
+/// One row of the touch log, see [trace_touches].
+fn touch_row(frame: u32, ms: f64, phase: &str, finger: FingerId, (x, y): Coords) -> String {
+    format!("{frame}\t{ms:.3}\t{phase}\t{finger:?}\t{x}\t{y}\n")
+}
+
+/// Called by UIKit for each touch event it hands to the app. When the trace
+/// is on, writes one row per finger to `input.log`: the frame, the
+/// milliseconds since startup, `phase` (`down`, `move` or `up`), the finger
+/// (`Mouse`, `Touch(n)`, `VirtualCursor`, `ButtonToTouch(button)`,
+/// `StickToTouch` or `DpadToTouch`) and the position in guest points. Each
+/// event is one unbuffered write, so a crash keeps every row before it.
+pub fn trace_touches(env: &mut Environment, phase: &str, touches: &HashMap<FingerId, Coords>) {
+    let elapsed_ms = env.startup_time.elapsed().as_secs_f64() * 1000.0;
+    let Some(trace) = env.objc.trace.as_mut() else {
+        return;
+    };
+    let frame = trace.frame;
+    let Some(input) = trace.input.as_mut() else {
+        return;
+    };
+    let mut fingers: Vec<_> = touches.iter().collect();
+    fingers.sort_by_key(|(finger, _)| format!("{finger:?}"));
+    let rows: String = fingers
+        .into_iter()
+        .map(|(&finger, &coords)| touch_row(frame, elapsed_ms, phase, finger, coords))
+        .collect();
+    let _ = input.write_all(rows.as_bytes());
 }
 
 impl ObjC {
@@ -455,7 +535,20 @@ fn fmt_f32(bits: u32) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{returns_struct, TrampolineCache};
+    use super::{returns_struct, touch_row, TrampolineCache};
+    use crate::window::FingerId;
+
+    #[test]
+    fn touch_rows_are_tab_separated() {
+        assert_eq!(
+            touch_row(12, 3456.789, "down", FingerId::Touch(0), (160.0, 240.5)),
+            "12\t3456.789\tdown\tTouch(0)\t160\t240.5\n"
+        );
+        assert_eq!(
+            touch_row(0, 1.0, "up", FingerId::Mouse, (-1.0, 0.0)),
+            "0\t1.000\tup\tMouse\t-1\t0\n"
+        );
+    }
 
     #[test]
     fn returns_struct_reads_the_return_type() {

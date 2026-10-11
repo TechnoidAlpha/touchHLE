@@ -110,6 +110,16 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 /// [super::handle_events] will forward touch events to this function.
 pub fn handle_event(env: &mut Environment, event: Event) {
+    // The touch log next to the message trace (input.log); does nothing when
+    // the trace is off. The co-ordinates are already guest points here.
+    let (phase, touches) = match &event {
+        Event::TouchesDown(touches) => ("down", touches),
+        Event::TouchesMove(touches) => ("move", touches),
+        Event::TouchesUp(touches) => ("up", touches),
+        _ => unreachable!(),
+    };
+    crate::objc::trace_touches(env, phase, touches);
+
     // before processing anything, we mark all current touches as stationary
     let current_touches = &env.framework_state.uikit.ui_touch.current_touches;
     for &touch in (*current_touches).values() {
