@@ -134,7 +134,8 @@ impl MsgTrace {
              # app: {}\n\
              # selectors: {}\n\
              # arg0/arg1 are r2/r3 (r3/stack0 for stret sends); sp0-sp3 are the words at sp\n\
-             frame\tms\tthread\torigin\tvariant\tclass\tselector\targ0\targ0_f32\targ1\targ1_f32\tsp0\tsp1\tsp2\tsp3\tlr\n",
+             # self is the receiver's address\n\
+             frame\tms\tthread\torigin\tvariant\tclass\tselector\targ0\targ0_f32\targ1\targ1_f32\tsp0\tsp1\tsp2\tsp3\tlr\tself\n",
             crate::branding(),
             if crate::branding().is_empty() { "" } else { " " },
             crate::VERSION,
@@ -240,11 +241,20 @@ pub(super) fn trace_send(
         None => ObjC::read_isa(receiver, &env.mem),
     };
     let class_name = class_name_for_trace(env, class);
-    write_line(env, origin, variant_name, &class_name, selector, variant);
+    write_line(
+        env,
+        origin,
+        variant_name,
+        &class_name,
+        selector,
+        variant,
+        receiver.to_bits(),
+    );
 }
 
 /// Write one trace line from the current registers. The arguments are taken
-/// from where `variant` puts them.
+/// from where `variant` puts them. `receiver` is written last, in the `self`
+/// column.
 fn write_line(
     env: &mut Environment,
     origin: &str,
@@ -252,6 +262,7 @@ fn write_line(
     class_name: &str,
     selector: SEL,
     variant: SendVariant,
+    receiver: u32,
 ) {
     let selector_name = selector.try_as_str(&env.mem).unwrap_or("?");
 
@@ -271,7 +282,7 @@ fn write_line(
     let elapsed_ms = env.startup_time.elapsed().as_secs_f64() * 1000.0;
     let trace = env.objc.trace.as_mut().unwrap();
     let line = format!(
-        "{}\t{:.3}\t{}\t{}\t{}\t{}\t{}\t{:#010x}\t{}\t{:#010x}\t{}\t{:#010x}\t{:#010x}\t{:#010x}\t{:#010x}\t{:#010x}\n",
+        "{}\t{:.3}\t{}\t{}\t{}\t{}\t{}\t{:#010x}\t{}\t{:#010x}\t{}\t{:#010x}\t{:#010x}\t{:#010x}\t{:#010x}\t{:#010x}\t{:#010x}\n",
         trace.frame,
         elapsed_ms,
         env.current_thread,
@@ -288,6 +299,7 @@ fn write_line(
         stack[2],
         stack[3],
         regs[Cpu::LR],
+        receiver,
     );
     // One unbuffered write per line, so the log is complete up to the last
     // send even if the emulator stops abruptly.
@@ -366,6 +378,7 @@ fn trace_imp_trampoline(env: &mut Environment) {
         &class_name,
         selector,
         SendVariant::Normal,
+        receiver.to_bits(),
     );
 
     env.cpu.branch(real);
