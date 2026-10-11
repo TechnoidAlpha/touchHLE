@@ -701,6 +701,7 @@ impl Environment {
         env.objc.start_trace(
             &env.options.trace_selectors,
             env.options.capture_frames,
+            env.options.capture_frames_max,
             env.bundle.bundle_identifier(),
         );
 

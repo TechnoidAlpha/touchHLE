@@ -69,6 +69,9 @@ pub struct Options {
     /// `--capture-frames=N`: save every Nth presented frame as a PNG file
     /// while the message trace is on (0 is off). See src/objc/trace.rs.
     pub capture_frames: u32,
+    /// `--capture-frames-max=M`: stop saving frames after M of them (0 is no
+    /// cap). See src/objc/trace.rs.
+    pub capture_frames_max: u32,
     /// `--bundle-files-ignore-case`, see
     /// [crate::fs::Fs::set_bundle_files_ignore_case].
     pub bundle_files_ignore_case: bool,
@@ -107,6 +110,7 @@ impl Default for Options {
             zero_stack_after_guest_to_host_call: None,
             trace_selectors: Vec::new(),
             capture_frames: 0,
+            capture_frames_max: 3000,
             bundle_files_ignore_case: false,
         }
     }
@@ -275,6 +279,10 @@ impl Options {
             self.capture_frames = value
                 .parse()
                 .map_err(|_| "Invalid value for --capture-frames=".to_string())?;
+        } else if let Some(value) = arg.strip_prefix("--capture-frames-max=") {
+            self.capture_frames_max = value
+                .parse()
+                .map_err(|_| "Invalid value for --capture-frames-max=".to_string())?;
         } else if arg == "--bundle-files-ignore-case" {
             self.bundle_files_ignore_case = true;
         } else if arg == "--ignore-gl-errors" {

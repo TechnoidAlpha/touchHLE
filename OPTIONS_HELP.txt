@@ -281,7 +281,21 @@ Debugging options:
         renderbuffer, unrotated, as 8-bit RGB (with --scale-hack, that many
         times larger). Only frames presented directly from a full-screen
         CAEAGLLayer are saved. Earlier frames in that folder are removed
-        when the run starts. Each picture is roughly 100-250 KB.
+        when the run starts. Each picture is roughly 100-250 KB (about
+        150 KB on average), and at most --capture-frames-max= of them are
+        saved per run. The frames still being written when the app exits
+        normally are finished first (waiting up to 3 seconds); an abrupt
+        stop (a crash, a killed process) can lose the last few frames.
+        Reading a frame back costs a few milliseconds on the emulator
+        thread, so the app's timing around a captured frame is a little
+        slower.
+
+    --capture-frames-max=M
+        Stops the frame capture after M frames, and logs it once. The
+        default is 3000 frames, about 450 MB at about 150 KB a frame
+        (every 10th frame at 30 fps is 3 frames a second, so 3000 frames
+        last about 17 minutes and grow by about 27 MB a minute). 0 is no
+        cap.
 
 Other options:
     --preferred-languages=...

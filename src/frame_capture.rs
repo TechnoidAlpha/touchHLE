@@ -13,12 +13,19 @@
 //! `frames/f{frame:06}_{ms}.png` in the user data directory. The encoder is
 //! a minimal one: 8-bit RGB, every row with the "Up" filter, deflated by
 //! `flate2` at a moderate level, with `crc32fast` for the chunk checksums.
+//!
+//! The capture stops after a cap (`--capture-frames-max=`, see
+//! [FrameCapture::at_cap]), and on the way out the frames still queued are
+//! written before touchHLE exits, for a bounded time (see
+//! [FrameCapture::finish]).
 
 use flate2::write::ZlibEncoder;
 use flate2::Compression;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TrySendError};
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 /// Folder in the user data directory the frames are written to.
 pub const FRAMES_DIR: &str = "frames";
@@ -45,22 +52,75 @@ struct CapturedFrame {
 /// The emulator thread's end of the frame capture.
 pub struct FrameCapture {
     sender: SyncSender<CapturedFrame>,
+    worker: JoinHandle<()>,
     /// Frames dropped because the worker was behind.
     dropped: u64,
+    /// Frames handed to the worker so far.
+    sent: u64,
+    /// `--capture-frames-max=`: how many frames to hand over at most, 0 for
+    /// no cap.
+    max: u32,
+    /// Whether reaching the cap has been logged.
+    cap_logged: bool,
 }
 
 impl FrameCapture {
-    /// Create (or empty of earlier captures) `dir` and start the worker.
-    pub fn start(dir: PathBuf) -> Result<FrameCapture, String> {
+    /// Create (or empty of earlier captures) `dir` and start the worker,
+    /// which saves at most `max` frames (0: no cap).
+    pub fn start(dir: PathBuf, max: u32) -> Result<FrameCapture, String> {
         std::fs::create_dir_all(&dir)
             .map_err(|e| format!("could not create {}: {}", dir.display(), e))?;
         remove_earlier_frames(&dir);
         let (sender, receiver) = sync_channel(QUEUE_LENGTH);
-        std::thread::Builder::new()
+        let worker = std::thread::Builder::new()
             .name("touchHLE frame capture".to_string())
             .spawn(move || worker(&dir, receiver))
             .map_err(|e| format!("could not start the frame capture thread: {e}"))?;
-        Ok(FrameCapture { sender, dropped: 0 })
+        Ok(FrameCapture {
+            sender,
+            worker,
+            dropped: 0,
+            sent: 0,
+            max,
+            cap_logged: false,
+        })
+    }
+
+    /// Whether the cap has been reached, so no more frames are to be read
+    /// back or saved. Logged the first time.
+    pub fn at_cap(&mut self) -> bool {
+        if !cap_reached(self.sent, self.max) {
+            return false;
+        }
+        if !self.cap_logged {
+            self.cap_logged = true;
+            log!(
+                "Frame capture stopped after {} frames (--capture-frames-max=); no more frames are saved this run",
+                self.sent
+            );
+        }
+        true
+    }
+
+    /// On the way out: let the worker write the frames still queued, and
+    /// wait for it for at most `wait`. Frames it has not written by then are
+    /// lost, which is logged.
+    pub fn finish(self, wait: Duration) {
+        let FrameCapture { sender, worker, .. } = self;
+        // The worker stops once the queue is empty and this end is gone.
+        drop(sender);
+        let deadline = Instant::now() + wait;
+        while !worker.is_finished() {
+            if Instant::now() >= deadline {
+                log!(
+                    "Frame capture: frames still being written after {:?} are lost",
+                    wait
+                );
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let _ = worker.join();
     }
 
     /// Hand a frame to the worker. `rgba` is what `glReadPixels` returned
@@ -75,7 +135,7 @@ impl FrameCapture {
             rgba,
         };
         match self.sender.try_send(captured) {
-            Ok(()) => (),
+            Ok(()) => self.sent += 1,
             Err(TrySendError::Full(_)) => {
                 self.dropped += 1;
                 // Powers of two, so a long stall does not flood the log.
@@ -92,6 +152,11 @@ impl FrameCapture {
             }
         }
     }
+}
+
+/// Whether `sent` frames reach the cap `max` (0: no cap).
+fn cap_reached(sent: u64, max: u32) -> bool {
+    max != 0 && sent >= u64::from(max)
 }
 
 /// The file name a captured frame is saved under: the trace's frame number
@@ -234,7 +299,7 @@ fn write_chunk(png: &mut Vec<u8>, kind: &[u8; 4], data: &[u8]) {
 
 #[cfg(test)]
 mod tests {
-    use super::{encode_png, frame_file_name, is_frame_file_name, write_chunk};
+    use super::{cap_reached, encode_png, frame_file_name, is_frame_file_name, write_chunk};
     use std::io::Read;
 
     #[test]
@@ -292,6 +357,15 @@ mod tests {
             png[41 + idat_len..45 + idat_len],
             crc.finalize().to_be_bytes()
         );
+    }
+
+    #[test]
+    fn the_cap_counts_frames_handed_over() {
+        assert!(!cap_reached(0, 0));
+        assert!(!cap_reached(u64::MAX, 0));
+        assert!(!cap_reached(2999, 3000));
+        assert!(cap_reached(3000, 3000));
+        assert!(cap_reached(1, 1));
     }
 
     #[test]

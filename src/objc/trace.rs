@@ -18,7 +18,8 @@
 //! separated by spaces (see [parse_selector_line]). The only one is `png`:
 //! `powerFire png` saves the first frame presented after each call of
 //! `powerFire`, the frame that shows its result. `--capture-frames=N` saves
-//! every Nth frame as well. Frames are read back on the CAEAGLLayer fast
+//! every Nth frame as well, up to `--capture-frames-max=` frames a run
+//! (3000 by default). Frames are read back on the CAEAGLLayer fast
 //! path only (see [trace_present_frame]) and written by a worker thread as
 //! `frames/f{frame:06}_{ms}.png` (see [crate::frame_capture]), where
 //! `frame` is the frame column of the trace lines whose drawing the picture
@@ -239,6 +240,14 @@ fn parse_selector_line(line: &str) -> Option<SelectorLine> {
     Some(parsed)
 }
 
+/// `--capture-frames-max=` in words, for the trace header and the log.
+fn capture_cap(capture_max: u32) -> String {
+    match capture_max {
+        0 => "no cap".to_string(),
+        n => format!("at most {n} frames"),
+    }
+}
+
 /// `--capture-frames=` in words, for the trace header and the log.
 fn periodic_capture(capture_every: u32) -> String {
     match capture_every {
@@ -250,9 +259,14 @@ fn periodic_capture(capture_every: u32) -> String {
 
 impl MsgTrace {
     /// Gather the selectors from the option and the file, and open the log if
-    /// there are any or `capture_every` is not 0. Returns [None] when the
-    /// trace is off.
-    fn open(option_selectors: &[String], capture_every: u32, bundle_id: &str) -> Option<MsgTrace> {
+    /// there are any or `capture_every` is not 0. At most `capture_max`
+    /// frames are saved (0: no cap). Returns [None] when the trace is off.
+    fn open(
+        option_selectors: &[String],
+        capture_every: u32,
+        capture_max: u32,
+        bundle_id: &str,
+    ) -> Option<MsgTrace> {
         let base = crate::paths::user_data_base_path();
         // An item of the option is a line of the file with ';' between its
         // words (an options file line cannot hold spaces in one option).
@@ -357,7 +371,9 @@ impl MsgTrace {
              # arg0/arg1 are r2/r3 (r3/stack0 for stret sends); sp0-sp3 are the words at sp\n\
              # self is the receiver's address\n\
              # no imp lines for methods that return a struct or a union\n\
-             # frame capture (frames/f<frame>_<ms>.png): {}; png after: {}\n\
+             # frame capture (frames/f<frame>_<ms>.png): {}; png after: {}; {}\n\
+             # a captured frame is read back on the emulator thread, so the calls\n\
+             # around it are timed a little slower than without capture\n\
              # origin nslog: a line the app printed with NSLog, in the selector column\n\
              # peeks: a row of a selector named in a '# peeks' line has one more column\n\
              # per peek after self, in that line's order; other rows end at self, so\n\
@@ -377,6 +393,7 @@ impl MsgTrace {
             } else {
                 png_after.join(",")
             },
+            capture_cap(capture_max),
             peek_lines,
         );
         if let Err(e) = out.write_all(header.as_bytes()) {
@@ -391,12 +408,13 @@ impl MsgTrace {
         let input = open_input_log(&base.join(INPUT_LOG_FILE), bundle_id);
         let capture = if capture_every > 0 || !png_after.is_empty() {
             let dir = base.join(FRAMES_DIR);
-            match FrameCapture::start(dir.clone()) {
+            match FrameCapture::start(dir.clone(), capture_max) {
                 Ok(capture) => {
                     log!(
-                        "Frame capture on ({}, after {} png selector(s)), writing to {}",
+                        "Frame capture on ({}, after {} png selector(s), {}), writing to {}",
                         periodic_capture(capture_every),
                         png_after.len(),
+                        capture_cap(capture_max),
                         dir.display()
                     );
                     Some(capture)
@@ -496,14 +514,16 @@ pub fn trace_touches(env: &mut Environment, phase: &str, touches: &HashMap<Finge
 
 impl ObjC {
     /// Turn the message trace on if any selectors were chosen or
-    /// `capture_every` (`--capture-frames=`) is not 0.
+    /// `capture_every` (`--capture-frames=`) is not 0. `capture_max` is
+    /// `--capture-frames-max=`.
     pub fn start_trace(
         &mut self,
         option_selectors: &[String],
         capture_every: u32,
+        capture_max: u32,
         bundle_id: &str,
     ) {
-        self.trace = MsgTrace::open(option_selectors, capture_every, bundle_id);
+        self.trace = MsgTrace::open(option_selectors, capture_every, capture_max, bundle_id);
     }
 }
 
@@ -537,11 +557,25 @@ pub fn trace_present_frame(env: &mut Environment) -> Option<FrameCaptureTicket> 
     let frame = trace.frame;
     trace.frame = trace.frame.wrapping_add(1);
     let due = capture_due(frame, trace.capture_every, trace.capture_pending);
-    if trace.capture.is_none() || !due {
+    // Past the cap nothing is read back, so the frame costs nothing more.
+    if !due || trace.capture.as_mut().is_none_or(FrameCapture::at_cap) {
         return None;
     }
     trace.capture_pending = false;
     Some(FrameCaptureTicket { frame, ms })
+}
+
+/// How long [trace_finish] waits for the frame capture worker.
+const FINISH_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Called on UIKit's exit path just before touchHLE exits: lets the frame
+/// capture worker write the frames still queued, waiting at most
+/// [FINISH_WAIT]. A stop that does not go through that path (a crash, a
+/// killed process) can still lose the last few frames.
+pub fn trace_finish(env: &mut Environment) {
+    if let Some(capture) = env.objc.trace.as_mut().and_then(|t| t.capture.take()) {
+        capture.finish(FINISH_WAIT);
+    }
 }
 
 /// Hand a frame read back for `ticket` to the frame capture worker. `rgba`

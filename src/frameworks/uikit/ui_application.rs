@@ -548,6 +548,9 @@ pub(super) fn exit(env: &mut Environment) {
         let _: () = msg![env; pool drain];
     };
 
+    // Frames the message trace's capture still has queued are written first.
+    crate::objc::trace_finish(env);
+
     std::process::exit(0);
 }
 
