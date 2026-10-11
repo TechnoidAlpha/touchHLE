@@ -523,11 +523,13 @@ fn synchronize_user_defaults(env: &mut Environment) {
 // that skips a step sends the step first. An app not built for multitasking
 // is ended on Home instead, see exits_on_suspend.
 
-/// Whether iPhone OS 4 would end the app on Home rather than keep it alive
-/// in the background. It kept alive only apps built for multitasking: one
-/// whose `Info.plist` has `UIApplicationExitsOnSuspend` set, or whose
-/// delegate has no `applicationDidEnterBackground:`, was sent
-/// `applicationWillTerminate:` and ended. Logs which applies.
+/// Whether to end the app on Home rather than keep it in the background.
+/// iPhone OS 4 ended an app linked against an SDK before 4.0, or one whose
+/// `Info.plist` sets `UIApplicationExitsOnSuspend`. touchHLE reads the key,
+/// but instead of the SDK uses its own heuristic: a delegate with no
+/// `applicationDidEnterBackground:` marks an app not written for
+/// multitasking. That ends such an app as stock touchHLE did, and changes
+/// nothing for 4Towers. Logs which applies.
 pub(super) fn exits_on_suspend(env: &mut Environment) -> bool {
     if env.bundle.exits_on_suspend() {
         log!(
@@ -545,7 +547,7 @@ pub(super) fn exits_on_suspend(env: &mut Environment) -> bool {
     {
         log!(
             "Lifecycle: the app delegate has no applicationDidEnterBackground:, \
-             so the app is not built for multitasking and Home ends it."
+             so touchHLE takes it as not built for multitasking and Home ends it."
         );
         return true;
     }
