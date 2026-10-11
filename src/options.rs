@@ -63,7 +63,8 @@ pub struct Options {
     pub ignore_gl_errors: bool,
     pub zero_stack_after_guest_to_host_call: Option<u32>,
     /// Selectors for the message trace (`--trace-selectors=`), see
-    /// src/objc/trace.rs.
+    /// src/objc/trace.rs. Each item may carry markers and peeks after the
+    /// selector, separated by `;`.
     pub trace_selectors: Vec<String>,
     /// `--capture-frames=N`: save every Nth presented frame as a PNG file
     /// while the message trace is on (0 is off). See src/objc/trace.rs.

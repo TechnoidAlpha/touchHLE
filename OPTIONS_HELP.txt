@@ -243,6 +243,25 @@ Debugging options:
         trace_selectors.txt in the user data directory (# starts a comment);
         the option and the file add up. trace.log is replaced on each run.
 
+        A selector can also carry peeks: fields of the receiver or of a
+        pointer argument, read from memory when the call is logged and
+        written as extra columns after the receiver's address, one per peek
+        in the order given. In trace_selectors.txt they follow the selector,
+        separated by spaces, for example
+            dmg: self.hp:f32 self.expectedHp:f32
+            addCreeps self.sharedData->waveNum:i32
+            fireTarget: arg0.distMoved:f32 arg0.+0x150:f32
+        and in the option they are separated by ";", for example
+        --trace-selectors=dmg:;self.hp:f32,addCreeps. A peek starts at self,
+        arg0 or arg1 (the arg0/arg1 words of the line); .name is the
+        instance variable of that name, .+0xNN is NN bytes further on, ->
+        follows the pointer read so far (->name or ->+0xNN), and it ends in
+        a type: i32, u32, f32, u8, ptr or id. Peeks are read when the call
+        starts, before the method runs. Only lines of a selector with peeks
+        have the extra columns, and the header names them on "# peeks"
+        lines. A peek that cannot be read (nil, a bad pointer, no such
+        variable) shows "-" and is logged once; it never stops the app.
+
         While the trace is on, input.log in the same folder gets one
         tab-separated row per finger for every touch event the app receives:
         frame, ms (the same clock and frame numbers as trace.log), phase

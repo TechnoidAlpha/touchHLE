@@ -25,6 +25,20 @@
 //! shows and `ms` the whole milliseconds since startup when it was
 //! presented.
 //!
+//! A line may also carry peeks, in any order with the markers (see [peek]
+//! for the grammar): fields of the receiver or of a pointer argument, read
+//! from guest memory when the call is logged and written after the `self`
+//! column, one column per peek in the order listed. With
+//! `dmg: self.hp:f32 self.expectedHp:f32`, every `dmg:` row has two more
+//! columns. Rows of other selectors keep the usual columns, so the column
+//! count differs per selector; the header lists each selector's peeks on a
+//! line `# peeks <selector> <spec> <spec>...`. Peeks are read at call
+//! entry, before the method runs: the state after a call is in the peeks of
+//! the next traced call. A read never panics and never calls the guest (see
+//! [peek_columns]); one that fails writes `-` and is logged once per
+//! selector and peek. An item of `--trace-selectors=` takes the same words
+//! as a line, with `;` between them (`dmg:;self.hp:f32`).
+//!
 //! Two kinds of call are traced:
 //!
 //! - Message sends through `objc_msgSend` and its variants (variant `send`,
@@ -40,8 +54,8 @@
 //! startup, the thread, whether the call came from the guest or from host
 //! code, the variant, the receiver's class, the selector, the first two
 //! argument words (as hex and as a float from the same bits), the first four
-//! words on the stack, the link register and, last, the receiver's address
-//! (the `self` column).
+//! words on the stack, the link register, the receiver's address (the
+//! `self` column) and then the selector's peeks, if it has any.
 //!
 //! While the trace is on, every touch event the app receives is also written
 //! to `input.log` in the user data directory (see [trace_touches]), on the

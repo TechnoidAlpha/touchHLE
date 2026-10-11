@@ -58,10 +58,60 @@ Two kinds of call are traced. Ordinary message sends go through `objc_msgSend` a
 
 Every line the game prints with `NSLog` (the lines starting `4Towers_3[0] ` in `touchHLE_log.txt`, which stays as it was) also becomes a `trace.log` row while the trace is on, so the few markers the game prints itself (the wave spawner finishing, pause choices, saves) sit on the trace's timeline. Such a row has the usual `frame`, `ms` and `thread`, `nslog` in the `origin` column, `-` in `variant` and `class`, the message in the `selector` column (tabs, carriage returns and newlines turned into spaces, so a row is always one line), and `-` in the ten columns after it (`arg0` to `self`). A parser that reads `arg0` and the rest as numbers should check the `origin` first.
 
-You can also list selectors one per line in `trace_selectors.txt` next to the other touchHLE files (`#` starts a comment). The option and the file add up. A line in the file can carry marker words after the selector, separated by spaces: the only one so far is `png` (see Frames below). A word that is not a marker is ignored and logged once. With no selectors, and without `--capture-frames=`, nothing is traced and nothing is written. `trace.log` is replaced each run.
+You can also list selectors one per line in `trace_selectors.txt` next to the other touchHLE files (`#` starts a comment). The option and the file add up. A line in the file can carry marker words and peeks after the selector, separated by spaces: the only marker so far is `png` (see Frames below), and peeks are described below. A word that is neither is ignored and logged once. With no selectors, and without `--capture-frames=`, nothing is traced and nothing is written. `trace.log` is replaced each run.
 
 - **Windows:** `trace.log` is written in the folder you run `touchHLE.exe` from, next to `touchHLE_log.txt`.
 - **Android:** the command line is not available, so either put `trace_selectors.txt` in touchHLE's files folder, or add the option to the game's line in `touchHLE_options.txt`. `trace.log` lands in the same folder, which is the app's `files` folder: `Android/data/org.touchhle.android.unofficial/files/` for this fork's own APK, or `Android/data/com.lambdamugames.fourtowers/files/` for the remake repo's standalone 4Towers APK (for example `adb pull /sdcard/Android/data/com.lambdamugames.fourtowers/files/trace.log`).
+
+### Peeks
+
+A line of `trace_selectors.txt` can also carry peeks: fields of the receiver or of a pointer argument, read from the game's memory when the call is logged and written as extra columns. They turn the trace into the original's own numbers: a creep's `hp` and `expectedHp` at each hit, the gold at each change, a tower's level and timer at each shot. Peeks follow the selector, separated by spaces, in any order with the `png` marker:
+
+```
+dmg: self.hp:f32 self.expectedHp:f32 self.fullhp:f32
+addCreeps self.sharedData->waveNum:i32 self.sharedData->gSpeed:f32
+fireTarget: arg0.distMoved:f32 arg0.hp:f32 png
+```
+
+On the command line (or the game's line in `touchHLE_options.txt`, which cannot hold spaces inside one option) the words of an item are separated by `;` instead: `--trace-selectors=dmg:;self.hp:f32;self.expectedHp:f32,addCreeps`.
+
+The grammar of one peek, a single word with no spaces:
+
+```
+<base>(.<ivar> | .+0xNN | ->(<ivar> | +0xNN))* :<type>
+```
+
+- `<base>` is `self` (the receiver), `arg0` or `arg1`: the words in the row's `arg0` and `arg1` columns (r2 and r3 for an ordinary send; for a `stret` send, r3 and the first stack word). A float argument is just a word, so read it from `arg0_f32` instead.
+- `.name` is the instance variable `name` of the object, found by name on its class chain in the class table touchHLE built from the binary's Objective-C metadata. It may only come straight after the base or after `->`: a field is not an object.
+- `.+0xNN` (or decimal `.+NN`) moves NN bytes further on, from the object or from the field reached so far, so `self.sprPoint.+4:f32` is the y of a `CGPoint` ivar and `self.+0x150:f32` reads a raw offset.
+- `->` reads the 4-byte pointer reached so far and carries on in the object it points at, whose class is read from its own isa: `->name` or `->+0xNN`.
+- `:<type>` is `i32`, `u32`, `f32`, `u8` (a `BOOL` or `char` ivar), `ptr` (hex) or `id` (hex, a colon and the class name read from the object's isa, for example `0x0012a4c0:Creeps`, or `nil`).
+- With no step at all, the base word itself is the value: `arg0:id` names the class of the first argument.
+
+Rows:
+
+- Every row of a selector with peeks, `send` and `imp` alike, has one more column per peek after `self`, in the order listed. Rows of other selectors (and `nslog` rows) end at `self` as before, so **the column count differs per selector**. The header lists them, one line per selector with peeks: `# peeks dmg: self.hp:f32 self.expectedHp:f32 self.fullhp:f32`. Split that line on spaces: after `# peeks`, the first word is the selector and the rest name its columns. The same selector listed twice gets the peeks of both lines, without repeats.
+- Values: `f32` with six significant digits (C's `%g`, with the exponent written `1.5e-7`), integers in decimal, `ptr` as `0x` and eight hex digits.
+- Peeks are read when the call starts, **before the method runs**. A row of `dmg:` shows the hit points before that hit; the state after it is in the peeks of the next traced call (for example a peek on `checkHp`, which `dmg:` calls).
+
+No-panic rule: a peek only reads memory, through touchHLE's non-panicking reader, and the class table. It never sends a message or calls the game. A nil base, a pointer into the null page or past the end of memory, an object whose isa is not a known class, or a class chain without that ivar gives `-` in the column, and the reason is logged once per selector and peek; the run carries on. Reads need not be aligned. A wrong type is not detected: it gives a wrong number, not a `-`. The offset of each ivar is looked up once per class and cached, so a row with four peeks costs a few extra memory reads.
+
+A list for 4Towers, from the decompile's field list (the offsets in the comments are the armv7 binary's, in case a name lookup ever fails):
+
+```
+dmg: self.hp:f32 self.expectedHp:f32 self.fullhp:f32         # Creeps +0x150 +0x154 +0x158; arg0_f32 = the hit
+minusExpected: self.expectedHp:f32                            # +0x154; the damage reserved at fire time
+ice:dur: self.ms:f32 self.originalSpeed:f32 self.freezed:u8 self.freezeLoops:f32
+checkNewPoint self.currPoint:i32 self.distMoved:f32 self.timeElapsed:f32 self.totalMovementTime:f32 self.ms:f32
+checkHp self.hp:f32 self.stealthNow:u8 self.ability:i32 self.type:i32
+setExpectedGold: self.expectedGold:f32 self.totalGold:f32     # SharedData +0x6c +0x68; arg0_f32 = the new value, lr = the cause
+upgradeT: self.lvl:i32 self.refNum:i32 self.rate:f32 self.range:f32 self.dmg:i32 self.splash:f32 self.amtWorth:f32
+fireTarget: self.timeElapsed:f32 self.currLoops:i32 self.totalLoops:i32 self.rate:f32 self.speedBuff:f32 self.canFire:u8 arg0.hp:f32 arg0.expectedHp:f32
+checkCollision self.type:i32 self.damg:i32 self.splash:f32 self.buffDmg:f32 self.buffSplash:f32 self.slowPercent:i32 self.target:id
+addCreeps self.sharedData->waveNum:i32 self.sharedData->gSpeed:f32 self.sharedData->numOfWaves:i32 self.sharedData->totalLeft:i32 self.sharedData->totalGold:f32
+```
+
+The types come from the decompile's headers (`i` is `i32`, `f` is `f32`, `c` is `u8`, `@` is `id`). The walk through guest memory needs a running game, so it is not covered by unit tests; the grammar and the value formatting are.
 
 ## Frames and touch log
 
