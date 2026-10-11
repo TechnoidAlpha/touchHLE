@@ -120,7 +120,11 @@ pub fn handle_events(env: &mut Environment) -> Option<Instant> {
             // multitasking: the app is told, and stays alive in between. See
             // ui_application and dev-docs/4towers-branch.md, "Home and back".
             Event::AppWillResignActive => ui_application::will_resign_active(env),
-            Event::AppDidEnterBackground => ui_application::did_enter_background(env),
+            Event::AppDidEnterBackground => {
+                ui_application::did_enter_background(env);
+                // SDL is not polled until now (see Window::poll_for_events).
+                env.window_mut().background_handled();
+            }
             Event::AppWillEnterForeground => ui_application::will_enter_foreground(env),
             Event::AppDidBecomeActive => ui_application::did_become_active(env),
             Event::AppWillTerminate => {

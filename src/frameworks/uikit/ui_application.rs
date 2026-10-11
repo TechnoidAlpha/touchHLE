@@ -538,8 +538,9 @@ pub(super) fn will_resign_active(env: &mut Environment) {
 }
 
 /// The app is now in the background (the second half of Home). It stays
-/// alive: touchHLE keeps running it, but presents nothing (see
-/// [crate::window::Window::is_backgrounded]) and pauses its audio.
+/// alive, presents nothing (see [crate::window::Window::is_backgrounded])
+/// and has its audio paused. On Android SDL then suspends touchHLE's thread
+/// until the app comes back; on a computer (F9) the app keeps running.
 pub(super) fn did_enter_background(env: &mut Environment) {
     if State::get(env).in_background {
         log!("Lifecycle: already in the background, ignoring.");

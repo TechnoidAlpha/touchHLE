@@ -231,9 +231,14 @@ pub struct Window {
     /// sends them in pairs on Android, so this is a queue, not one slot.
     lifecycle_events: VecDeque<Event>,
     /// Set when the host sends touchHLE to the background, cleared when it
-    /// brings it back. While set, nothing is presented: on Android the
-    /// window's surface is destroyed and the GL context is not current.
+    /// brings it back. While set, nothing is presented. On Android SDL soon
+    /// blocks this thread (see [Self::poll_for_events]), but the app runs
+    /// on until then; on a computer (F9) it keeps running.
     backgrounded: bool,
+    /// Set when the background event is queued, cleared once UIKit has
+    /// handled it (see [Self::background_handled]). While set, SDL is not
+    /// polled.
+    background_unhandled: bool,
     /// Presents skipped while backgrounded, logged when it comes back.
     presents_skipped: u32,
     #[cfg(target_os = "macos")]
@@ -293,9 +298,6 @@ impl Window {
             let attr = video_ctx.gl_attr();
             attr.set_context_version(1, 1);
             attr.set_context_profile(sdl2::video::GLProfile::GLES);
-
-            // Disable blocking of event loop when app is paused.
-            sdl2::hint::set("SDL_ANDROID_BLOCK_ON_PAUSE", "0");
         }
 
         // Separate mouse and touch events
@@ -387,6 +389,7 @@ impl Window {
             last_polled: Instant::now() - Duration::from_secs(1),
             lifecycle_events: VecDeque::new(),
             backgrounded: false,
+            background_unhandled: false,
             presents_skipped: 0,
             #[cfg(target_os = "macos")]
             max_height,
@@ -443,6 +446,16 @@ impl Window {
     /// was called too recently.
     pub fn poll_for_events(&mut self, options: &Options) {
         assert!(self.on_main_stack);
+        // On Android, SDL's event pump blocks this thread for as long as the
+        // app is in the background, two pumps after the app has taken
+        // DIDENTERBACKGROUND off SDL's queue. That is not when the app has
+        // been told: this runs from the main loop, also while the guest
+        // runs, and UIKit only sees the event on the run loop's next turn.
+        // So SDL is not pumped until UIKit has handled it, or the block
+        // could land before (or in the middle of) the app's save.
+        if self.background_unhandled {
+            return;
+        }
         let now = Instant::now();
         // poll roughly twice per frame to try to avoid missing frames sometimes
         if now.duration_since(self.last_polled) < Duration::from_secs_f64(1.0 / 120.0) {
@@ -728,13 +741,14 @@ impl Window {
                         continue;
                     }
                 }
-                // On Android (with SDL_ANDROID_BLOCK_ON_PAUSE=0) SDL sends
-                // WILLENTERBACKGROUND and DIDENTERBACKGROUND together when
-                // the activity pauses, and WILLENTERFOREGROUND and
-                // DIDENTERFOREGROUND together when it resumes. Polling must
-                // go on: SDL only lets go of the window's surface once the
-                // app has taken DIDENTERBACKGROUND off its queue. See
-                // dev-docs/4towers-branch.md, "Home and back".
+                // On Android SDL sends WILLENTERBACKGROUND and
+                // DIDENTERBACKGROUND together when the activity pauses.
+                // With SDL_ANDROID_BLOCK_ON_PAUSE at its default (on), a
+                // later pump backs up the GL context and blocks this thread
+                // until the activity resumes; the same pump then sends
+                // WILLENTERFOREGROUND and DIDENTERFOREGROUND and restores
+                // the context before it returns. See [Self::poll_for_events]
+                // and dev-docs/4towers-branch.md, "Home and back".
                 E::AppWillEnterBackground { .. } => {
                     self.queue_lifecycle_event(Event::AppWillResignActive);
                     continue;
@@ -939,6 +953,7 @@ impl Window {
         match event {
             Event::AppDidEnterBackground => {
                 self.backgrounded = true;
+                self.background_unhandled = true;
                 self.presents_skipped = 0;
             }
             Event::AppWillEnterForeground => {
@@ -959,16 +974,17 @@ impl Window {
     /// Make no GL context current, so the next use of one makes it current
     /// again for real. Called when touchHLE comes back from the background.
     ///
-    /// On Android, SDL makes the context it saved current again on the new
-    /// surface before touchHLE sees the foreground event, but only if SDL
-    /// does not think that context is current already. A GL call made in the
-    /// background, after SDL's backup, makes the guest's context current
-    /// with no surface (or the dying one) and SDL still records it as
-    /// current, so SDL's restore does nothing and every later make-current
-    /// sees the context as current and skips the call: nothing would ever
-    /// draw to the new surface. With no context current, the next guest GL
-    /// call (or the compositor) binds its context to the window's surface as
-    /// it is now. On a computer (F10) this only costs one make-current.
+    /// On Android, SDL's pump makes no context current just before it
+    /// blocks, and the one it saved current again on the new surface just
+    /// after it wakes, before touchHLE sees the foreground event, with this
+    /// thread asleep in between. This was written for SDL's non-blocking
+    /// pump, where a GL call could land between the two: it made a context
+    /// current with no surface, SDL recorded it as current, and so skipped
+    /// its restore and every later make-current, and nothing would ever
+    /// draw to the new surface. That cannot happen with the blocking pump;
+    /// this is kept as it costs one make-current, and the next guest GL
+    /// call (or the compositor) binds its context to the window's surface
+    /// as it is now, whatever happened in the background.
     fn release_gl_context(&mut self) {
         if let Err(e) = self.video_ctx.gl_release_current_context() {
             log!("Lifecycle: could not release the GL context: {}", e);
@@ -978,10 +994,19 @@ impl Window {
     }
 
     /// Whether the host has sent touchHLE to the background. While it is, the
-    /// window must not be drawn to or swapped: on Android, SDL destroys the
-    /// window's EGL surface and leaves no GL context current.
+    /// window must not be drawn to or swapped: on Android the window's EGL
+    /// surface is going away, and SDL blocks this thread once it has backed
+    /// up the GL context.
     pub fn is_backgrounded(&self) -> bool {
         self.backgrounded
+    }
+
+    /// Called by UIKit once it has told the app about the background event
+    /// (and saved its defaults and paused its audio), so SDL is polled again
+    /// and, on Android, may now block this thread (see
+    /// [Self::poll_for_events]).
+    pub fn background_handled(&mut self) {
+        self.background_unhandled = false;
     }
 
     /// Count a present skipped because touchHLE is in the background.
