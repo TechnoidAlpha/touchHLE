@@ -155,6 +155,15 @@ impl Bundle {
             .unwrap_or(false)
     }
 
+    /// Whether the app opts out of multitasking with
+    /// `UIApplicationExitsOnSuspend` in its `Info.plist`.
+    pub fn exits_on_suspend(&self) -> bool {
+        self.plist
+            .get("UIApplicationExitsOnSuspend")
+            .and_then(|v| v.as_boolean())
+            .unwrap_or(false)
+    }
+
     fn find_icon(icon_files: &[plist::Value]) -> Option<&plist::Value> {
         ["Icon", "Icon-72"]
             .iter()

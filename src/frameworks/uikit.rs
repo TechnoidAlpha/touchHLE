@@ -121,6 +121,10 @@ pub fn handle_events(env: &mut Environment) -> Option<Instant> {
             // ui_application and dev-docs/4towers-branch.md, "Home and back".
             Event::AppWillResignActive => ui_application::will_resign_active(env),
             Event::AppDidEnterBackground => {
+                if ui_application::exits_on_suspend(env) {
+                    // The old behaviour: Home ends the app.
+                    ui_application::exit(env);
+                }
                 ui_application::did_enter_background(env);
                 // SDL is not polled until now (see Window::poll_for_events).
                 env.window_mut().background_handled();

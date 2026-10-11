@@ -520,7 +520,38 @@ fn synchronize_user_defaults(env: &mut Environment) {
 // touchHLE gets these from the host (Android's onPause and onResume through
 // SDL, or F9 and F10 on a computer), see crate::window::Event. Each message
 // is sent once per trip: one that would repeat the last is ignored, and one
-// that skips a step sends the step first.
+// that skips a step sends the step first. An app not built for multitasking
+// is ended on Home instead, see exits_on_suspend.
+
+/// Whether iPhone OS 4 would end the app on Home rather than keep it alive
+/// in the background. It kept alive only apps built for multitasking: one
+/// whose `Info.plist` has `UIApplicationExitsOnSuspend` set, or whose
+/// delegate has no `applicationDidEnterBackground:`, was sent
+/// `applicationWillTerminate:` and ended. Logs which applies.
+pub(super) fn exits_on_suspend(env: &mut Environment) -> bool {
+    if env.bundle.exits_on_suspend() {
+        log!(
+            "Lifecycle: the app's Info.plist has UIApplicationExitsOnSuspend, \
+             so Home ends it."
+        );
+        return true;
+    }
+    let ui_application: id = msg_class![env; UIApplication sharedApplication];
+    let delegate: id = msg![env; ui_application delegate];
+    if delegate == nil
+        || !env
+            .objc
+            .object_has_method_named(&env.mem, delegate, "applicationDidEnterBackground:")
+    {
+        log!(
+            "Lifecycle: the app delegate has no applicationDidEnterBackground:, \
+             so the app is not built for multitasking and Home ends it."
+        );
+        return true;
+    }
+    log!("Lifecycle: the app is built for multitasking, so it stays alive.");
+    false
+}
 
 /// The app is about to become inactive (the first half of Home).
 pub(super) fn will_resign_active(env: &mut Environment) {
