@@ -5,18 +5,29 @@
  */
 //! Selector-filtered message trace (`--trace-selectors=`).
 //!
-//! When at least one selector is chosen, every message send of a chosen
-//! selector writes one tab-separated line to `trace.log` in the user data
-//! directory. Selectors come from the `--trace-selectors=` option and from the
-//! file `trace_selectors.txt` in the user data directory (one per line, `#`
-//! starts a comment); the two add up. With no selectors the trace is off and
-//! the only cost per message is one `Option::is_some` check.
+//! When at least one selector is chosen, every call of a chosen selector
+//! writes one tab-separated line to `trace.log` in the user data directory.
+//! Selectors come from the `--trace-selectors=` option and from the file
+//! `trace_selectors.txt` in the user data directory (one per line, `#` starts
+//! a comment); the two add up. With no selectors the trace is off and the only
+//! cost per message is one `Option::is_some` check.
+//!
+//! Two kinds of call are traced:
+//!
+//! - Message sends through `objc_msgSend` and its variants (variant `send`,
+//!   `stret` or `super2`).
+//! - Calls through an IMP fetched with `methodForSelector:` or
+//!   `instanceMethodForSelector:` (variant `imp`). For a traced selector those
+//!   return a trampoline that writes the line and then continues in the real
+//!   method (see [trace_wrap_imp]). This is how cocos2d's scheduler calls the
+//!   selectors it was given, so scheduled timers show up.
 //!
 //! Each line records the presented frame number, the milliseconds since
-//! startup, the thread, whether the send came from the guest or from host code,
-//! the receiver's class, the selector, the first two argument words (as hex and
-//! as a float from the same bits), the first four words on the stack and the
-//! link register.
+//! startup, the thread, whether the call came from the guest or from host
+//! code, the variant, the receiver's class, the selector, the first two
+//! argument words (as hex and as a float from the same bits), the first four
+//! words on the stack, the link register and, last, the receiver's address
+//! (the `self` column).
 
 use super::{id, nil, Class, ClassHostObject, ObjC, IMP, SEL};
 use crate::abi::GuestFunction;
