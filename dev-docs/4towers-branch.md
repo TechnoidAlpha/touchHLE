@@ -60,10 +60,32 @@ Two kinds of call are traced. Ordinary message sends go through `objc_msgSend` a
 
 Every line the game prints with `NSLog` (the lines starting `4Towers_3[0] ` in `touchHLE_log.txt`, which stays as it was) also becomes a `trace.log` row while the trace is on, so the few markers the game prints itself (the wave spawner finishing, pause choices, saves) sit on the trace's timeline. Such a row has the usual `frame`, `ms` and `thread`, `nslog` in the `origin` column, `-` in `variant` and `class`, the message in the `selector` column (tabs, carriage returns and newlines turned into spaces, so a row is always one line), and `-` in the ten columns after it (`arg0` to `self`). A parser that reads `arg0` and the rest as numbers should check the `origin` first.
 
-You can also list selectors one per line in `trace_selectors.txt` next to the other touchHLE files (`#` starts a comment). The option and the file add up. A line in the file can carry marker words and peeks after the selector, separated by spaces: the only marker so far is `png` (see Frames below), and peeks are described below. A word that is neither is ignored and logged once. With no selectors, and without `--capture-frames=`, nothing is traced and nothing is written. `trace.log` is replaced each run.
+You can also list selectors one per line in `trace_selectors.txt` next to the other touchHLE files (`#` starts a comment). The option and the file add up. A selector can be narrowed to one class of receiver (`setPosition:@CCLabelTTF`, see Receiver class below). A line in the file can carry marker words and peeks after the selector, separated by spaces: the only marker so far is `png` (see Frames below), and peeks are described below. A word that is neither is ignored and logged once. With no selectors, and without `--capture-frames=`, nothing is traced and nothing is written. `trace.log` is replaced each run.
 
 - **Windows:** `trace.log` is written in the folder you run `touchHLE.exe` from, next to `touchHLE_log.txt`.
 - **Android:** the command line is not available, so either put `trace_selectors.txt` in touchHLE's files folder, or add the option to the game's line in `touchHLE_options.txt`. `trace.log` lands in the same folder, which is the app's `files` folder: `Android/data/org.touchhle.android.unofficial/files/` for this fork's own APK, or `Android/data/com.lambdamugames.fourtowers/files/` for the remake repo's standalone 4Towers APK (for example `adb pull /sdcard/Android/data/com.lambdamugames.fourtowers/files/trace.log`).
+
+### Receiver class
+
+A selector can be narrowed to one class of receiver by ending the word with `@` and the class name, with no space: `setPosition:@CCLabelTTF` traces `setPosition:` only when the receiver's class, or one of its superclasses, is named `CCLabelTTF`. Without `@` every receiver is traced, as before. The rule:
+
+- The name is matched exactly (case included) against the receiver's class and each class above it, up to the root, as touchHLE's class table names them. So `@CCNode` takes every label, sprite and menu, and `@CCLabel` takes nothing (there is no class of that name).
+- A class method's receiver is the class itself, and its class is the metaclass, which has the same name, as have the metaclasses above it. So `@CCLabelTTF` also takes `+[CCLabelTTF labelWithString:fontName:fontSize:]` and the class methods of `CCLabelTTF`'s subclasses. The `class` column tells the two apart: `+CCLabelTTF` for a class method, `CCLabelTTF` for an instance.
+- It applies to every row of the selector: `send`, `stret`, `super2` and `imp` alike. For a `super2` row it is the receiver's own class that is matched, not the superclass named in the `class` column. A scheduled selector gets its `imp` stub whatever the class; the stub checks the receiver at each call and writes nothing for a receiver that does not match.
+- The same selector may be listed more than once, with different classes, or with and without one: a call is traced if any of its lines takes the receiver. A `png` marker counts only for calls its own line takes. Peeks belong to the selector, not to a line, so every traced row of the selector has the peeks of all its lines (one `# peeks` line per selector, as below).
+- The `# selectors:` line of the header lists the words as written, `@` and class included. A word with nothing before the `@`, or nothing (or another `@`) after it, is not understood: its line is ignored and logged.
+- An item of `--trace-selectors=` takes the same words: `--trace-selectors=setPosition:@CCLabelTTF,setString:;arg0:str`.
+
+The class of each receiver is looked up once per selector, so a filter costs a hash lookup per call after the first.
+
+What each label says and where it is, for 4Towers' HUD:
+
+```
+initWithString:dimensions:alignment:fontName:fontSize: arg0:str
+setPosition:@CCLabelTTF
+```
+
+The first line writes the text of each `CCLabelTTF` made with a box (`labelWithString:dimensions:alignment:fontName:fontSize:` goes through it), with the new label's address in `self`. The second writes each move of a `CCLabelTTF`, and of no other node. `setPosition:` takes a `CGPoint`, which arrives as two floats in r2 and r3, so the `arg0_f32` and `arg1_f32` columns already are its x and y in points, and its `self` is the label's address, which joins it to the label's text. Add `setString: arg0:str` for the changes of text (see the list of label selectors under Peeks).
 
 ### Peeks
 

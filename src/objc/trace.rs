@@ -43,6 +43,13 @@
 //! (see [ns_string::host_string_text]), so `setString: arg0:str` shows the
 //! text a label is given.
 //!
+//! A selector word may end with `@ClassName` (`setPosition:@CCLabelTTF`):
+//! then only calls whose receiver's class, or one of its superclasses, is
+//! named `ClassName` are traced (see [Traced]). A class method's receiver
+//! is a class, whose class is its metaclass, which has the same name, so
+//! `@CCLabelTTF` takes `+[CCLabelTTF labelWithString:...]` as well. The
+//! same selector may be listed with several classes, and without one.
+//!
 //! Two kinds of call are traced:
 //!
 //! - Message sends through `objc_msgSend` and its variants (variant `send`,
@@ -107,8 +114,7 @@ pub(super) enum SendVariant {
     Super2,
 }
 
-/// What a line of `trace_selectors.txt` asks for besides tracing the
-/// selector, see [parse_selector_line].
+/// What a traced call asks for besides its line, see [Traced::markers_for].
 #[derive(Copy, Clone, Default, Debug, PartialEq, Eq)]
 struct Markers {
     /// `png`: save the first frame presented after each call.
@@ -116,6 +122,72 @@ struct Markers {
     /// The selector's peeks: an index into [MsgTrace::peek_sets], or [None]
     /// if it has none.
     peeks: Option<usize>,
+}
+
+/// The receivers one or more lines of a selector trace it for.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Filter {
+    /// `@ClassName`: receivers whose class, or a superclass of it, has that
+    /// name. [None]: any receiver.
+    class: Option<String>,
+    /// `png` on any of those lines.
+    png: bool,
+}
+
+/// A traced selector: who it is traced for, and its peeks.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct Traced {
+    /// One per receiver class it is listed with (and one for a line with
+    /// no class).
+    filters: Vec<Filter>,
+    /// The selector's peeks, shared by all its lines whatever their class,
+    /// see [Markers::peeks].
+    peeks: Option<usize>,
+}
+
+impl Traced {
+    /// Add a line of this selector with receiver class `class` and the
+    /// `png` marker if `png`. A class listed twice gets one filter.
+    fn add(&mut self, class: Option<&str>, png: bool) {
+        match self
+            .filters
+            .iter_mut()
+            .find(|f| f.class.as_deref() == class)
+        {
+            Some(filter) => filter.png |= png,
+            None => self.filters.push(Filter {
+                class: class.map(str::to_string),
+                png,
+            }),
+        }
+    }
+
+    /// Whether any line names a class, so the receiver's class matters.
+    fn by_class(&self) -> bool {
+        self.filters.iter().any(|f| f.class.is_some())
+    }
+
+    /// The markers of a call whose receiver's class chain (its class, then
+    /// each superclass) has the names `chain`, or [None] if no filter takes
+    /// it. `png` is set if a filter that takes it has `png`.
+    fn markers_for<S: AsRef<str>>(&self, chain: &[S]) -> Option<Markers> {
+        let mut taken = false;
+        let mut png = false;
+        for filter in &self.filters {
+            let takes = filter
+                .class
+                .as_deref()
+                .is_none_or(|class| chain.iter().any(|name| name.as_ref() == class));
+            if takes {
+                taken = true;
+                png |= filter.png;
+            }
+        }
+        taken.then_some(Markers {
+            png,
+            peeks: self.peeks,
+        })
+    }
 }
 
 /// The peeks of one traced selector, in the order they were listed.
@@ -136,13 +208,20 @@ struct Peek {
 }
 
 pub struct MsgTrace {
-    /// The traced selectors and their markers.
-    selectors: HashMap<String, Markers>,
+    /// The traced selectors.
+    traced: Vec<Traced>,
+    /// Each traced selector's index in [MsgTrace::traced], by name.
+    by_name: HashMap<String, usize>,
     /// The peeks of each selector that has any, see [Markers::peeks].
     peek_sets: Vec<PeekSet>,
-    /// The markers of each (uniqued) selector pointer, or [None] if it is not
-    /// traced, so the string comparison happens once per selector.
-    cache: HashMap<SEL, Option<Markers>>,
+    /// The index in [MsgTrace::traced] of each (uniqued) selector pointer, or
+    /// [None] if it is not traced, so the string comparison happens once per
+    /// selector.
+    cache: HashMap<SEL, Option<usize>>,
+    /// For a selector with a class filter, the markers per receiver class
+    /// ([None]: not traced for that class), so each class chain is walked
+    /// once per selector.
+    class_cache: HashMap<(SEL, Class), Option<Markers>>,
     /// Stubs handed out by `methodForSelector:` for traced selectors, see
     /// [trace_wrap_imp].
     trampolines: TrampolineCache<(Class, SEL, u32), (SEL, GuestFunction)>,
@@ -205,7 +284,14 @@ impl<K: Hash + Eq, V: Copy> TrampolineCache<K, V> {
 /// `--trace-selectors=`) asks for, see [parse_selector_line].
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct SelectorLine {
+    /// The first word as written, for the header.
+    word: String,
+    /// The selector, without `@ClassName`.
     selector: String,
+    /// The `ClassName` of `@ClassName`, if the word ends with one.
+    class: Option<String>,
+    /// Why the first word is not a selector: the line is ignored, logged.
+    error: Option<String>,
     /// The `png` marker.
     png: bool,
     /// The peek specs, in the order given.
@@ -216,17 +302,32 @@ struct SelectorLine {
     bad_peeks: Vec<(String, String)>,
 }
 
-/// One line of `trace_selectors.txt`: the selector, then optional marker
-/// words and peek specs in any order, separated by spaces or tabs; `#`
-/// starts a comment. Returns [None] for a blank or comment-only line. The
-/// only marker is `png`; a word starting with `self`, `arg0` or `arg1` is a
-/// peek (see [peek]); any other word is ignored, and logged once by the
-/// caller.
+/// One line of `trace_selectors.txt`: the selector, optionally followed by
+/// `@ClassName` in the same word, then optional marker words and peek specs
+/// in any order, separated by spaces or tabs; `#` starts a comment. Returns
+/// [None] for a blank or comment-only line. The only marker is `png`; a
+/// word starting with `self`, `arg0` or `arg1` is a peek (see [peek]); any
+/// other word is ignored, and logged once by the caller.
 fn parse_selector_line(line: &str) -> Option<SelectorLine> {
     let line = line.split('#').next().unwrap();
     let mut words = line.split_whitespace();
+    let word = words.next()?;
+    let (selector, class) = match word.split_once('@') {
+        Some((selector, class)) => (selector, Some(class)),
+        None => (word, None),
+    };
+    let error = if selector.is_empty() {
+        Some("no selector before @".to_string())
+    } else if class.is_some_and(|c| c.is_empty() || c.contains('@')) {
+        Some("@ must be followed by one class name".to_string())
+    } else {
+        None
+    };
     let mut parsed = SelectorLine {
-        selector: words.next()?.to_string(),
+        word: word.to_string(),
+        selector: selector.to_string(),
+        class: class.map(str::to_string),
+        error,
         ..SelectorLine::default()
     };
     for word in words {
@@ -288,13 +389,26 @@ impl MsgTrace {
                     .map(|line| (TRACE_SELECTORS_FILE, line)),
             );
         }
-        // The same selector may be listed twice; its markers and peeks add
-        // up.
+        // The same selector may be listed twice, with the same receiver
+        // class or another; its markers and peeks add up.
         let mut unknown_logged: HashSet<String> = HashSet::new();
+        // The selector words as written (with any @ClassName), for the
+        // header, and those with png.
         let mut list: Vec<String> = Vec::new();
-        let mut selectors: HashMap<String, Markers> = HashMap::new();
+        let mut png_words: HashSet<String> = HashSet::new();
+        let mut traced: Vec<Traced> = Vec::new();
+        let mut by_name: HashMap<String, usize> = HashMap::new();
         let mut peek_sets: Vec<PeekSet> = Vec::new();
         for (source, line) in lines {
+            if let Some(error) = &line.error {
+                log!(
+                    "Warning: {} has a selector {:?} that is not understood, its line is ignored: {}",
+                    source,
+                    line.word,
+                    error
+                );
+                continue;
+            }
             for word in &line.unknown {
                 if unknown_logged.insert(word.clone()) {
                     log!(
@@ -314,11 +428,18 @@ impl MsgTrace {
                     reason
                 );
             }
-            let entry = selectors.entry(line.selector.clone()).or_insert_with(|| {
-                list.push(line.selector.clone());
-                Markers::default()
+            if !list.contains(&line.word) {
+                list.push(line.word.clone());
+            }
+            if line.png {
+                png_words.insert(line.word.clone());
+            }
+            let index = *by_name.entry(line.selector.clone()).or_insert_with(|| {
+                traced.push(Traced::default());
+                traced.len() - 1
             });
-            entry.png |= line.png;
+            let entry = &mut traced[index];
+            entry.add(line.class.as_deref(), line.png);
             if line.peeks.is_empty() {
                 continue;
             }
@@ -340,12 +461,12 @@ impl MsgTrace {
                 }
             }
         }
-        if selectors.is_empty() && capture_every == 0 {
+        if traced.is_empty() && capture_every == 0 {
             return None;
         }
         let png_after: Vec<&str> = list
             .iter()
-            .filter(|s| selectors[*s].png)
+            .filter(|s| png_words.contains(*s))
             .map(String::as_str)
             .collect();
 
@@ -374,6 +495,7 @@ impl MsgTrace {
              # selectors: {}\n\
              # arg0/arg1 are r2/r3 (r3/stack0 for stret sends); sp0-sp3 are the words at sp\n\
              # self is the receiver's address\n\
+             # selector@Class: only receivers of Class or a subclass, class methods included\n\
              # no imp lines for methods that return a struct or a union\n\
              # frame capture (frames/f<frame>_<ms>.png): {}; png after: {}; {}\n\
              # a captured frame is read back on the emulator thread, so the calls\n\
@@ -432,9 +554,11 @@ impl MsgTrace {
             None
         };
         Some(MsgTrace {
-            selectors,
+            traced,
+            by_name,
             peek_sets,
             cache: HashMap::new(),
+            class_cache: HashMap::new(),
             trampolines: TrampolineCache::new(),
             not_wrapped: HashSet::new(),
             out,
@@ -614,26 +738,76 @@ pub fn trace_note_uncaptured_present(env: &mut Environment, path: &str) {
     );
 }
 
-/// The markers of `selector` if it is one of the traced ones. The trace must
-/// be on.
-fn selector_markers(env: &mut Environment, selector: SEL) -> Option<Markers> {
+/// The index in [MsgTrace::traced] of `selector` if it is one of the traced
+/// ones. The trace must be on.
+fn traced_index(env: &mut Environment, selector: SEL) -> Option<usize> {
     let mem = &*env.mem;
-    let MsgTrace {
-        selectors, cache, ..
-    } = env.objc.trace.as_mut()?;
+    let MsgTrace { by_name, cache, .. } = env.objc.trace.as_mut()?;
     *cache.entry(selector).or_insert_with(|| {
         if selector.is_null() {
             return None;
         }
         selector
             .try_as_str(mem)
-            .and_then(|s| selectors.get(s).copied())
+            .and_then(|s| by_name.get(s).copied())
     })
 }
 
-/// Whether `selector` is one of the traced ones. The trace must be on.
+/// The markers of a call of `selector` on `receiver` if it is traced: the
+/// selector is one of the traced ones, and one of its lines takes the
+/// receiver's class (see [Traced::markers_for]). The trace must be on.
+fn selector_markers(env: &mut Environment, selector: SEL, receiver: id) -> Option<Markers> {
+    let index = traced_index(env, selector)?;
+    let trace = env.objc.trace.as_ref()?;
+    let traced = &trace.traced[index];
+    if !traced.by_class() {
+        return traced.markers_for::<&str>(&[]);
+    }
+    let class = if receiver == nil {
+        nil
+    } else {
+        ObjC::read_isa(receiver, &env.mem)
+    };
+    if let Some(&markers) = trace.class_cache.get(&(selector, class)) {
+        return markers;
+    }
+    let chain = class_chain_names(&env.objc, class);
+    let trace = env.objc.trace.as_mut()?;
+    let markers = trace.traced[index].markers_for(&chain);
+    trace.class_cache.insert((selector, class), markers);
+    markers
+}
+
+/// Whether `selector` is one of the traced ones, for any receiver. The
+/// trace must be on.
 fn selector_is_traced(env: &mut Environment, selector: SEL) -> bool {
-    selector_markers(env, selector).is_some()
+    traced_index(env, selector).is_some()
+}
+
+/// The names of `class` and of each of its superclasses, in that order (for
+/// a metaclass, the metaclasses' names, which are their classes' names, and
+/// last the root class). Empty for nil. Never panics: the walk stops at a
+/// class touchHLE has no full record of.
+fn class_chain_names(objc: &ObjC, class: Class) -> Vec<String> {
+    let mut names = Vec::new();
+    let mut current = class;
+    // A bound, in case a broken chain loops.
+    for _ in 0..64 {
+        if current == nil {
+            break;
+        }
+        if let Some(name) = objc.try_get_class_name(current) {
+            names.push(name.to_string());
+        }
+        match objc
+            .get_host_object(current)
+            .and_then(|o| o.as_any().downcast_ref::<ClassHostObject>())
+        {
+            Some(host) => current = host.superclass,
+            None => break,
+        }
+    }
+    names
 }
 
 /// Act on a traced call's markers once its line is written.
@@ -665,7 +839,7 @@ pub(super) fn trace_send(
     super2: Option<Class>,
     variant: SendVariant,
 ) {
-    let Some(markers) = selector_markers(env, selector) else {
+    let Some(markers) = selector_markers(env, selector, receiver) else {
         return;
     };
 
@@ -1015,12 +1189,14 @@ pub fn trace_wrap_imp(env: &mut Environment, class: Class, selector: SEL, imp: I
     IMP::Guest(stub)
 }
 
-/// Runs when the guest calls a trampoline. Writes the trace line, then sets
-/// the PC (and the Thumb state) to the real IMP, so the guest carries on
-/// inside the real method with every register (r0-r3, SP, LR) as the caller
-/// left it, and the method returns straight to the caller. The stub's own
-/// return instruction never runs. Only methods that do not return a struct get
-/// a trampoline, so the receiver is in r0 and the arguments start at r2.
+/// Runs when the guest calls a trampoline. Writes the trace line (if the
+/// selector's class filters take the receiver, see [selector_markers]),
+/// then sets the PC (and the Thumb state) to the real IMP, so the guest
+/// carries on inside the real method with every register (r0-r3, SP, LR) as
+/// the caller left it, and the method returns straight to the caller. The
+/// stub's own return instruction never runs. Only methods that do not return
+/// a struct get a trampoline, so the receiver is in r0 and the arguments
+/// start at r2.
 fn trace_imp_trampoline(env: &mut Environment) {
     // The PC points at the instruction after the SVC, and the SVC is the
     // first instruction of the stub.
@@ -1033,12 +1209,16 @@ fn trace_imp_trampoline(env: &mut Environment) {
         .expect("trace trampoline called with no target");
 
     let receiver: id = Ptr::from_bits(env.cpu.regs()[0]);
+    // The stub is made for any receiver; a class filter is applied here.
+    let Some(markers) = selector_markers(env, selector, receiver) else {
+        env.cpu.branch(real);
+        return;
+    };
     let class_name = if receiver == nil {
         "nil".to_string()
     } else {
         class_name_for_trace(&env.objc, ObjC::read_isa(receiver, &env.mem))
     };
-    let markers = selector_markers(env, selector).unwrap_or_default();
     write_line(
         env,
         "guest",
@@ -1080,7 +1260,8 @@ fn fmt_f32(bits: u32) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        capture_due, nslog_row, parse_selector_line, returns_struct, touch_row, TrampolineCache,
+        capture_due, nslog_row, parse_selector_line, returns_struct, touch_row, Filter, Markers,
+        Traced, TrampolineCache,
     };
     use crate::window::FingerId;
 
@@ -1161,6 +1342,127 @@ mod tests {
         assert_eq!(line.bad_peeks[0].0, "arg0.hp");
         assert!(line.bad_peeks[0].1.contains("no :type"));
         assert!(line.unknown.is_empty());
+    }
+
+    #[test]
+    fn selector_words_take_a_receiver_class() {
+        let line = parse_selector_line("setPosition:@CCLabelTTF png arg0:str").unwrap();
+        assert_eq!(line.word, "setPosition:@CCLabelTTF");
+        assert_eq!(line.selector, "setPosition:");
+        assert_eq!(line.class.as_deref(), Some("CCLabelTTF"));
+        assert_eq!(line.error, None);
+        assert!(line.png);
+        assert_eq!(line.peeks.len(), 1);
+        assert_eq!(line.peeks[0].text, "arg0:str");
+        // Without '@' the word is the selector and there is no class.
+        let line = parse_selector_line("setString: arg0:str").unwrap();
+        assert_eq!(line.word, "setString:");
+        assert_eq!(line.selector, "setString:");
+        assert_eq!(line.class, None);
+        assert_eq!(line.error, None);
+        // An item of --trace-selectors= once ';' became a space.
+        let line = parse_selector_line(&"tLoop:@Game;png".replace(';', " ")).unwrap();
+        assert_eq!(line.selector, "tLoop:");
+        assert_eq!(line.class.as_deref(), Some("Game"));
+        assert!(line.png);
+        // A class method's selector without arguments.
+        let line = parse_selector_line("sharedDirector@CCDirector").unwrap();
+        assert_eq!(line.selector, "sharedDirector");
+        assert_eq!(line.class.as_deref(), Some("CCDirector"));
+        // Words that are not a selector and a class.
+        for word in ["@CCLabelTTF", "setString:@", "a:@B@C", "@"] {
+            let line = parse_selector_line(word).unwrap();
+            assert!(line.error.is_some(), "{word}");
+            assert_eq!(line.word, word);
+        }
+    }
+
+    fn filter(class: Option<&str>, png: bool) -> Filter {
+        Filter {
+            class: class.map(str::to_string),
+            png,
+        }
+    }
+
+    #[test]
+    fn lines_of_one_selector_add_up_per_class() {
+        let mut traced = Traced::default();
+        traced.add(Some("CCLabelTTF"), false);
+        traced.add(Some("CCLabelBMFont"), true);
+        traced.add(Some("CCLabelTTF"), true);
+        traced.add(None, false);
+        assert_eq!(
+            traced.filters,
+            vec![
+                filter(Some("CCLabelTTF"), true),
+                filter(Some("CCLabelBMFont"), true),
+                filter(None, false),
+            ]
+        );
+        assert!(traced.by_class());
+        let mut plain = Traced::default();
+        plain.add(None, false);
+        plain.add(None, true);
+        assert_eq!(plain.filters, vec![filter(None, true)]);
+        assert!(!plain.by_class());
+    }
+
+    #[test]
+    fn class_filters_match_the_class_or_a_superclass() {
+        let traced = Traced {
+            filters: vec![
+                filter(Some("CCNode"), false),
+                filter(Some("CCMenuItemLabel"), true),
+            ],
+            peeks: Some(2),
+        };
+        let label = ["CCLabelTTF", "CCSprite", "CCNode", "NSObject"];
+        let item = ["CCMenuItemLabel", "CCMenuItem", "CCNode", "NSObject"];
+        // A superclass's name takes the call.
+        assert_eq!(
+            traced.markers_for(&label),
+            Some(Markers {
+                png: false,
+                peeks: Some(2)
+            })
+        );
+        // png only from a filter that takes the receiver.
+        assert_eq!(
+            traced.markers_for(&item),
+            Some(Markers {
+                png: true,
+                peeks: Some(2)
+            })
+        );
+        // Not on the chain, a nil receiver, and a name that is only a prefix.
+        assert_eq!(traced.markers_for(&["Creeps", "NSObject"]), None);
+        assert_eq!(traced.markers_for::<&str>(&[]), None);
+        let ttf = Traced {
+            filters: vec![filter(Some("CCLabel"), false)],
+            peeks: None,
+        };
+        assert_eq!(ttf.markers_for(&label), None);
+        // A class method: the metaclass chain has the same names, and ends
+        // with the root class after the root metaclass.
+        let metaclass = ["CCLabelTTF", "CCSprite", "CCNode", "NSObject", "NSObject"];
+        let by_label = Traced {
+            filters: vec![filter(Some("CCLabelTTF"), false)],
+            peeks: None,
+        };
+        assert!(by_label.markers_for(&metaclass).is_some());
+        // A line without a class takes any receiver, nil included.
+        let any = Traced {
+            filters: vec![filter(None, true)],
+            peeks: None,
+        };
+        assert_eq!(
+            any.markers_for::<&str>(&[]),
+            Some(Markers {
+                png: true,
+                peeks: None
+            })
+        );
+        assert!(any.markers_for(&label).is_some());
     }
 
     #[test]
