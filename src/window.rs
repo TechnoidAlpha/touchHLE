@@ -1371,25 +1371,47 @@ impl Window {
     /// no context is left current, so the GL calls that follow do nothing
     /// rather than reach another context.
     pub unsafe fn make_gl_context_current(&self, gl_ctx: &GLContext) {
-        let result = self.window.gl_make_current(&gl_ctx.0);
-        if !self.backgrounded {
+        Self::make_current(
+            &self.window,
+            &self.video_ctx,
+            self.backgrounded,
+            &self.make_current_failure_logged,
+            gl_ctx,
+        );
+    }
+
+    /// [Self::make_gl_context_current], taking the fields it needs, so that
+    /// [Self::make_internal_gl_ctx_current] can use it while it borrows
+    /// another.
+    fn make_current(
+        window: &sdl2::video::Window,
+        video_ctx: &sdl2::VideoSubsystem,
+        backgrounded: bool,
+        failure_logged: &std::cell::Cell<bool>,
+        gl_ctx: &GLContext,
+    ) {
+        let result = window.gl_make_current(&gl_ctx.0);
+        if !backgrounded {
             result.unwrap();
             return;
         }
         if let Err(e) = result {
-            if !self.make_current_failure_logged.replace(true) {
+            if !failure_logged.replace(true) {
                 log!(
                     "Lifecycle: could not make a GL context current in the background \
                      ({}), skipping.",
                     e
                 );
             }
-            let _ = self.video_ctx.gl_release_current_context();
+            let _ = video_ctx.gl_release_current_context();
         }
     }
 
     /// Make the internal OpenGL ES context (for splash screen and UI rendering)
-    /// current.
+    /// current. A failure in the background is handled as for the app's
+    /// contexts (see [Self::make_gl_context_current]): the compositor can
+    /// get here after the background event, when a guest callback in the
+    /// middle of a composite lets a poll queue it.
     #[must_use]
     pub fn make_internal_gl_ctx_current<'win>(&'win mut self) -> Box<dyn GLES + 'win> {
         // The invariant is held up here - since the instance we return is
@@ -1400,7 +1422,15 @@ impl Window {
                 .as_mut()
                 .unwrap()
                 .make_current_unchecked_for_window(
-                    &mut |gl_ctx| self.window.gl_make_current(&gl_ctx.0).unwrap(),
+                    &mut |gl_ctx| {
+                        Self::make_current(
+                            &self.window,
+                            &self.video_ctx,
+                            self.backgrounded,
+                            &self.make_current_failure_logged,
+                            gl_ctx,
+                        )
+                    },
                     &mut |s| self.video_ctx.gl_get_proc_address(s) as *const _,
                 )
         };
