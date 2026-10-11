@@ -344,7 +344,7 @@ The columns, in order. `f32` is written with six significant digits as in peeks,
 
 **Text.** `text`, `font` and `tex_file` are written as a `str` peek writes a string (see Peeks above): tabs, newlines, carriage returns and backslashes escaped, cut at 200 bytes with `...`. A string of a class the game defines itself is `-`.
 
-**Caps.** At most 5,000 node lines per dump; then the walk stops and a note says how many were still waiting. Nodes 32 levels below the running scene or deeper are not written (levels 0 to 31 are), and a note says how many. A node met twice (a loop in the children) is written once, with a note. At most 50 notes.
+**Caps.** At most 5,000 node lines per dump; then the walk stops and a note says how many were still waiting. Nodes 32 levels below the running scene or deeper are not written (levels 0 to 31 are), and a note says how many. A node met twice (a loop in the children) is written once, with a note. At most 50 notes, then `more notes left out`; the notes that say a cap cut the walk (they start with `cut:`) come last and are always written.
 
 ### How it reads the game
 

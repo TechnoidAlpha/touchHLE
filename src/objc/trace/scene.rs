@@ -46,7 +46,8 @@ pub(super) const MAX_NODES: usize = 5000;
 pub(super) const MAX_DEPTH: usize = 32;
 
 /// At most this many notes (children that could not be read, and the like)
-/// are written at the end of a dump.
+/// are written at the end of a dump. The notes that say a cap cut the walk
+/// are written after them all the same.
 const MAX_NOTES: usize = 50;
 
 /// The columns of a node line, in order. See dev-docs/4towers-branch.md,
@@ -463,12 +464,19 @@ pub(super) struct Walk {
 }
 
 impl Walk {
+    /// A note, unless [MAX_NOTES] were written already.
     fn note(&mut self, note: String) {
         if self.notes.len() < MAX_NOTES {
             self.notes.push(note);
         } else if self.notes.len() == MAX_NOTES {
             self.notes.push("more notes left out".to_string());
         }
+    }
+
+    /// A note that a cap cut the walk: always written, after the others
+    /// (it is only made once the walk is over or stopped).
+    fn cut(&mut self, note: String) {
+        self.notes.push(note);
     }
 }
 
@@ -488,7 +496,7 @@ pub(super) fn walk<M: SceneMemory + ?Sized>(
     let mut stack = vec![(root, 0usize)];
     while let Some((node, depth)) = stack.pop() {
         if walk.nodes == MAX_NODES {
-            walk.note(format!(
+            walk.cut(format!(
                 "cut: the cap of {MAX_NODES} nodes was reached; {} more on the walk's stack (and their children) are not written",
                 stack.len() + 1
             ));
@@ -515,7 +523,7 @@ pub(super) fn walk<M: SceneMemory + ?Sized>(
         }
     }
     if too_deep > 0 {
-        walk.note(format!(
+        walk.cut(format!(
             "cut: {too_deep} node(s) {MAX_DEPTH} levels deep are not written, nor their children"
         ));
     }
@@ -1269,6 +1277,47 @@ mod tests {
         assert_eq!(walked.nodes, 2);
         assert_eq!(walked.notes.len(), 1);
         assert!(walked.notes[0].contains("a loop"));
+    }
+
+    #[test]
+    fn a_cut_note_is_written_past_the_note_cap() {
+        let nils = vec![0u32; MAX_NOTES + 10];
+        // The node cap: nil children, then more nodes than the cap.
+        let mut g = FakeGuest::new();
+        let mut children = nils.clone();
+        children.extend((0..MAX_NODES as u32 + 10).map(|i| 0x1_0000 + 4 * i));
+        g.node(0x4000, &LAYER, &[]);
+        g.array(0x5000, &children);
+        g.put_word(g.ivar(0x4000, "children_"), 0x5000);
+        for &child in &children[nils.len()..] {
+            g.object(child, &["CCNode", "NSObject"]);
+        }
+        let walked = walk(&mut g, 0x4000, &HashMap::new());
+        assert_eq!(walked.nodes, MAX_NODES);
+        assert_eq!(walked.notes.len(), MAX_NOTES + 2);
+        assert_eq!(walked.notes[MAX_NOTES], "more notes left out");
+        let last = walked.notes.last().unwrap();
+        assert!(last.starts_with("cut: the cap of 5000 nodes"), "{last}");
+
+        // The depth cap: a chain too deep, its root with nil children.
+        let mut g = FakeGuest::new();
+        let chain: Vec<u32> = (0..MAX_DEPTH as u32 + 1)
+            .map(|i| 0x4000 + 0x100 * i)
+            .collect();
+        let mut first = nils.clone();
+        first.push(chain[1]);
+        g.node(chain[0], &LAYER, &[]);
+        g.array(0x8000, &first);
+        g.put_word(g.ivar(chain[0], "children_"), 0x8000);
+        for pair in chain[1..].windows(2) {
+            g.node(pair[0], &LAYER, &[pair[1]]);
+        }
+        g.node(*chain.last().unwrap(), &LAYER, &[]);
+        let walked = walk(&mut g, chain[0], &HashMap::new());
+        assert_eq!(walked.nodes, MAX_DEPTH);
+        assert_eq!(walked.notes.len(), MAX_NOTES + 2);
+        let last = walked.notes.last().unwrap();
+        assert!(last.starts_with("cut: 1 node(s) 32 levels deep"), "{last}");
     }
 
     #[test]
