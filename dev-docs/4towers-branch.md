@@ -356,4 +356,4 @@ Only memory and touchHLE's class table are read: the dump never sends a message 
 
 The walk runs on the emulator thread while the frame is presented, so the game sees the time it takes; for a few hundred nodes that should be well under a millisecond (the first dump also searches the data sections), but it has not been measured.
 
-**Not yet checked on a running game.** The walk is covered by unit tests on a made-up memory and class table (the `ccArray` reader, the column line, the escaping, the caps); finding the singletons and reading the real cocos2d objects of 4Towers has not been tried yet.
+**Not yet checked on a running game.** The walk is covered by unit tests on a made-up memory and class table (the `ccArray` reader, the column line, the escaping, the colour, the caps), and so are finding a singleton (a class object skipped, the kept slot read first, a search again when it goes stale) and matching the texture cache's keys to its textures; running these on the real cocos2d objects of 4Towers has not been tried yet.

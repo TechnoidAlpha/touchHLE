@@ -147,6 +147,10 @@ pub(super) trait SceneMemory {
     /// The text of the string at `string`, if it is one of touchHLE's.
     fn string_text(&self, string: u32) -> Option<String>;
 
+    /// The keys and values of the dictionary at `dict`, if it is one of
+    /// touchHLE's, read from its host object.
+    fn dictionary_pairs(&self, dict: u32) -> Option<Vec<(u32, u32)>>;
+
     /// The little-endian word at `addr`.
     fn word(&self, addr: u32) -> Result<u32, String> {
         let b = self.bytes(addr, 4)?;
@@ -718,6 +722,19 @@ impl SceneMemory for GuestScene<'_> {
         )
         .map(|text| text.into_owned())
     }
+
+    fn dictionary_pairs(&self, dict: u32) -> Option<Vec<(u32, u32)>> {
+        let pairs = crate::frameworks::foundation::ns_dictionary::host_dictionary_pairs(
+            self.objc,
+            Ptr::from_bits(dict),
+        )?;
+        Some(
+            pairs
+                .into_iter()
+                .map(|(key, value)| (key.to_bits(), value.to_bits()))
+                .collect(),
+        )
+    }
 }
 
 /// Whether `object` is an instance (not a class) of `class` or a subclass.
@@ -745,6 +762,23 @@ pub(super) fn find_singleton<M: SceneMemory + ?Sized>(
     slot: &mut Option<u32>,
     class: &str,
 ) -> Option<u32> {
+    let sections: Vec<(u32, u32)> = bin
+        .sections
+        .iter()
+        .filter(|section| DATA_SECTIONS.contains(&section.name.as_str()))
+        .map(|section| (section.addr, section.size))
+        .collect();
+    find_singleton_in(m, &sections, slot, class)
+}
+
+/// [find_singleton] over `sections`, each an address and a size in bytes.
+/// A section that cannot be read is skipped.
+fn find_singleton_in<M: SceneMemory + ?Sized>(
+    m: &mut M,
+    sections: &[(u32, u32)],
+    slot: &mut Option<u32>,
+    class: &str,
+) -> Option<u32> {
     if let Some(addr) = *slot {
         if let Ok(object) = m.word(addr) {
             if is_instance_of(m, object, class) {
@@ -752,11 +786,8 @@ pub(super) fn find_singleton<M: SceneMemory + ?Sized>(
             }
         }
     }
-    for section in &bin.sections {
-        if !DATA_SECTIONS.contains(&section.name.as_str()) {
-            continue;
-        }
-        let Ok(bytes) = m.bytes(section.addr, section.size) else {
+    for &(start, size) in sections {
+        let Ok(bytes) = m.bytes(start, size) else {
             continue;
         };
         let words: Vec<u32> = bytes
@@ -767,7 +798,7 @@ pub(super) fn find_singleton<M: SceneMemory + ?Sized>(
             .collect();
         for (i, &word) in words.iter().enumerate() {
             if is_instance_of(m, word, class) {
-                *slot = Some(section.addr + 4 * i as u32);
+                *slot = Some(start + 4 * i as u32);
                 return Some(word);
             }
         }
@@ -780,23 +811,19 @@ pub(super) fn find_singleton<M: SceneMemory + ?Sized>(
 /// keys and values of its `textures_`, an `NSMutableDictionary` touchHLE
 /// made, read from its host object without calling the guest. [None] if
 /// `textures_` cannot be read or is not one of touchHLE's dictionaries.
-pub(super) fn texture_files(
-    scene: &mut GuestScene,
+/// A key that is not one of touchHLE's strings is written as its address.
+pub(super) fn texture_files<M: SceneMemory + ?Sized>(
+    m: &mut M,
     texture_cache: u32,
 ) -> Option<HashMap<u32, String>> {
-    let dict = pointer(scene, texture_cache, "textures_").ok()?;
-    let pairs = crate::frameworks::foundation::ns_dictionary::host_dictionary_pairs(
-        scene.objc,
-        Ptr::from_bits(dict),
-    )?;
+    let dict = pointer(m, texture_cache, "textures_").ok()?;
+    let pairs = m.dictionary_pairs(dict)?;
     Some(
         pairs
             .into_iter()
             .map(|(key, value)| {
-                let file = scene
-                    .string_text(key.to_bits())
-                    .unwrap_or_else(|| format!("{:#010x}", key.to_bits()));
-                (value.to_bits(), file)
+                let file = m.string_text(key).unwrap_or_else(|| format!("{key:#010x}"));
+                (value, file)
             })
             .collect(),
     )
@@ -862,6 +889,7 @@ mod tests {
         /// Per class name, per ivar name.
         offsets: HashMap<String, HashMap<&'static str, u32>>,
         strings: HashMap<u32, String>,
+        dictionaries: HashMap<u32, Vec<(u32, u32)>>,
     }
 
     const BASE: u32 = 0x1000;
@@ -908,6 +936,7 @@ mod tests {
                 ("CCDirector", "runningScene_", 8),
                 ("CCDirector", "nextScene_", 12),
                 ("CCDirector", "winSizeInPoints_", 16),
+                ("CCTextureCache", "textures_", 4),
             ] {
                 offsets
                     .entry(class.to_string())
@@ -919,6 +948,7 @@ mod tests {
                 classes: HashMap::new(),
                 offsets,
                 strings: HashMap::new(),
+                dictionaries: HashMap::new(),
             }
         }
 
@@ -1011,6 +1041,10 @@ mod tests {
 
         fn string_text(&self, string: u32) -> Option<String> {
             self.strings.get(&string).cloned()
+        }
+
+        fn dictionary_pairs(&self, dict: u32) -> Option<Vec<(u32, u32)>> {
+            self.dictionaries.get(&dict).cloned()
         }
     }
 
@@ -1380,6 +1414,93 @@ mod tests {
         assert!(lines[1].ends_with("\tviewport=-\ttextures=-"));
         assert_eq!(lines[2], "# no CCDirector found, nothing walked");
         assert_eq!(lines[3], "# nodes=0");
+    }
+
+    #[test]
+    fn a_singleton_is_found_kept_and_found_again() {
+        const DIRECTOR: [&str; 3] = ["CCDirectorTimer", "CCDirectorIOS", "CCDirector"];
+        let mut g = FakeGuest::new();
+        // The class CCDirector itself (a metaclass instance), a texture
+        // cache, then the director, in a data section at 0x2000; a
+        // section that cannot be read comes first.
+        g.classes.insert(
+            0x3000,
+            Rc::new(ClassInfo {
+                name: "+CCDirector".to_string(),
+                chain: vec!["CCDirector".to_string(), "NSObject".to_string()],
+            }),
+        );
+        g.object(0x3100, &["CCTextureCache", "NSObject"]);
+        g.object(0x3200, &DIRECTOR);
+        g.put_word(0x2000, 0x3000);
+        g.put_word(0x2004, 0x3100);
+        g.put_word(0x2008, 0x3200);
+        let sections = [(0x0100, 0x10), (0x2000, 0x40)];
+        let mut slot = None;
+        let found = find_singleton_in(&mut g, &sections, &mut slot, "CCDirector");
+        assert_eq!(found, Some(0x3200));
+        assert_eq!(slot, Some(0x2008));
+        let mut cache_slot = None;
+        let found = find_singleton_in(&mut g, &sections, &mut cache_slot, "CCTextureCache");
+        assert_eq!(found, Some(0x3100));
+        assert_eq!(cache_slot, Some(0x2004));
+
+        // The slot is read first: a director it points at is taken
+        // without a search, even one outside the sections.
+        g.object(0x3300, &DIRECTOR);
+        g.put_word(0x2800, 0x3300);
+        let mut slot = Some(0x2800);
+        let found = find_singleton_in(&mut g, &sections, &mut slot, "CCDirector");
+        assert_eq!(found, Some(0x3300));
+        assert_eq!(slot, Some(0x2800));
+
+        // A slot that no longer points at a director: searched again.
+        g.put_word(0x2800, 0x3100);
+        let found = find_singleton_in(&mut g, &sections, &mut slot, "CCDirector");
+        assert_eq!(found, Some(0x3200));
+        assert_eq!(slot, Some(0x2008));
+        g.put_word(0x2008, 0);
+        g.put_word(0x2010, 0x3300);
+        let found = find_singleton_in(&mut g, &sections, &mut slot, "CCDirector");
+        assert_eq!(found, Some(0x3300));
+        assert_eq!(slot, Some(0x2010));
+
+        // None at all (the metaclass does not count).
+        g.put_word(0x2010, 0);
+        let found = find_singleton_in(&mut g, &sections, &mut slot, "CCDirector");
+        assert_eq!(found, None);
+        let mut slot = None;
+        assert_eq!(
+            find_singleton_in(&mut g, &[], &mut slot, "CCDirector"),
+            None
+        );
+        assert_eq!(slot, None);
+    }
+
+    #[test]
+    fn texture_files_maps_each_texture_to_its_key() {
+        let mut g = FakeGuest::new();
+        g.object(0x3000, &["CCTextureCache", "NSObject"]);
+        g.put_word(g.ivar(0x3000, "textures_"), 0x3800);
+        g.strings.insert(0x9000, "hud.png".to_string());
+        // The second key is not one of touchHLE's strings.
+        g.dictionaries
+            .insert(0x3800, vec![(0x9000, 0x8000), (0x9100, 0x8100)]);
+        let files = texture_files(&mut g, 0x3000).unwrap();
+        assert_eq!(
+            files,
+            HashMap::from([
+                (0x8000, "hud.png".to_string()),
+                (0x8100, "0x00009100".to_string()),
+            ])
+        );
+        // textures_ is nil, or not one of touchHLE's dictionaries, or the
+        // cache cannot be read.
+        g.put_word(g.ivar(0x3000, "textures_"), 0);
+        assert_eq!(texture_files(&mut g, 0x3000), None);
+        g.put_word(g.ivar(0x3000, "textures_"), 0x3900);
+        assert_eq!(texture_files(&mut g, 0x3000), None);
+        assert_eq!(texture_files(&mut g, 0x0700), None);
     }
 
     #[test]
