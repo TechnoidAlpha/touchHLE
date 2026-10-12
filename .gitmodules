@@ -7,7 +7,7 @@
 	url = https://github.com/touchHLE/dynarmic.git
 [submodule "openal-soft"]
 	path = vendor/openal-soft
-	url = https://github.com/kcat/openal-soft
+	url = https://github.com/TechnoidAlpha/openal-soft
 [submodule "vendor/SDL"]
 	path = vendor/SDL
 	url = https://github.com/libsdl-org/SDL.git
