@@ -1041,6 +1041,41 @@ fn image_size_estimate(pixel_count: GuestUSize, format: GLenum, type_: GLenum) -
     // This is approximate, it doesn't account for alignment.
     pixel_count.checked_mul(bytes_per_pixel).unwrap()
 }
+/// The pixels uploaded in place of an image with no pixels: one texel of
+/// zeros, which is transparent in every format with alpha. Four bytes cover
+/// the largest uncompressed texel OpenGL ES 1.1 has (`RGBA`/`UNSIGNED_BYTE`).
+const EMPTY_IMAGE_TEXEL: [u8; 4] = [0; 4];
+
+/// For an image with no pixels (a width or height of 0, the other not
+/// negative), the size to upload instead: 1 by 1. `None` for any other size,
+/// which goes to the host as it is (a negative one gets the host's error).
+///
+/// Personal fork, not for upstream: an empty `CCLabelTTF` has a 0 by 0
+/// texture (cocos2d's `-[CCTexture2D initWithString:...]` makes one for an
+/// empty string), and on the Fold 7 Qualcomm's own OpenGL ES 1.1 driver then
+/// draws the next textured quad as a solid block. A 1 by 1 transparent image
+/// leaves the texture complete and drawing nothing. The guest's
+/// `CCTexture2D` still records the size it asked for, so the scene dump's
+/// `tex_w` and `tex_h` stay 0.
+fn empty_image_substitute(width: GLsizei, height: GLsizei) -> Option<(GLsizei, GLsizei)> {
+    let empty = (width == 0 && height >= 0) || (height == 0 && width >= 0);
+    empty.then_some((1, 1))
+}
+
+/// Logs the first substitution of a run (see [empty_image_substitute]).
+fn log_empty_image_substitute(func: &str, width: GLsizei, height: GLsizei, format: GLenum) {
+    static LOGGED: std::sync::Once = std::sync::Once::new();
+    LOGGED.call_once(|| {
+        log!(
+            "GLES: {} of a {}x{} image (format {:#x}) uploads one transparent texel instead, so the driver never sees a texture with no image. Logged once per run.",
+            func,
+            width,
+            height,
+            format
+        );
+    });
+}
+
 fn glTexImage2D(
     env: &mut Environment,
     target: GLenum,
@@ -1053,6 +1088,22 @@ fn glTexImage2D(
     type_: GLenum,
     pixels: ConstVoidPtr,
 ) {
+    if let Some((sub_width, sub_height)) = empty_image_substitute(width, height) {
+        log_empty_image_substitute("glTexImage2D", width, height, format);
+        return with_ctx_and_mem(env, |gles, _mem| unsafe {
+            gles.TexImage2D(
+                target,
+                level,
+                internalformat,
+                sub_width,
+                sub_height,
+                border,
+                format,
+                type_,
+                EMPTY_IMAGE_TEXEL.as_ptr().cast::<GLvoid>(),
+            )
+        });
+    }
     with_ctx_and_mem(env, |gles, mem| unsafe {
         let pixels = if pixels.is_null() {
             std::ptr::null()
@@ -1110,6 +1161,24 @@ fn glCompressedTexImage2D(
     image_size: GLsizei,
     data: ConstVoidPtr,
 ) {
+    if let Some((sub_width, sub_height)) = empty_image_substitute(width, height) {
+        // A compressed format has no 1 by 1 image of its own (PVRTC blocks
+        // are 4 by 4 or 8 by 4), so the texel goes up as RGBA.
+        log_empty_image_substitute("glCompressedTexImage2D", width, height, internalformat);
+        return with_ctx_and_mem(env, |gles, _mem| unsafe {
+            gles.TexImage2D(
+                target,
+                level,
+                gles11::RGBA as GLint,
+                sub_width,
+                sub_height,
+                border,
+                gles11::RGBA,
+                gles11::UNSIGNED_BYTE,
+                EMPTY_IMAGE_TEXEL.as_ptr().cast::<GLvoid>(),
+            )
+        });
+    }
     with_ctx_and_mem(env, |gles, mem| unsafe {
         let data = mem
             .ptr_at(data.cast::<u8>(), image_size.try_into().unwrap())
@@ -1655,4 +1724,41 @@ fn _get_buffer_size(env: &mut Environment, target: GLenum) -> GLint {
         unsafe { gles.GetBufferParameteriv(target, gles11::BUFFER_SIZE, &mut buffer_size) }
         buffer_size
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn empty_image_becomes_one_texel() {
+        // An empty CCLabelTTF's texture is 0 by 0; either side 0 is empty.
+        assert_eq!(empty_image_substitute(0, 0), Some((1, 1)));
+        assert_eq!(empty_image_substitute(0, 16), Some((1, 1)));
+        assert_eq!(empty_image_substitute(64, 0), Some((1, 1)));
+    }
+
+    #[test]
+    fn other_sizes_pass_through() {
+        // The gold label's texture, a 1 by 1 one and the smallest others.
+        assert_eq!(empty_image_substitute(128, 32), None);
+        assert_eq!(empty_image_substitute(1, 1), None);
+        assert_eq!(empty_image_substitute(1, 2), None);
+        // A negative size is the host's error to raise, as before.
+        assert_eq!(empty_image_substitute(-1, 0), None);
+        assert_eq!(empty_image_substitute(0, -1), None);
+        assert_eq!(empty_image_substitute(-4, 4), None);
+    }
+
+    #[test]
+    fn the_texel_is_transparent_and_big_enough() {
+        // RGBA with UNSIGNED_BYTE, the largest texel, is 4 bytes, and all
+        // zeros is alpha 0 in ALPHA, LUMINANCE_ALPHA, RGBA and the packed
+        // 4444 and 5551 types.
+        assert!(
+            EMPTY_IMAGE_TEXEL.len()
+                >= image_size_estimate(1, gles11::RGBA, gles11::UNSIGNED_BYTE) as usize
+        );
+        assert!(EMPTY_IMAGE_TEXEL.iter().all(|&b| b == 0));
+    }
 }
