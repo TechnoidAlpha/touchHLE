@@ -305,10 +305,11 @@ Tab-separated text:
 - Line 1 names the columns (below). It does not start with `#`.
 - Line 2 starts with `# ` and holds `key=value` pairs, separated by tabs: `frame`, `ms`, `trigger` (the reasons), `director` (address and class, for example `0x0012a4c0:CCDirectorTimer`), `paused` (its `isPaused_`), `running_scene` and `next_scene` (`runningScene_` and `nextScene_`, address and class, or `nil`), `win_size` (`winSizeInPoints_`, width and height), `viewport` (the window's area that shows the game, `x,y,width,height` in host pixels) and `textures` (how many textures the texture cache holds). `-` for what cannot be read.
 - Then one line per node.
+- Then one line per texture in the texture cache, sorted by key: `# cache: <key>\t<tex_name>\t<w>x<h>`. The key is the file name the game cached the texture under (written as `text` is, see Text below; a key that is not one of touchHLE's strings is its address), `tex_name` the `CCTexture2D`'s `name_` (its GL texture name) and `w`, `h` its `width_` and `height_`, so a node's `tex_name` can be matched to a cached file. `-` for what cannot be read, and for all three when the value is not a `CCTexture2D`. There are as many as `textures=` says, and no cap; a dump without a texture cache has none.
 - Then notes, each on a line starting with `# `: what was cut by a cap, and children that could not be read.
 - Last, `# nodes=N`, the number of node lines.
 
-To read it: take the first line as the column names and skip every other line that starts with `#`. A node line never starts with `#` (it starts with spaces or a class name).
+To read it: take the first line as the column names and skip every other line that starts with `#`. A node line never starts with `#` (it starts with spaces or a class name). The texture cache is the lines that start with `# cache: `, split on tabs.
 
 The nodes come in depth-first order from the director's `runningScene_` (depth 0): each node, then its children, each child's own children before the next child. Children are in the order of the node's `children_` array, which cocos2d keeps sorted by `zOrder_` (ties in the order they were added). cocos2d draws a node's children with a negative `z` before the node itself and the others after it.
 
@@ -339,7 +340,7 @@ The columns, in order. `f32` is written with six significant digits as in peeks,
 | `tex_w`, `tex_h` | u32 | `width_`, `height_`: the texture's size in pixels | the same |
 | `tex_size_w`, `tex_size_h` | f32 | `size_`: the size of the picture in it, in pixels | the same |
 | `tex_format` | i32 | `format_`, cocos2d's `CCTexture2DPixelFormat` as stored | the same |
-| `tex_max_s`, `tex_max_t` | f32 | `maxS_`, `maxT_` | the same |
+| `tex_max_s`, `tex_max_t` | f32 | `maxS_`, `maxT_`: `nan` for a 0 by 0 texture (an empty `CCLabelTTF`'s), as cocos2d divides by its size | the same |
 | `tex_file` | text | the key the texture cache holds the texture under: the file name the game asked for | the same |
 | `text` | text | `string_` | `CCLabelTTF`, `CCLabelAtlas`, `CCLabelBMFont` |
 | `font` | text | `fontName_` | `CCLabelTTF` |
@@ -352,7 +353,7 @@ The columns, in order. `f32` is written with six significant digits as in peeks,
 
 **The colour.** A `CCSprite` (so a `CCLabelTTF`) and a `CCAtlasNode` start with `opacityModifyRGB_` on. Then `setColor:` keeps the colour in `colorUnmodified_` and stores `color_` multiplied by `opacity_ / 255`, and `setOpacity:` does the same again (`CCSprite.c` and `CCAtlasNode.c` in the decompile), so a white sprite at opacity 128 has a `color_` of 128,128,128. `r`, `g` and `b` are the colour as set (255,255,255 there), as `[sprite color]` returns it; the colour drawn is that times `opacity` / 255 when `opacity_rgb` is 1. A `CCLabelBMFont` has no `colorUnmodified_` and keeps the colour as set in `color_`.
 
-**Text.** `text`, `font` and `tex_file` are written as a `str` peek writes a string (see Peeks above): tabs, newlines, carriage returns and backslashes escaped, cut at 200 bytes with `...`. A string of a class the game defines itself is `-`.
+**Text.** `text`, `font` and `tex_file` are written as a `str` peek writes a string (see Peeks above): tabs, newlines, carriage returns and backslashes escaped, cut at 200 bytes with `...`. A string of a class the game defines itself is `-`. An empty string (an empty label's text) is an empty field, nothing between the two tabs: neither `nil` nor `-`.
 
 **Caps.** At most 5,000 node lines per dump; then the walk stops and a note says how many were still waiting. Nodes 32 levels below the running scene or deeper are not written (levels 0 to 31 are), and a note says how many. A node met twice (a loop in the children) is written once, with a note. At most 50 notes, then `more notes left out`; the notes that say a cap cut the walk (they start with `cut:`) come last and are always written.
 
@@ -362,8 +363,8 @@ Only memory and touchHLE's class table are read: the dump never sends a message 
 
 - **`children_`** is a `CCArray`. Its `data` ivar points at a `ccArray` struct: `num` (u32) at +0, `max` (u32) at +4 and `arr`, a pointer to `num` object pointers, at +8 (cocos2d 0.99.5's `ccCArray.h`; `CCArray::count` and `CCArray::objectAtIndex:` in `CCArray.c` read the same places). A `num` above `max` is taken as unreadable.
 - **The director.** `+[CCDirector sharedDirector]` keeps the director in a file-static variable (`DAT_001512a0` in the decompile of 4Towers, `CCDirector.c` around line 404) that is not exported, and calling `sharedDirector` would run the game's code mid-frame. So the dump looks through the app binary's `__data`, `__bss` and `__common` sections, one 4-byte word at a time, for the first word that points at an instance (not a class) of `CCDirector` or a subclass. The director is one object, so any word that points at one points at it. The address of that word is kept and checked again at each dump; if it no longer points at a director, the sections are searched again. Before the director exists there is nothing to walk, and the file says so.
-- **The texture cache** is found the same way (`+[CCTextureCache sharedTextureCache]` keeps it in `DAT_001512bc`, `CCTextureCache.c` line 172). Its `textures_` is an `NSMutableDictionary` made by touchHLE, so its keys and values are read from touchHLE's own record of the dictionary, once per dump, and each value (a `CCTexture2D`) is matched to the sprites' textures by address.
+- **The texture cache** is found the same way (`+[CCTextureCache sharedTextureCache]` keeps it in `DAT_001512bc`, `CCTextureCache.c` line 172). Its `textures_` is an `NSMutableDictionary` made by touchHLE, so its keys and values are read from touchHLE's own record of the dictionary, once per dump, and each value (a `CCTexture2D`) is matched to the sprites' textures by address. The `# cache:` lines read each value's `name_`, `width_` and `height_` by ivar name, as the texture columns do.
 
 The walk runs on the emulator thread while the frame is presented, so the game sees the time it takes; for a few hundred nodes that should be well under a millisecond (the first dump also searches the data sections), but it has not been measured.
 
-**Not yet checked on a running game.** The walk is covered by unit tests on a made-up memory and class table (the `ccArray` reader, the column line, the escaping, the colour, the caps), and so are finding a singleton (a class object skipped, the kept slot read first, a search again when it goes stale) and matching the texture cache's keys to its textures; running these on the real cocos2d objects of 4Towers has not been tried yet.
+**Not yet checked on a running game.** The walk is covered by unit tests on a made-up memory and class table (the `ccArray` reader, the column line, the escaping, the colour, the caps), and so are finding a singleton (a class object skipped, the kept slot read first, a search again when it goes stale) and matching the texture cache's keys to its textures and writing its `# cache:` lines. The dump was first run on 4Towers on two phones on 25 October 2026 (the game repo's `docs/TOUCHHLE.md`, Known Visual Quirks); the `# cache:` lines have not been run on the game yet.
