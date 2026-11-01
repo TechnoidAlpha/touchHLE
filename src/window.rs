@@ -175,6 +175,9 @@ pub enum Event {
     /// User pressed F11 (or the Android wrapper sent it), asking for a scene
     /// dump of the message trace (see `trace_request_scene_dump`).
     DumpScene,
+    /// User pressed F8 (or the Android wrapper sent it), asking for the
+    /// message trace's coverage file now (see `trace_write_coverage`).
+    WriteCoverage,
     TextInput(TextInputEvent),
 }
 
@@ -924,6 +927,15 @@ impl Window {
                 } => {
                     echo!("F11 pressed, DumpScene event queued.");
                     Event::DumpScene
+                }
+                // The coverage file of the message trace, now.
+                E::KeyDown {
+                    keycode: Some(sdl2::keyboard::Keycode::F8),
+                    repeat: false,
+                    ..
+                } => {
+                    echo!("F8 pressed, WriteCoverage event queued.");
+                    Event::WriteCoverage
                 }
                 E::KeyDown {
                     keycode: Some(sdl2::keyboard::Keycode::Backspace),

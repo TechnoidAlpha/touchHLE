@@ -399,3 +399,105 @@ The generators are touchHLE's own (xorshift32), not Apple's, so the numbers are 
 What it costs: nothing when off (one `Option` check per draw). With `--trace-rng` each draw is one unbuffered write to `trace.log`, like a traced call.
 
 The row format and the replay file's grammar are covered by unit tests (`rng_rows_have_the_call_row_columns` in `src/objc/trace.rs`, and `src/libc/stdlib/rng.rs`).
+
+### Address hooks
+
+A hook writes a row with origin `addr` every time execution reaches a chosen guest address: a decompiled function's entry (`SharedData::asbs:b: @ 00006c1c`), a line in the middle of one, or a C function the selector trace cannot see. The game does not pause: the row is written and execution carries on at once.
+
+Hooks are listed in `trace_addresses.txt` next to the other touchHLE files, one per line (`#` starts a comment), or in `--trace-addresses=` (items separated by commas, the words of an item by `;`, as for `--trace-selectors=`). The two add up. A line:
+
+```
+<address> [arm|thumb] [<name>] [<peek>...]
+```
+
+- `<address>` is hex, with or without `0x`; a leading `@` (the decompile's spelling) is allowed. An odd address means Thumb code at the address one below, as a function pointer with the Thumb bit does (the class dumps' `IMP: 0x54ed` can be pasted as it is).
+- `arm` or `thumb` says which instruction set the hook is for; without it (and with an even address) it is for both. An instruction is Arm or Thumb according to how it is reached, and the same bytes are almost never run both ways, so the word only matters for odd cases.
+- `<name>` is any word that is not a peek; it goes in the row's `selector` column. Without one the address is the name.
+- Peeks are written as for the selector trace (see Peeks above), but start at a register, `r0` to `r3` or `sp`, as it is when the address is reached, or at a fixed address in hex: `r0.hp:f32` (an ivar of the object in r0), `sp.+8:u32` (the third word on the stack), `0x1512a0.+0:i32` (the word at that address), `0x1512a0->waveNum:i32` (an ivar of the object a static variable points at). At a function's entry r0 to r3 are its first four arguments, and for an Objective-C method r0 is `self` and r1 the selector.
+
+For example:
+
+```
+00006c1c thumb asbs r2:f32 r3:f32       # SharedData::asbs:b:, the two points' x
+0x0005bb24 spawnCreep r0:id r0.type:i32
+```
+
+A second line for the same address adds its instruction sets and peeks to the first. The header of `trace.log` has a line per hook: `# addr <name> <address> <arm|thumb|any> r2 r3 sp <peeks...>`.
+
+The row has the 17 columns of a call row and then three more, then the peeks:
+
+| column | value |
+| --- | --- |
+| `frame`, `ms`, `thread` | as for any row |
+| `origin` | `addr` |
+| `variant` | `arm` or `thumb`: how the instruction ran |
+| `class` | `-` |
+| `selector` | the hook's name |
+| `arg0`, `arg0_f32` | r0, in hex and as a float |
+| `arg1`, `arg1_f32` | r1, the same |
+| `sp0` to `sp3` | the four words at sp |
+| `lr` | the link register: at a function's entry, its caller's return address |
+| `self` | the hooked address |
+| then | r2, r3 and sp in hex, then a column per peek, in the order of the `# addr` line |
+
+Everything is read before the instruction at the address runs. For example (from the unit test): `5  12.500  0  addr  arm  -  spawn  0x3f800000  1  0x00000002  ...  0x00004001  0x00002d24  0x00000003  0x00000004  0x00fff000  25`.
+
+How it works: the CPU (dynarmic, a JIT) offers a hook when it reads an instruction to translate it. A hooked address always starts a block of translated code (the block it would have been in ends just before it), and the block's first operation is a write to a probe address in the null page, which has no page table entry, so the write goes through touchHLE's memory callback. The callback halts the CPU, and dynarmic's check after a callback stores the exact PC and returns, so touchHLE stops before the hooked instruction with every register as it was. The row is written, then that one instruction is run as a single step with the probe let through once, and the run carries on. Adding a hook clears the translated code at its address, so a hook takes effect at once. Details:
+
+- A conditional instruction gates its whole block, so a hook on one fires only when its condition passes (when the instruction really runs).
+- A hook on an address that is not the start of an instruction (the middle of a 32-bit Thumb instruction) never fires.
+- Hooks need the probe address to have no page table entry. That holds for every app binary, whose first page is its `__PAGEZERO`, and with `--disable-direct-memory-access` every access goes through the callbacks anyway. Otherwise the hooks are not set and the log says so.
+- What it costs: nothing for code that is not hooked. A hit leaves the JIT and comes back, about the cost of a host function call, plus the row's write.
+
+### Coverage
+
+`--coverage` records every instruction address the JIT translates and writes the app binary's ones to `coverage.txt`, next to `trace.log`: at exit (touchHLE's exit path, as for the frames), when F8 is pressed (or sent by the Android wrapper, like F11), and every 1800 frames presented (about 30 to 60 seconds), so a run that crashes or is killed still leaves a recent file. Each write replaces the file and has everything since the start.
+
+The file is tab-separated text: lines starting with `# ` are the header (the build, the app, when and why it was written, `instructions=`, `ranges=` and `outside_the_app=`, the addresses outside the app binary, which are touchHLE's own stubs and dylibs), then a line of column names, `start end set section`, then one line per range: the first address, the address after the last instruction (hex), `arm` or `thumb`, and the binary's section (`__text` for nearly all). Instructions of one instruction set that follow each other without a gap make one range, so a function that ran from start to end is one line, and a literal pool or a branch not taken splits it. For example (from the unit test): `0x00002d24  0x00002d6a  thumb  __text`.
+
+It is the JIT's view: an instruction counts once it is translated, which happens the first time execution reaches the block it is in. So it says which code ever ran, with one caveat: in a block that ran, a conditional instruction whose condition failed counts too (dynarmic translates a straight run of instructions up to a branch, and a condition only skips an instruction). Code translated again after its cache was cleared counts once. To map ranges to functions, look up each start in the decompile; a function whose entry is not in any range never ran.
+
+What it costs: one append to a vector per translated instruction, at translation only, so it does not slow code that already ran; a write of the file sorts and merges what was gathered (a few hundred thousand addresses at most for this game).
+
+### Watchpoints
+
+A watchpoint writes a row with origin `watch` for every write the game makes to a chosen field, with the value before and after and the address of the instruction that wrote it, so "who changed the gold, from where" is one row naming the function. They are listed in `trace_watch.txt` (one per line, `#` starts a comment) or `--trace-watch=` (commas between items, `;` between the words of an item). A line:
+
+```
+<target>:<type> [<name>]
+```
+
+- `<target>` is an address in hex (with or without `0x`), or `Class.ivar`, optionally followed by `.+N` (bytes further on, decimal or `0x` hex, for a member of a struct ivar). A `Class.ivar` watch starts on the first object of that class (or of a subclass, matched by name on the class chain as for Receiver class above) allocated once the trace is on, with an `arm` row; when that object is freed (`-[NSObject dealloc]`), the watch stops with a `disarm` row and waits for the next one.
+- `<type>` is how the value is read and written and how many bytes are watched: `u8`, `i8`, `u16`, `i16`, `u32`, `i32`, `f32`, `ptr`, `u64`, `i64` or `f64`.
+- `<name>` goes in the row's `selector` column; without one the target as written is the name.
+
+For example: `SharedData.totalGold:f32 gold`, `SharedData.waveNum:i32`, `0x0012a4c8:f32`. The header of `trace.log` has a line per watch: `# watch <name> <target> <type>`.
+
+The row has the 17 columns of a call row:
+
+| column | `write` row | `arm` row | `disarm` row |
+| --- | --- | --- | --- |
+| `variant` | `write` | `arm` | `disarm` |
+| `class` | the type | the type | the type |
+| `selector` | the name | the name | the name |
+| `arg0` | the watched address | the same | the same |
+| `arg0_f32` | the value before, as its type | the value now | `-` |
+| `arg1` | the object (`-` for a fixed address) | the object | the object |
+| `arg1_f32` | the value after | `-` | `-` |
+| `sp0`, `sp1` | the write's address and size in bytes | `-` | `-` |
+| `sp2`, `sp3` | the watched bytes before and after, in hex | the bytes now, `-` | `-` |
+| `lr` | the link register when the write ran | `-` | `-` |
+| `self` | the address of the writing instruction | `-` | `-` |
+
+A write is logged whenever it touches a watched byte, also when it writes the same value, and also when it covers more than the field (an `strd`, an `stm`) or only part of it; `sp0` and `sp1` say what it wrote. For example (from the unit test): `7  100.250  0  watch  write  f32  gold  0x0012a4c8  30  -  0  0x0012a4c8  4  0x41f00000  0x00000000  0x0003a001  0x0003a4e6`: the gold went from 30 to 0, written by the instruction at `0x3a4e6`.
+
+How it works: guest memory is reached through dynarmic's page table, one entry per 4 KiB page. The page holding a watched field is taken out of the table, so every access to it, by every instruction, goes through touchHLE's read and write callbacks; the other pages keep their direct access. A write that touches a watched range is made, its old and new bytes are recorded, and the CPU halts the way a hook does: dynarmic's check after the callback stores the exact PC of the writing instruction. The row is written, the rest of that instruction is run as a single step (it makes its writes again; the one already logged is skipped, any other watched write it makes is logged with the same PC), and execution carries on. When the last watch on a page stops, the page gets its entry back. So that a run can resume from the middle of a block, a run with watchpoints turns off one optimization of dynarmic's arm64 back end (register get/set elimination); on x64 dynarmic already skips it.
+
+Limits:
+
+- Only the guest's own writes are seen. Writes made by touchHLE's host code into guest memory (its `memcpy`, `memset`, `objc_setProperty`, `setValue:forKey:`, Foundation, the zeroing of freed memory) do not go through the CPU and are not logged; a field the game copies with `memcpy` changes without a row.
+- A store-exclusive (`strex`) to a watched field is logged without halting (running it again would fail and make the guest retry on the new value), so its row has `-` in `lr` and `self`, and it is written at the next presented frame.
+- `Class.ivar` watches only the first instance at a time, and only objects allocated through `+[NSObject allocWithZone:]` (every class of the game's).
+- What it costs: every access to a watched page, read or write, goes through a callback (a function call instead of one instruction), and each write to the watched bytes leaves the JIT twice. A field that is written every frame is fine; a page that holds a hot array is slower. Other pages are not affected, and with no watchpoint nothing changes.
+
+The parsing of the three files' lines, the rows, the header lines, the range merging and the watch bookkeeping (which writes touch which ranges, the halt and the step after it, the store-exclusive case) are covered by unit tests (`src/objc/trace/addr.rs`, `coverage.rs`, `watch.rs`, `src/cpu/watch.rs`, and the hook peeks in `src/objc/trace/peek.rs`).

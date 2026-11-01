@@ -30,6 +30,12 @@
 //!   that is not one of touchHLE's own strings).
 //!
 //! With no step at all (`arg0:id`), the base word itself is the value.
+//!
+//! A peek of an address hook (see [parse_hook_peek]) starts instead at a
+//! register, `r0` to `r3` or `sp`, as they are when the hooked address is
+//! reached, or at a fixed address written in hex (`0x1512a0`), which is the
+//! base word itself: `0x1512a0.+0:i32` reads the word there, and
+//! `0x1512a0->waveNum:i32` follows the pointer kept there.
 
 /// Where a peek starts.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -40,6 +46,12 @@ pub(super) enum PeekBase {
     Arg0,
     /// `arg1`: the word in the trace's `arg1` column.
     Arg1,
+    /// `r0` to `r3` (an address hook only): that register.
+    Reg(u8),
+    /// `sp` (an address hook only): the stack pointer.
+    Sp,
+    /// `0x...` (an address hook only): that address.
+    Addr(u32),
 }
 
 /// One step of a peek's path.
@@ -93,8 +105,77 @@ pub(super) fn looks_like_peek(word: &str) -> bool {
     ["self", "arg0", "arg1"].iter().any(|b| word.starts_with(b))
 }
 
+/// Whether a word of a `trace_addresses.txt` line is meant as a peek: it
+/// starts with one of the bases of [parse_hook_peek] and has a `:type`.
+pub(super) fn looks_like_hook_peek(word: &str) -> bool {
+    ["r0", "r1", "r2", "r3", "sp", "0x"]
+        .iter()
+        .any(|b| word.starts_with(b))
+        && word.contains(':')
+}
+
 /// Parse one peek spec (see the module doc), or say what is wrong with it.
 pub(super) fn parse_peek(text: &str) -> Result<PeekSpec, String> {
+    parse_peek_from(text, false)
+}
+
+/// Parse one peek spec of an address hook: like [parse_peek], but the base
+/// is `r0` to `r3`, `sp` or an address in hex (see the module doc).
+pub(super) fn parse_hook_peek(text: &str) -> Result<PeekSpec, String> {
+    parse_peek_from(text, true)
+}
+
+/// The base of `path` and what follows it: one of `self`, `arg0` and
+/// `arg1`, or for a hook (`hook`) one of `r0` to `r3`, `sp` and a hex
+/// address.
+fn split_base(path: &str, hook: bool) -> Result<(PeekBase, &str), String> {
+    let follows = |rest: &str| rest.is_empty() || rest.starts_with('.') || rest.starts_with("->");
+    if hook {
+        if let Some(hex) = path.strip_prefix("0x") {
+            let len = hex
+                .find(|c: char| !c.is_ascii_hexdigit())
+                .unwrap_or(hex.len());
+            let (digits, rest) = hex.split_at(len);
+            let addr =
+                u32::from_str_radix(digits, 16).map_err(|_| format!("bad address 0x{digits:?}"))?;
+            if !follows(rest) {
+                return Err(format!("expected . or -> at {rest:?}"));
+            }
+            return Ok((PeekBase::Addr(addr), rest));
+        }
+    }
+    let bases: &[(&str, PeekBase)] = if hook {
+        &[
+            ("r0", PeekBase::Reg(0)),
+            ("r1", PeekBase::Reg(1)),
+            ("r2", PeekBase::Reg(2)),
+            ("r3", PeekBase::Reg(3)),
+            ("sp", PeekBase::Sp),
+        ]
+    } else {
+        &[
+            ("self", PeekBase::Receiver),
+            ("arg0", PeekBase::Arg0),
+            ("arg1", PeekBase::Arg1),
+        ]
+    };
+    bases
+        .iter()
+        .find_map(|&(name, base)| {
+            let rest = path.strip_prefix(name)?;
+            follows(rest).then_some((base, rest))
+        })
+        .ok_or_else(|| {
+            if hook {
+                "it must start with r0, r1, r2, r3, sp or an address (0x...)".to_string()
+            } else {
+                "it must start with self, arg0 or arg1".to_string()
+            }
+        })
+}
+
+/// [parse_peek], or [parse_hook_peek] if `hook`.
+fn parse_peek_from(text: &str, hook: bool) -> Result<PeekSpec, String> {
     let (path, ty) = text
         .rsplit_once(':')
         .ok_or_else(|| "no :type at the end".to_string())?;
@@ -112,19 +193,7 @@ pub(super) fn parse_peek(text: &str) -> Result<PeekSpec, String> {
             ))
         }
     };
-    let bases = [
-        ("self", PeekBase::Receiver),
-        ("arg0", PeekBase::Arg0),
-        ("arg1", PeekBase::Arg1),
-    ];
-    let (base, mut rest) = bases
-        .iter()
-        .find_map(|&(name, base)| {
-            let rest = path.strip_prefix(name)?;
-            (rest.is_empty() || rest.starts_with('.') || rest.starts_with("->"))
-                .then_some((base, rest))
-        })
-        .ok_or_else(|| "it must start with self, arg0 or arg1".to_string())?;
+    let (base, mut rest) = split_base(path, hook)?;
 
     let mut steps = Vec::new();
     while !rest.is_empty() {
@@ -260,8 +329,8 @@ pub(super) fn fmt_peek_value(ty: PeekType, word: u32, detail: Option<&str>) -> S
 #[cfg(test)]
 mod tests {
     use super::{
-        fmt_f32_6, fmt_peek_value, fmt_str, looks_like_peek, parse_peek, PeekBase, PeekStep,
-        PeekType, STR_MAX_BYTES,
+        fmt_f32_6, fmt_peek_value, fmt_str, looks_like_hook_peek, looks_like_peek, parse_hook_peek,
+        parse_peek, PeekBase, PeekStep, PeekType, STR_MAX_BYTES,
     };
 
     fn ivar(name: &str) -> PeekStep {
@@ -371,6 +440,63 @@ mod tests {
                 Err(e) => assert!(e.contains(reason), "{text}: {e:?}, wanted {reason:?}"),
             }
         }
+    }
+
+    #[test]
+    fn hook_peeks_start_at_a_register_or_an_address() {
+        let cases: &[(&str, PeekBase, Vec<PeekStep>, PeekType)] = &[
+            ("r0:id", PeekBase::Reg(0), vec![], PeekType::Id),
+            (
+                "r3.hp:f32",
+                PeekBase::Reg(3),
+                vec![ivar("hp")],
+                PeekType::F32,
+            ),
+            (
+                "sp.+8:u32",
+                PeekBase::Sp,
+                vec![PeekStep::Bytes(8)],
+                PeekType::U32,
+            ),
+            (
+                "0x1512a0.+0:i32",
+                PeekBase::Addr(0x1512a0),
+                vec![PeekStep::Bytes(0)],
+                PeekType::I32,
+            ),
+            (
+                "0x001512A0->waveNum:i32",
+                PeekBase::Addr(0x1512a0),
+                vec![PeekStep::Deref, ivar("waveNum")],
+                PeekType::I32,
+            ),
+        ];
+        for (text, base, steps, ty) in cases {
+            let spec = parse_hook_peek(text).unwrap_or_else(|e| panic!("{text}: {e}"));
+            assert_eq!(spec.base, *base, "{text}");
+            assert_eq!(&spec.steps, steps, "{text}");
+            assert_eq!(spec.ty, *ty, "{text}");
+        }
+        for (text, reason) in [
+            ("self.hp:f32", "must start with r0"),
+            ("r4:u32", "must start with r0"),
+            ("0x:u32", "bad address"),
+            ("0x12g4:u32", "expected . or ->"),
+            ("0x123456789:u32", "bad address"),
+            ("lr:u32", "must start with r0"),
+        ] {
+            match parse_hook_peek(text) {
+                Ok(spec) => panic!("{text} parsed as {spec:?}"),
+                Err(e) => assert!(e.contains(reason), "{text}: {e:?}, wanted {reason:?}"),
+            }
+        }
+        // The selector trace's bases are not taken for a hook, nor the
+        // other way round.
+        assert!(parse_peek("r0:u32").is_err());
+        assert!(looks_like_hook_peek("r1.+4:f32"));
+        assert!(looks_like_hook_peek("0x1512a0.+0:i32"));
+        assert!(!looks_like_hook_peek("rand_stub"));
+        assert!(!looks_like_hook_peek("spawn"));
     }
 
     #[test]

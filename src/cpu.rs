@@ -9,9 +9,35 @@
 //!
 //! iPhone OS apps used either ARMv6 or ARMv7-A, which are both 32-bit ISAs.
 //! For the moment, only ARMv6 has been tested.
+//!
+//! The message trace's instruments reach into the CPU here (see
+//! src/objc/trace.rs for what they write):
+//!
+//! - Address hooks ([Cpu::set_hook]): a hooked address always starts a
+//!   block of JIT code, whose first IR operation is a write to a probe
+//!   address in the null page. That write goes through the C++ memory
+//!   callback, which halts the CPU, and dynarmic's check for a halt after a
+//!   callback stores the exact PC; so the CPU stops before the hooked
+//!   instruction with every register as it was ([CpuState::Hook]). After
+//!   the row is written, [Cpu::step_past_hook] runs that one instruction
+//!   with the probe let through once, and execution carries on.
+//! - Coverage ([Cpu::set_coverage]): each instruction address the JIT
+//!   translates.
+//! - Watchpoints ([Cpu::watch]): the page holding a watched range is taken
+//!   out of dynarmic's page table, so every access to it goes through the
+//!   memory callbacks. A write that touches the range is made, recorded
+//!   with the range's old and new bytes, and halts the CPU the same way,
+//!   with the PC of the writing instruction ([CpuState::Watch]); then
+//!   [Cpu::step_past_watch] runs the rest of that instruction.
+
+mod watch;
+
+pub use watch::WatchHit;
 
 use crate::abi::GuestFunction;
-use crate::mem::{ConstPtr, GuestUSize, Mem, MutPtr, Ptr, SafeRead, SafeWrite};
+use crate::mem::{ConstPtr, ConstVoidPtr, GuestUSize, Mem, MutPtr, Ptr, SafeRead, SafeWrite};
+use std::collections::BTreeSet;
+use watch::Watches;
 
 // Import functions from C++
 use touchHLE_dynarmic_wrapper::*;
@@ -92,16 +118,83 @@ extern "C" fn touchHLE_cpu_write_u64(mem: *mut touchHLE_Mem, addr: VAddr, value:
     touchHLE_cpu_write_impl(mem, addr, value)
 }
 
+/// The `len` (at most 8) bytes at `addr` as a little-endian number, or 0 if
+/// they cannot be read.
+pub(crate) fn read_le(mem: &Mem, addr: VAddr, len: u32) -> u64 {
+    mem.get_bytes_fallible(ConstVoidPtr::from_bits(addr), len)
+        .map_or(0, |bytes| {
+            bytes
+                .iter()
+                .rev()
+                .fold(0u64, |value, &byte| (value << 8) | u64::from(byte))
+        })
+}
+
+/// A write of `size` bytes (1, 2, 4 or 8) of `value` at `addr` that touches
+/// a watched page (see the module doc). Called by the C++ memory callbacks
+/// instead of the plain write. Makes the write, records it if it touched a
+/// watched range, and returns 0 if done, 1 on a memory error (like the
+/// plain write's error flag), 2 if the CPU should halt so the writing
+/// instruction can be found. `may_halt` is false for a store-exclusive.
+#[no_mangle]
+extern "C" fn touchHLE_cpu_watch_write(
+    watches: *mut std::ffi::c_void,
+    mem: *mut touchHLE_Mem,
+    addr: VAddr,
+    size: u32,
+    value: u64,
+    may_halt: bool,
+) -> i32 {
+    // See touchHLE_cpu_read_impl about catch_unwind.
+    let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let mem = unsafe { &mut *mem.cast::<Mem>() };
+        let watches = unsafe { &mut *watches.cast::<Watches>() };
+        let touched = watches.touched(addr, size);
+        let old: Vec<u64> = touched
+            .iter()
+            .map(|&(_, start, len)| read_le(mem, start, len))
+            .collect();
+        match size {
+            1 => mem.write(MutPtr::<u8>::from_bits(addr), value as u8),
+            2 => mem.write(MutPtr::<u16>::from_bits(addr), value as u16),
+            4 => mem.write(MutPtr::<u32>::from_bits(addr), value as u32),
+            _ => mem.write(MutPtr::<u64>::from_bits(addr), value),
+        }
+        let touched: Vec<(usize, u64, u64)> = touched
+            .iter()
+            .zip(old)
+            .map(|(&(watch, start, len), old)| (watch, old, read_le(mem, start, len)))
+            .collect();
+        watches.record(addr, size, &touched, may_halt)
+    }));
+    match res {
+        Err(_) => 1,
+        Ok(false) => 0,
+        Ok(true) => 2,
+    }
+}
+
 pub struct Cpu {
     dynarmic_wrapper: *mut touchHLE_DynarmicWrapper,
     /// Copy of the direct memory access pointer used to check it has not
     /// changed. If this is null, direct memory access is not in use.
     direct_memory_access_ptr: *const std::ffi::c_void,
+    /// The watchpoints (see [Cpu::watch]), made at the first one. The C++
+    /// side holds this pointer and hands it to [touchHLE_cpu_watch_write]
+    /// while the CPU runs; it is freed when the CPU is.
+    watches: *mut Watches,
+    /// Every instruction address the JIT has translated since coverage was
+    /// turned on, with bit 0 set for Thumb (see [Cpu::coverage]). [None]
+    /// while it is off.
+    coverage: Option<BTreeSet<u32>>,
 }
 
 impl Drop for Cpu {
     fn drop(&mut self) {
         unsafe { touchHLE_DynarmicWrapper_delete(self.dynarmic_wrapper) }
+        if !self.watches.is_null() {
+            drop(unsafe { Box::from_raw(self.watches) });
+        }
     }
 }
 
@@ -115,6 +208,14 @@ pub enum CpuState {
     Svc(u32),
     /// An error was encountered.
     Error(CpuError),
+    /// Execution reached a hooked address (see [Cpu::set_hook]), which is
+    /// given. The PC is that address and the hooked instruction has not run.
+    Hook(VAddr),
+    /// An instruction wrote to a watched range (see [Cpu::watch]). The PC
+    /// is that instruction's, and the write is done, but the rest of the
+    /// instruction (another word of an `stm`, the base register's update)
+    /// may not be: see [Cpu::step_past_watch].
+    Watch,
 }
 
 /// A reason that can cause CPU execution to be interrupted.
@@ -147,7 +248,11 @@ impl Cpu {
     /// is provided, direct memory access is enabled, and the CPU instance
     /// becomes bound to that [Mem] instance (subsequent calls must use the same
     /// one).
-    pub fn new(direct_memory_access: Option<&mut Mem>) -> Cpu {
+    ///
+    /// `precise_halts` must be set if watchpoints will be used (see the
+    /// module doc): execution then resumes from the middle of a block of JIT
+    /// code, which needs every register written back as it changes.
+    pub fn new(direct_memory_access: Option<&mut Mem>, precise_halts: bool) -> Cpu {
         // Null page count is in pages rather than bytes. Mem ensures it is
         // page aligned.
         let null_page_count: usize = direct_memory_access
@@ -163,11 +268,14 @@ impl Cpu {
             .map_or(std::ptr::null_mut(), |mem| unsafe {
                 mem.direct_memory_access_ptr()
             });
-        let dynarmic_wrapper =
-            unsafe { touchHLE_DynarmicWrapper_new(direct_memory_access_ptr, null_page_count) };
+        let dynarmic_wrapper = unsafe {
+            touchHLE_DynarmicWrapper_new(direct_memory_access_ptr, null_page_count, precise_halts)
+        };
         Cpu {
             dynarmic_wrapper,
             direct_memory_access_ptr,
+            watches: std::ptr::null_mut(),
+            coverage: None,
         }
     }
 
@@ -266,6 +374,127 @@ impl Cpu {
         }
     }
 
+    /// Hook the instruction at `addr` (without the Thumb bit) when it runs as
+    /// Arm code (`arm`) and/or as Thumb code (`thumb`): execution stops there
+    /// with [CpuState::Hook] (see the module doc). Neither removes the hook.
+    /// Returns false, and does nothing, if hooks cannot work: with direct
+    /// memory access and no null page, the probe would be an ordinary write.
+    pub fn set_hook(&mut self, addr: VAddr, arm: bool, thumb: bool) -> bool {
+        if !unsafe { touchHLE_DynarmicWrapper_hooks_usable(self.dynarmic_wrapper) } {
+            return false;
+        }
+        let modes = u8::from(arm) | (u8::from(thumb) << 1);
+        unsafe { touchHLE_DynarmicWrapper_set_hook(self.dynarmic_wrapper, addr, modes) };
+        true
+    }
+
+    /// After [CpuState::Hook] for `addr`, run the hooked instruction (a
+    /// single step) without stopping at the hook again, and return what the
+    /// step returned. The step is what lets the hook through, so no other
+    /// thread can take that pass (a thread switch can only happen between
+    /// runs).
+    #[must_use]
+    pub fn step_past_hook(&mut self, mem: &mut Mem, addr: VAddr) -> CpuState {
+        unsafe { touchHLE_DynarmicWrapper_begin_hook_skip(self.dynarmic_wrapper, addr) };
+        let state = self.run_or_step(mem, None);
+        let used = unsafe { touchHLE_DynarmicWrapper_end_hook_skip(self.dynarmic_wrapper) };
+        if !used {
+            log_dbg!(
+                "The hook at {:#x} was not passed by the step after it ({:?})",
+                addr,
+                state
+            );
+        }
+        state
+    }
+
+    /// Turn coverage (every instruction address the JIT translates) on or
+    /// off. Turning it off forgets what was gathered.
+    pub fn set_coverage(&mut self, on: bool) {
+        unsafe { touchHLE_DynarmicWrapper_set_coverage(self.dynarmic_wrapper, on) };
+        self.coverage = on.then(BTreeSet::new);
+    }
+
+    /// The instruction addresses translated since coverage was turned on,
+    /// each once, with bit 0 set for Thumb; [None] if it is off. Code that is
+    /// translated again (after its cache was cleared) is counted once.
+    pub fn coverage(&mut self) -> Option<&BTreeSet<u32>> {
+        let set = self.coverage.as_mut()?;
+        let mut buffer = vec![0u32; 4096];
+        loop {
+            let count = unsafe {
+                touchHLE_DynarmicWrapper_coverage_drain(
+                    self.dynarmic_wrapper,
+                    buffer.as_mut_ptr(),
+                    buffer.len(),
+                )
+            };
+            if count == 0 {
+                break;
+            }
+            set.extend(&buffer[..count]);
+        }
+        Some(set)
+    }
+
+    /// Watch writes to the `len` bytes (at most 8) at `start`. Returns the
+    /// watch's number, for [Cpu::unwatch] and [WatchHit::watch]. Only the
+    /// pages the range is on slow down. The CPU must have been made with
+    /// `precise_halts` (see [Cpu::new]).
+    pub fn watch(&mut self, start: VAddr, len: GuestUSize) -> usize {
+        if self.watches.is_null() {
+            self.watches = Box::into_raw(Box::default());
+            unsafe {
+                touchHLE_DynarmicWrapper_set_watches(self.dynarmic_wrapper, self.watches.cast())
+            };
+        }
+        let watch = unsafe { &mut *self.watches }.add(start, len);
+        for page in watch::pages_of(start, len) {
+            unsafe { touchHLE_DynarmicWrapper_watch_page(self.dynarmic_wrapper, page, true) };
+        }
+        watch
+    }
+
+    /// Stop watching `watch`. Its pages go back to fast access once no
+    /// other watch is on them.
+    pub fn unwatch(&mut self, watch: usize) {
+        if self.watches.is_null() {
+            return;
+        }
+        if let Some((start, len)) = unsafe { &mut *self.watches }.remove(watch) {
+            for page in watch::pages_of(start, len) {
+                unsafe { touchHLE_DynarmicWrapper_watch_page(self.dynarmic_wrapper, page, false) };
+            }
+        }
+    }
+
+    /// The writes to watched ranges recorded since the last call.
+    pub fn take_watch_hits(&mut self) -> Vec<WatchHit> {
+        if self.watches.is_null() {
+            return Vec::new();
+        }
+        unsafe { &mut *self.watches }.take_hits()
+    }
+
+    /// After [CpuState::Watch], run the rest of the writing instruction (a
+    /// single step of the whole instruction, which makes its writes again)
+    /// and return what the step returned. `logged` are the writes (address
+    /// and size) already taken with [Cpu::take_watch_hits]: each is skipped
+    /// once, and any other watched write the instruction makes is recorded
+    /// with its address, without halting.
+    #[must_use]
+    pub fn step_past_watch(&mut self, mem: &mut Mem, logged: Vec<(VAddr, u32)>) -> CpuState {
+        let pc = self.regs()[Self::PC];
+        if !self.watches.is_null() {
+            unsafe { &mut *self.watches }.begin_step(pc, logged);
+        }
+        let state = self.run_or_step(mem, None);
+        if !self.watches.is_null() {
+            unsafe { &mut *self.watches }.end_step();
+        }
+        state
+    }
+
     /// Start CPU execution.
     ///
     /// If `ticks` is [Some], it is used as an abstract time limit. The value
@@ -295,7 +524,11 @@ impl Cpu {
             -2 => CpuState::Error(CpuError::MemoryError),
             -3 => CpuState::Error(CpuError::UndefinedInstruction),
             -4 => CpuState::Error(CpuError::Breakpoint),
-            _ if res < -4 => panic!("Unexpected CPU execution result"),
+            -5 => {
+                CpuState::Hook(unsafe { touchHLE_DynarmicWrapper_hook_hit(self.dynarmic_wrapper) })
+            }
+            -6 => CpuState::Watch,
+            _ if res < -6 => panic!("Unexpected CPU execution result"),
             svc => CpuState::Svc(svc as u32),
         }
     }

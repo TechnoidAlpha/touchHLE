@@ -82,12 +82,15 @@
 //! `--dump-scene-every=N`, and is taken when the next frame is presented
 //! (see [trace_present_frame]).
 
+mod addr;
+mod coverage;
 mod peek;
 mod scene;
+mod watch;
 
 use super::{id, nil, Class, ClassHostObject, ObjC, IMP, SEL};
 use crate::abi::GuestFunction;
-use crate::cpu::Cpu;
+use crate::cpu::{Cpu, CpuState, WatchHit};
 use crate::dyld::HostFunction;
 use crate::frame_capture::{FrameCapture, FRAMES_DIR};
 use crate::frameworks::foundation::ns_string;
@@ -100,6 +103,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::hash::Hash;
 use std::io::{BufRead, BufReader, Write};
+use watch::{WatchEvent, WatchRowHead, WatchTarget};
 
 /// File in the user data directory listing selectors to trace.
 pub const TRACE_SELECTORS_FILE: &str = "trace_selectors.txt";
@@ -108,6 +112,13 @@ pub const TRACE_LOG_FILE: &str = "trace.log";
 /// File in the user data directory the touch log is written to, see
 /// [trace_touches].
 pub const INPUT_LOG_FILE: &str = "input.log";
+/// File in the user data directory listing address hooks, see [addr].
+pub const TRACE_ADDRESSES_FILE: &str = "trace_addresses.txt";
+/// File in the user data directory listing watchpoints, see [watch].
+pub const TRACE_WATCH_FILE: &str = "trace_watch.txt";
+/// With `--coverage`, `coverage.txt` is also written every this many
+/// presented frames, so a run that stops without exiting leaves one.
+const COVERAGE_EVERY_FRAMES: u32 = 1800;
 
 /// Which `objc_msgSend` variant a send came through. This decides where the
 /// receiver, selector and arguments sit in the registers.
@@ -277,6 +288,163 @@ pub struct MsgTrace {
     /// `--trace-rng`: write a row per random number draw and seed, see
     /// [trace_rng].
     rng: bool,
+    /// The address hooks (see [addr]), and the index of each by address.
+    hooks: Vec<AddrHook>,
+    hook_index: HashMap<u32, usize>,
+    /// `--coverage`: write `coverage.txt` (see [trace_write_coverage]).
+    coverage: bool,
+    /// The watchpoints (see [watch]), and the index of each by the CPU's
+    /// number for it.
+    watches: Vec<Watch>,
+    watch_by_cpu: HashMap<usize, usize>,
+}
+
+/// An address hook (see [addr]) and its peeks.
+struct AddrHook {
+    line: addr::HookLine,
+    peeks: Vec<Peek>,
+}
+
+/// A watchpoint (see [watch]) and where it stands.
+struct Watch {
+    line: watch::WatchLine,
+    /// The watched address and the CPU's number for the watch, once it is
+    /// set: at the start for a fixed address, at the first instance for a
+    /// `Class.ivar`.
+    armed: Option<(u32, usize)>,
+    /// The object of a `Class.ivar` watch, while armed.
+    object: Option<u32>,
+    /// Whether a failure to find the ivar has been logged.
+    failure_logged: bool,
+}
+
+/// The lines of an option's items (each item a line with `;` between its
+/// words, as an options file line cannot hold spaces in one option) and
+/// then of `file` in the user data directory, each with where it came
+/// from.
+fn option_and_file_lines(
+    items: &[String],
+    option: &'static str,
+    file: &'static str,
+) -> Vec<(&'static str, String)> {
+    let mut lines: Vec<(&'static str, String)> = items
+        .iter()
+        .map(|item| (option, item.replace(';', " ")))
+        .collect();
+    let path = crate::paths::user_data_base_path().join(file);
+    if let Ok(file_handle) = File::open(path) {
+        lines.extend(
+            BufReader::new(file_handle)
+                .lines()
+                .map_while(Result::ok)
+                .map(|line| (file, line)),
+        );
+    }
+    lines
+}
+
+/// The watchpoints asked for by `--trace-watch=` and `trace_watch.txt`.
+/// Lines that are not understood are logged (if `log_errors`) and skipped.
+fn watch_lines(options: &Options, log_errors: bool) -> Vec<watch::WatchLine> {
+    let mut parsed = Vec::new();
+    for (source, line) in
+        option_and_file_lines(&options.trace_watch, "--trace-watch=", TRACE_WATCH_FILE)
+    {
+        match watch::parse_watch_line(&line) {
+            Ok(Some(line)) => parsed.push(line),
+            Ok(None) => (),
+            Err(why) if log_errors => {
+                log!(
+                    "Warning: {} has a watch {:?} that is not understood, ignored: {}",
+                    source,
+                    line.trim(),
+                    why
+                );
+            }
+            Err(_) => (),
+        }
+    }
+    parsed
+}
+
+/// Whether the CPU must be made with precise halts (see
+/// [crate::cpu::Cpu::new]): when any watchpoint is asked for.
+pub fn trace_wants_precise_halts(options: &Options) -> bool {
+    !watch_lines(options, false).is_empty()
+}
+
+/// The address hooks asked for by `--trace-addresses=` and
+/// `trace_addresses.txt`, at most one per address (a second line for an
+/// address adds its instruction sets and peeks). Lines and words that are
+/// not understood are logged and skipped.
+fn hook_lines(options: &Options) -> Vec<AddrHook> {
+    let mut hooks: Vec<AddrHook> = Vec::new();
+    for (source, line) in option_and_file_lines(
+        &options.trace_addresses,
+        "--trace-addresses=",
+        TRACE_ADDRESSES_FILE,
+    ) {
+        let parsed = match addr::parse_hook_line(&line) {
+            Ok(Some(parsed)) => parsed,
+            Ok(None) => continue,
+            Err(why) => {
+                log!(
+                    "Warning: {} has a line {:?} that is not understood, ignored: {}",
+                    source,
+                    line.trim(),
+                    why
+                );
+                continue;
+            }
+        };
+        for (word, why) in &parsed.bad_peeks {
+            log!(
+                "Warning: {} has a peek {:?} (after {}) that is not understood, ignored: {}",
+                source,
+                word,
+                parsed.name,
+                why
+            );
+        }
+        for word in &parsed.unknown {
+            log!(
+                "Warning: {} has a word {:?} (after {}) that is neither a name nor a peek, ignored",
+                source,
+                word,
+                parsed.name
+            );
+        }
+        let new_peeks = |specs: &[PeekSpec]| -> Vec<Peek> {
+            specs
+                .iter()
+                .map(|spec| Peek {
+                    spec: spec.clone(),
+                    ivar_offsets: HashMap::new(),
+                    failure_logged: false,
+                })
+                .collect()
+        };
+        match hooks.iter_mut().find(|h| h.line.addr == parsed.addr) {
+            Some(hook) => {
+                hook.line.arm |= parsed.arm;
+                hook.line.thumb |= parsed.thumb;
+                for spec in &parsed.peeks {
+                    if hook.peeks.iter().all(|p| p.spec != *spec) {
+                        hook.line.peeks.push(spec.clone());
+                        hook.peeks.extend(new_peeks(std::slice::from_ref(spec)));
+                    }
+                }
+            }
+            None => {
+                let peeks = new_peeks(&parsed.peeks);
+                hooks.push(AddrHook {
+                    line: parsed,
+                    peeks,
+                });
+            }
+        }
+    }
+    hooks
 }
 
 /// The state of the scene dumps (see [scene] and [trace_present_frame]).
@@ -434,14 +602,26 @@ fn periodic_capture(capture_every: u32) -> String {
 impl MsgTrace {
     /// Gather the selectors from the option and the file, and open the log if
     /// there are any, or `--capture-frames=` or `--dump-scene-every=` is not
-    /// 0, or `--trace-rng` is on. At most `--capture-frames-max=` frames are
-    /// saved (0: no cap). Returns [None] when the trace is off.
+    /// 0, or `--trace-rng` or `--coverage` is on, or there are address hooks
+    /// or watchpoints. At most `--capture-frames-max=` frames are saved (0:
+    /// no cap). Returns [None] when the trace is off.
     fn open(options: &Options, bundle_id: &str) -> Option<MsgTrace> {
         let option_selectors = &options.trace_selectors;
         let capture_every = options.capture_frames;
         let capture_max = options.capture_frames_max;
         let scene_every = options.dump_scene_every;
         let rng = options.trace_rng;
+        let coverage = options.coverage;
+        let hooks = hook_lines(options);
+        let watches: Vec<Watch> = watch_lines(options, true)
+            .into_iter()
+            .map(|line| Watch {
+                line,
+                armed: None,
+                object: None,
+                failure_logged: false,
+            })
+            .collect();
         let base = crate::paths::user_data_base_path();
         // An item of the option is a line of the file with ';' between its
         // words (an options file line cannot hold spaces in one option).
@@ -535,7 +715,14 @@ impl MsgTrace {
                 }
             }
         }
-        if traced.is_empty() && capture_every == 0 && scene_every == 0 && !rng {
+        if traced.is_empty()
+            && capture_every == 0
+            && scene_every == 0
+            && !rng
+            && hooks.is_empty()
+            && !coverage
+            && watches.is_empty()
+        {
             return None;
         }
         let png_after: Vec<&str> = list
@@ -561,6 +748,32 @@ impl MsgTrace {
                 return None;
             }
         };
+        let instrument_lines: String = [
+            "# origin addr: an address hook (trace_addresses.txt): variant arm or\n",
+            "# thumb, the hook's name in selector, r0 and r1 in arg0 and arg1, the\n",
+            "# stack words in sp0-sp3, lr, the hooked address in self, then r2, r3,\n",
+            "# sp and the hook's peeks (its '# addr' line names them); written\n",
+            "# before the instruction at the address runs\n",
+            "# origin watch: a write to a watched field (trace_watch.txt): variant\n",
+            "# write, arm or disarm, the type in class, the name in selector, the\n",
+            "# field's address in arg0, the old value in arg0_f32, the object in\n",
+            "# arg1, the new value in arg1_f32, the write's address and size in sp0\n",
+            "# and sp1, the old and new bytes in sp2 and sp3, lr, and the writing\n",
+            "# instruction's address in self\n",
+        ]
+        .concat()
+            + &format!(
+                "# coverage (coverage.txt): {}\n",
+                if coverage { "on" } else { "off" }
+            )
+            + &hooks
+                .iter()
+                .map(|hook| addr::hook_header_line(&hook.line))
+                .collect::<String>()
+            + &watches
+                .iter()
+                .map(|w| watch::watch_header_line(&w.line))
+                .collect::<String>();
         let peek_lines: String = peek_sets
             .iter()
             .map(|set| {
@@ -612,7 +825,7 @@ impl MsgTrace {
                 scene_after.join(",")
             },
             if rng { "on" } else { "off" },
-            peek_lines,
+            instrument_lines + &peek_lines,
         );
         if let Err(e) = out.write_all(header.as_bytes()) {
             log!("Warning: could not write {}: {}", path.display(), e);
@@ -667,6 +880,15 @@ impl MsgTrace {
                 ..SceneDumps::default()
             },
             rng,
+            hook_index: hooks
+                .iter()
+                .enumerate()
+                .map(|(index, hook)| (hook.line.addr, index))
+                .collect(),
+            hooks,
+            coverage,
+            watches,
+            watch_by_cpu: HashMap::new(),
         })
     }
 }
@@ -780,9 +1002,17 @@ fn capture_due(frame: u32, every: u32, pending: bool) -> bool {
 pub fn trace_present_frame(env: &mut Environment) -> Option<FrameCaptureTicket> {
     let elapsed = env.startup_time.elapsed();
     let ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX);
+    // Store-exclusive writes to a watched field do not halt the CPU, so
+    // they wait here.
+    let pending = env.cpu.take_watch_hits();
+    write_watch_hits(env, &pending, None);
     let trace = env.objc.trace.as_mut()?;
     let frame = trace.frame;
     trace.frame = trace.frame.wrapping_add(1);
+    if trace.coverage && frame > 0 && frame.is_multiple_of(COVERAGE_EVERY_FRAMES) {
+        trace_write_coverage(env, "periodic");
+    }
+    let trace = env.objc.trace.as_mut()?;
     if let Some(reason) = scene_due(frame, trace.scene.every, &mut trace.scene.pending) {
         // The picture goes with the dump.
         trace.capture_pending = true;
@@ -962,6 +1192,7 @@ const FINISH_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
 /// [FINISH_WAIT]. A stop that does not go through that path (a crash, a
 /// killed process) can still lose the last few frames.
 pub fn trace_finish(env: &mut Environment) {
+    trace_write_coverage(env, "exit");
     let Some(trace) = env.objc.trace.as_mut() else {
         return;
     };
@@ -1225,10 +1456,33 @@ fn peek_columns(env: &mut Environment, set: usize, words: [u32; 3]) -> String {
         return String::new();
     };
     let PeekSet { selector, peeks } = &mut trace.peek_sets[set];
+    let base_of = |base: PeekBase| match base {
+        PeekBase::Receiver => words[0],
+        PeekBase::Arg0 => words[1],
+        PeekBase::Arg1 => words[2],
+        // Not taken by the parser for a selector.
+        PeekBase::Reg(_) | PeekBase::Sp | PeekBase::Addr(_) => 0,
+    };
+    let columns = peek_values(&env.objc, &env.mem, selector, peeks, &base_of);
+    env.objc.trace = Some(trace);
+    columns
+}
+
+/// A tab and a value per peek of `peeks`, or a tab and `-` for one that
+/// cannot be read (logged once per peek, naming `owner`, the selector or
+/// hook it belongs to). `base_of` gives the word a base stands for. Only
+/// reads guest memory and the class table.
+fn peek_values(
+    objc: &ObjC,
+    mem: &Mem,
+    owner: &str,
+    peeks: &mut [Peek],
+    base_of: &dyn Fn(PeekBase) -> u32,
+) -> String {
     let mut columns = String::new();
     for peek in peeks.iter_mut() {
         columns.push('\t');
-        match read_peek(&env.objc, &env.mem, peek, words) {
+        match read_peek(objc, mem, peek, base_of) {
             Ok(value) => columns.push_str(&value),
             Err(why) => {
                 columns.push('-');
@@ -1237,14 +1491,13 @@ fn peek_columns(env: &mut Environment, set: usize, words: [u32; 3]) -> String {
                     log!(
                         "Message trace: peek {} of {} could not be read ({}), its column shows - (logged once)",
                         peek.spec.text,
-                        selector,
+                        owner,
                         why
                     );
                 }
             }
         }
     }
-    env.objc.trace = Some(trace);
     columns
 }
 
@@ -1288,15 +1541,16 @@ fn ivar_offset(objc: &ObjC, mem: &Mem, class: Class, name: &str) -> Option<Optio
 
 /// Follow a peek's path from `words` (self, arg0, arg1) and read its value,
 /// written as its column shows it, or say why it cannot be read.
-fn read_peek(objc: &ObjC, mem: &Mem, peek: &mut Peek, words: [u32; 3]) -> Result<String, String> {
+fn read_peek(
+    objc: &ObjC,
+    mem: &Mem,
+    peek: &mut Peek,
+    base_of: &dyn Fn(PeekBase) -> u32,
+) -> Result<String, String> {
     let Peek {
         spec, ivar_offsets, ..
     } = peek;
-    let base = words[match spec.base {
-        PeekBase::Receiver => 0,
-        PeekBase::Arg0 => 1,
-        PeekBase::Arg1 => 2,
-    }];
+    let base = base_of(spec.base);
     // The object the path is in, and the address it has reached.
     let mut object = base;
     let mut addr = base;
@@ -1495,6 +1749,405 @@ pub fn trace_rng(
         seed_ptr,
     );
     let _ = trace.out.write_all(row.as_bytes());
+}
+
+/// Called when the CPU set up for the hooks, coverage and watchpoints of
+/// the trace, once it is open: sets the hooks and the watchpoints on fixed
+/// addresses, and turns coverage on.
+pub fn trace_start_instruments(env: &mut Environment) {
+    let Some(mut trace) = env.objc.trace.take() else {
+        return;
+    };
+    let mut set = 0;
+    for hook in &trace.hooks {
+        if env
+            .cpu
+            .set_hook(hook.line.addr, hook.line.arm, hook.line.thumb)
+        {
+            set += 1;
+        }
+    }
+    if set < trace.hooks.len() {
+        log!("Warning: address hooks cannot work here (direct memory access with no null page), none is set");
+    } else if set > 0 {
+        log!("Address hooks on: {} address(es)", set);
+    }
+    if trace.coverage {
+        env.cpu.set_coverage(true);
+        log!(
+            "Coverage on, written to {} at exit, with F8, and every {} frames",
+            coverage::COVERAGE_FILE,
+            COVERAGE_EVERY_FRAMES
+        );
+    }
+    let MsgTrace {
+        watches,
+        watch_by_cpu,
+        ..
+    } = &mut trace;
+    for (index, w) in watches.iter_mut().enumerate() {
+        if let WatchTarget::Addr(addr) = w.line.target {
+            let id = env.cpu.watch(addr, w.line.ty.size());
+            w.armed = Some((addr, id));
+            watch_by_cpu.insert(id, index);
+        }
+    }
+    if !watches.is_empty() {
+        log!(
+            "Watchpoints on: {} ({} on fixed addresses, the others wait for an instance)",
+            watches.len(),
+            watch_by_cpu.len()
+        );
+    }
+    env.objc.trace = Some(trace);
+}
+
+/// The four words at `sp`, or zeros if they cannot be read.
+fn stack_words(mem: &Mem, sp: u32) -> [u32; 4] {
+    let mut stack = [0u32; 4];
+    for (i, word) in stack.iter_mut().enumerate() {
+        *word = sp
+            .checked_add(4 * i as u32)
+            .and_then(|addr| read_guest_word(mem, addr).ok())
+            .unwrap_or(0);
+    }
+    stack
+}
+
+/// Called when the CPU stops at a hooked address `pc` ([CpuState::Hook]):
+/// writes the hook's `addr` row (see [addr::hook_row]), with its peeks
+/// read from the registers and memory as they are before the instruction
+/// runs. Only reads memory and the class table.
+pub fn trace_addr_hook(env: &mut Environment, pc: u32) {
+    let elapsed_ms = env.startup_time.elapsed().as_secs_f64() * 1000.0;
+    let thread = env.current_thread;
+    let regs = *env.cpu.regs();
+    let thumb = (env.cpu.cpsr() & Cpu::CPSR_THUMB) != 0;
+    let stack = stack_words(&env.mem, regs[Cpu::SP]);
+    let Some(mut trace) = env.objc.trace.take() else {
+        return;
+    };
+    if let Some(&index) = trace.hook_index.get(&pc) {
+        let frame = trace.frame;
+        let AddrHook { line, peeks } = &mut trace.hooks[index];
+        let base_of = |base: PeekBase| match base {
+            PeekBase::Reg(n) => regs[usize::from(n)],
+            PeekBase::Sp => regs[Cpu::SP],
+            PeekBase::Addr(addr) => addr,
+            // Not taken by the parser for a hook.
+            PeekBase::Receiver | PeekBase::Arg0 | PeekBase::Arg1 => 0,
+        };
+        let peeked = peek_values(&env.objc, &env.mem, &line.name, peeks, &base_of);
+        let row = addr::hook_row(
+            &addr::HookHit {
+                frame,
+                ms: elapsed_ms,
+                thread,
+                name: &line.name,
+                thumb,
+                regs,
+                stack,
+                peeks: &peeked,
+            },
+            fmt_f32,
+        );
+        let _ = trace.out.write_all(row.as_bytes());
+    }
+    env.objc.trace = Some(trace);
+}
+
+/// Called when the CPU stops on a write to a watched field
+/// ([CpuState::Watch]): the PC is the writing instruction's. Runs the rest
+/// of that instruction (see [Cpu::step_past_watch]), writes a `watch` row
+/// per write it made to a watched field, and returns what the step
+/// returned.
+pub fn trace_watch_halt(env: &mut Environment) -> CpuState {
+    let regs = *env.cpu.regs();
+    let mut hits = env.cpu.take_watch_hits();
+    let mut logged = Vec::new();
+    for hit in &mut hits {
+        if hit.pc.is_none() && !hit.exclusive {
+            hit.pc = Some(regs[Cpu::PC]);
+            logged.push((hit.addr, hit.size));
+        }
+    }
+    let state = env.cpu.step_past_watch(&mut env.mem, logged);
+    hits.extend(env.cpu.take_watch_hits());
+    write_watch_hits(env, &hits, Some(regs[Cpu::LR]));
+    state
+}
+
+/// Write a `watch` row (see [watch::watch_row]) per hit. `lr` is the link
+/// register when the writing instruction ran, if known; a store-exclusive's
+/// row has neither it nor the instruction.
+fn write_watch_hits(env: &mut Environment, hits: &[WatchHit], lr: Option<u32>) {
+    if hits.is_empty() {
+        return;
+    }
+    let elapsed_ms = env.startup_time.elapsed().as_secs_f64() * 1000.0;
+    let thread = env.current_thread;
+    let Some(trace) = env.objc.trace.as_mut() else {
+        return;
+    };
+    let mut rows = String::new();
+    for hit in hits {
+        let Some(&index) = trace.watch_by_cpu.get(&hit.watch) else {
+            continue;
+        };
+        let w = &trace.watches[index];
+        let Some((field, _)) = w.armed else {
+            continue;
+        };
+        let head = WatchRowHead {
+            frame: trace.frame,
+            ms: elapsed_ms,
+            thread,
+            name: &w.line.name,
+            ty: w.line.ty,
+            field,
+            object: w.object,
+        };
+        rows.push_str(&watch::watch_row(
+            &head,
+            &WatchEvent::Write {
+                addr: hit.addr,
+                size: hit.size,
+                old: hit.old,
+                new: hit.new,
+                pc: hit.pc,
+                lr: if hit.exclusive { None } else { lr },
+            },
+        ));
+    }
+    let _ = trace.out.write_all(rows.as_bytes());
+}
+
+/// Called by `+[NSObject allocWithZone:]` with each new object. A
+/// `Class.ivar` watchpoint that is waiting for an instance, of a class on
+/// the object's class chain, starts on this object's ivar, with an `arm`
+/// row. Costs one check per allocation unless such a watch is waiting.
+pub fn trace_note_alloc(env: &mut Environment, object: id) {
+    let waiting = env.objc.trace.as_ref().is_some_and(|trace| {
+        trace
+            .watches
+            .iter()
+            .any(|w| w.armed.is_none() && matches!(w.line.target, WatchTarget::Ivar { .. }))
+    });
+    if !waiting || object == nil {
+        return;
+    }
+    let class = ObjC::read_isa(object, &env.mem);
+    let chain = class_chain_names(&env.objc, class);
+    let elapsed_ms = env.startup_time.elapsed().as_secs_f64() * 1000.0;
+    let thread = env.current_thread;
+    let Some(mut trace) = env.objc.trace.take() else {
+        return;
+    };
+    let frame = trace.frame;
+    let MsgTrace {
+        watches,
+        watch_by_cpu,
+        out,
+        ..
+    } = &mut trace;
+    for (index, w) in watches.iter_mut().enumerate() {
+        let WatchTarget::Ivar {
+            class: wanted,
+            ivar,
+            offset,
+        } = &w.line.target
+        else {
+            continue;
+        };
+        if w.armed.is_some() || !chain.iter().any(|name| name == wanted) {
+            continue;
+        }
+        let ivar_at = match ivar_offset(&env.objc, &env.mem, class, ivar) {
+            Some(Some(ivar_at)) => ivar_at,
+            _ => {
+                if !std::mem::replace(&mut w.failure_logged, true) {
+                    log!(
+                        "Watchpoint {}: {} has no ivar {} (logged once)",
+                        w.line.name,
+                        class_name_for_trace(&env.objc, class),
+                        ivar
+                    );
+                }
+                continue;
+            }
+        };
+        let field = object.to_bits().wrapping_add(ivar_at).wrapping_add(*offset);
+        let size = w.line.ty.size();
+        let id = env.cpu.watch(field, size);
+        w.armed = Some((field, id));
+        w.object = Some(object.to_bits());
+        watch_by_cpu.insert(id, index);
+        let head = WatchRowHead {
+            frame,
+            ms: elapsed_ms,
+            thread,
+            name: &w.line.name,
+            ty: w.line.ty,
+            field,
+            object: w.object,
+        };
+        let value = crate::cpu::read_le(&env.mem, field, size);
+        let row = watch::watch_row(&head, &WatchEvent::Arm { value });
+        let _ = out.write_all(row.as_bytes());
+    }
+    env.objc.trace = Some(trace);
+}
+
+/// Called by `-[NSObject dealloc]` before the object is freed. A
+/// `Class.ivar` watchpoint on this object stops (with a `disarm` row) and
+/// waits for the next instance.
+pub fn trace_note_dealloc(env: &mut Environment, object: id) {
+    let watched = env.objc.trace.as_ref().is_some_and(|trace| {
+        trace
+            .watches
+            .iter()
+            .any(|w| w.object == Some(object.to_bits()))
+    });
+    if !watched {
+        return;
+    }
+    let elapsed_ms = env.startup_time.elapsed().as_secs_f64() * 1000.0;
+    let thread = env.current_thread;
+    let Some(mut trace) = env.objc.trace.take() else {
+        return;
+    };
+    let frame = trace.frame;
+    let MsgTrace {
+        watches,
+        watch_by_cpu,
+        out,
+        ..
+    } = &mut trace;
+    for w in watches.iter_mut() {
+        if w.object != Some(object.to_bits()) {
+            continue;
+        }
+        if let Some((field, id)) = w.armed.take() {
+            env.cpu.unwatch(id);
+            watch_by_cpu.remove(&id);
+            let head = WatchRowHead {
+                frame,
+                ms: elapsed_ms,
+                thread,
+                name: &w.line.name,
+                ty: w.line.ty,
+                field,
+                object: w.object,
+            };
+            let row = watch::watch_row(&head, &WatchEvent::Disarm);
+            let _ = out.write_all(row.as_bytes());
+        }
+        w.object = None;
+    }
+    env.objc.trace = Some(trace);
+}
+
+/// Write `coverage.txt` (see [coverage]) if `--coverage` is on: the
+/// instructions of the app binary the JIT has translated so far, merged
+/// into ranges, each with its section. `reason` (`exit`, `key F8`,
+/// `periodic`) goes in the header. The file is replaced each time.
+pub fn trace_write_coverage(env: &mut Environment, reason: &str) {
+    static OFF_LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    let elapsed_ms = env.startup_time.elapsed().as_secs_f64() * 1000.0;
+    let frame = match env.objc.trace.as_ref() {
+        Some(trace) if trace.coverage => trace.frame,
+        _ => {
+            if reason == "key F8" && !OFF_LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                log!("Coverage not written: --coverage is off (logged once)");
+            }
+            return;
+        }
+    };
+    let Some(addresses) = env.cpu.coverage().cloned() else {
+        return;
+    };
+    let sections: Vec<(u32, u32, String)> = env
+        .bins
+        .first()
+        .map(|bin| {
+            bin.sections
+                .iter()
+                .map(|s| (s.addr, s.size, s.name.clone()))
+                .collect()
+        })
+        .unwrap_or_default();
+    let section_of = |addr: u32| {
+        sections
+            .iter()
+            .find(|&&(start, size, _)| addr >= start && addr - start < size)
+            .map(|(_, _, name)| name.as_str())
+    };
+    let mut instructions = Vec::new();
+    let mut outside = 0usize;
+    for word in addresses {
+        let thumb = word & 1 == 1;
+        let addr = word & !1;
+        if section_of(addr).is_none() {
+            outside += 1;
+            continue;
+        }
+        let size = if thumb {
+            read_guest_bytes(&env.mem, addr, 2)
+                .map(|b| coverage::thumb_size(u16::from_le_bytes([b[0], b[1]])))
+                .unwrap_or(2)
+        } else {
+            4
+        };
+        instructions.push((addr, size, thumb));
+    }
+    let count = instructions.len();
+    let ranges = coverage::merge(instructions);
+    let ranges: Vec<(coverage::CoverageRange, &str)> = ranges
+        .into_iter()
+        .map(|range| {
+            let section = section_of(range.start).unwrap_or("?");
+            (range, section)
+        })
+        .collect();
+    let header = vec![
+        format!(
+            "touchHLE {}{}{} coverage",
+            crate::branding(),
+            if crate::branding().is_empty() {
+                ""
+            } else {
+                " "
+            },
+            crate::VERSION
+        ),
+        format!("app: {}", env.bundle.bundle_identifier()),
+        format!("written: {reason}, at frame {frame}, ms {elapsed_ms:.3}"),
+        "the instructions of the app binary the JIT translated at least once,".to_string(),
+        "merged into ranges: start (included) and end (not included), the".to_string(),
+        "instruction set, the binary's section; a translated instruction ran,".to_string(),
+        "or was skipped by its condition inside a block that ran".to_string(),
+        format!(
+            "instructions={count} ranges={} outside_the_app={outside}",
+            ranges.len()
+        ),
+    ];
+    let text = coverage::coverage_text(&header, &ranges);
+    let path = crate::paths::user_data_base_path().join(coverage::COVERAGE_FILE);
+    match std::fs::write(&path, text) {
+        Ok(()) if reason != "periodic" => {
+            log!(
+                "Coverage ({}): {} instructions in {} ranges written to {}",
+                reason,
+                count,
+                ranges.len(),
+                path.display()
+            );
+        }
+        Ok(()) => (),
+        Err(e) => {
+            log!("Warning: could not write {}: {}", path.display(), e);
+        }
+    }
 }
 
 /// One `trace.log` row for a scene dump: the frame, ms and thread as for

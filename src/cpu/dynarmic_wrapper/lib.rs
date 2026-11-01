@@ -52,6 +52,7 @@ extern "C" {
     pub fn touchHLE_DynarmicWrapper_new(
         dynamic_memory_access_ptr: *mut std::ffi::c_void,
         null_page_count: usize,
+        precise_halts: bool,
     ) -> *mut touchHLE_DynarmicWrapper;
     pub fn touchHLE_DynarmicWrapper_delete(cpu: *mut touchHLE_DynarmicWrapper);
     pub fn touchHLE_DynarmicWrapper_regs_const(cpu: *const touchHLE_DynarmicWrapper) -> *const u32;
@@ -73,4 +74,30 @@ extern "C" {
         ticks: Option<&mut u64>,
     ) -> i32;
 
+    pub fn touchHLE_DynarmicWrapper_hooks_usable(cpu: *const touchHLE_DynarmicWrapper) -> bool;
+    pub fn touchHLE_DynarmicWrapper_set_hook(
+        cpu: *mut touchHLE_DynarmicWrapper,
+        pc: VAddr,
+        modes: u8,
+    );
+    pub fn touchHLE_DynarmicWrapper_hook_hit(cpu: *const touchHLE_DynarmicWrapper) -> VAddr;
+    pub fn touchHLE_DynarmicWrapper_begin_hook_skip(cpu: *mut touchHLE_DynarmicWrapper, pc: VAddr);
+    pub fn touchHLE_DynarmicWrapper_end_hook_skip(cpu: *mut touchHLE_DynarmicWrapper) -> bool;
+
+    pub fn touchHLE_DynarmicWrapper_set_coverage(cpu: *mut touchHLE_DynarmicWrapper, on: bool);
+    pub fn touchHLE_DynarmicWrapper_coverage_drain(
+        cpu: *mut touchHLE_DynarmicWrapper,
+        out: *mut u32,
+        capacity: usize,
+    ) -> usize;
+
+    pub fn touchHLE_DynarmicWrapper_set_watches(
+        cpu: *mut touchHLE_DynarmicWrapper,
+        watches: *mut std::ffi::c_void,
+    );
+    pub fn touchHLE_DynarmicWrapper_watch_page(
+        cpu: *mut touchHLE_DynarmicWrapper,
+        page: u32,
+        watch: bool,
+    );
 }

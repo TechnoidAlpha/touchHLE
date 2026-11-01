@@ -518,10 +518,15 @@ impl Environment {
         let mut dyld = dyld::Dyld::new();
         dyld.do_initial_linking(&bins, &mut mem, &mut objc);
 
-        let cpu = cpu::Cpu::new(match options.direct_memory_access {
-            true => Some(&mut mem),
-            false => None,
-        });
+        // Watchpoints need the CPU made with precise halts.
+        let precise_halts = crate::objc::trace_wants_precise_halts(&options);
+        let cpu = cpu::Cpu::new(
+            match options.direct_memory_access {
+                true => Some(&mut mem),
+                false => None,
+            },
+            precise_halts,
+        );
 
         let main_thread_init_routine = Coroutine::new(move |yielder, mut env: Environment| {
             let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -700,6 +705,7 @@ impl Environment {
         // selectors were chosen.
         env.objc
             .start_trace(&env.options, env.bundle.bundle_identifier());
+        crate::objc::trace_start_instruments(&mut env);
         if let Some(path) = env.options.rng_replay.clone() {
             env.libc_state.stdlib.start_replay(&path);
         }
@@ -790,10 +796,13 @@ impl Environment {
         let mut dyld = dyld::Dyld::new();
         dyld.do_initial_linking_with_no_bins(&mut mem, &mut objc);
 
-        let cpu = cpu::Cpu::new(match options.direct_memory_access {
-            true => Some(&mut mem),
-            false => None,
-        });
+        let cpu = cpu::Cpu::new(
+            match options.direct_memory_access {
+                true => Some(&mut mem),
+                false => None,
+            },
+            /* precise_halts: */ false,
+        );
 
         let main_thread = Thread {
             state: ThreadState::Running,
@@ -1644,6 +1653,16 @@ impl Environment {
                 }
             }
             cpu::CpuState::Error(e) => ThreadNextAction::DebugCpuError(e),
+            cpu::CpuState::Hook(pc) => {
+                // The trace's row, then the hooked instruction.
+                crate::objc::trace_addr_hook(self, pc);
+                let state = self.cpu.step_past_hook(&mut self.mem, pc);
+                self.handle_cpu_state(state)
+            }
+            cpu::CpuState::Watch => {
+                let state = crate::objc::trace_watch_halt(self);
+                self.handle_cpu_state(state)
+            }
         }
     }
 

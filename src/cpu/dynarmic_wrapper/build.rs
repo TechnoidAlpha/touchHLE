@@ -53,7 +53,7 @@ fn main() {
     // Allow providing Boost manually regardless of what platform we're on
     // (or whether the target platform was detected correctly…)
     if boost_path.is_dir() {
-        build.define("Boost_INCLUDE_DIR", boost_path);
+        build.define("Boost_INCLUDE_DIR", &boost_path);
     }
     // Prevent CMake from using macOS-only linker commands when cross-compiling
     // for Android.
@@ -125,11 +125,31 @@ fn main() {
     //rerun_if_changed(&dynarmic_root);
     rerun_if_changed(&workspace_root.join(".git/modules/dynarmic/HEAD"));
 
-    cc::Build::new()
+    // lib.cpp emits IR for the address hooks (see src/cpu.rs), so it needs
+    // dynarmic's IR headers, which need C++20, mcl, fmt and Boost.
+    let mut wrapper = cc::Build::new();
+    wrapper
         .file(package_root.join("lib.cpp"))
         .cpp(true)
-        .std("c++17")
+        .std("c++20")
         .include(dynarmic_out.join("include"))
-        .compile("dynarmic_wrapper");
+        .include(dynarmic_root.join("externals/mcl/include"))
+        .include(dynarmic_root.join("externals/fmt/include"));
+    if boost_path.is_dir() {
+        wrapper.include(&boost_path);
+    }
+    // Homebrew's Boost, which dynarmic's CMake build finds by itself, is not
+    // on the compiler's default include path.
+    for prefix in ["/opt/homebrew/include", "/usr/local/include"] {
+        if Path::new(prefix).join("boost").is_dir() {
+            wrapper.include(prefix);
+        }
+    }
+    let target_env = env::var("CARGO_CFG_TARGET_ENV").unwrap_or_default();
+    if target_env == "msvc" {
+        // fmt's headers insist on it.
+        wrapper.flag("/utf-8");
+    }
+    wrapper.compile("dynarmic_wrapper");
     rerun_if_changed(&package_root.join("lib.cpp"));
 }

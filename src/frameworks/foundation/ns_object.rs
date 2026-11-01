@@ -37,7 +37,10 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 + (id)allocWithZone:(NSZonePtr)_zone { // struct _NSZone*
     log_dbg!("[{:?} allocWithZone:]", this);
-    env.objc.alloc_object(this, Box::new(TrivialHostObject), &mut env.mem)
+    let object = env.objc.alloc_object(this, Box::new(TrivialHostObject), &mut env.mem);
+    // A watchpoint of the message trace may wait for an instance.
+    crate::objc::trace_note_alloc(env, object);
+    object
 }
 
 + (id)new {
@@ -132,6 +135,7 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 - (())dealloc {
     log_dbg!("[{:?} dealloc]", this);
+    crate::objc::trace_note_dealloc(env, this);
     env.objc.dealloc_object(this, &mut env.mem)
 }
 

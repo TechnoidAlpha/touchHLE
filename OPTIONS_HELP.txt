@@ -325,6 +325,36 @@ Debugging options:
         an "rng" row of a trace.log (seed rows are skipped); # starts a
         comment. When the values run out, the generated ones are used.
 
+    --trace-addresses=...
+        Writes a row of origin "addr" to trace.log every time the app's
+        code reaches one of the listed guest addresses, without pausing:
+        the registers r0 to r3, sp, lr, four stack words and any peeks. An
+        item is an address in hex (odd for Thumb code), optionally "arm" or
+        "thumb", a name and peeks that start at r0 to r3, sp or a hex
+        address, with ";" between its words, for example
+        --trace-addresses=6c1c;thumb;asbs;r2:f32. Hooks can also be listed
+        one per line, with spaces, in trace_addresses.txt in the user data
+        directory. This turns the message trace on even with no selectors.
+
+    --coverage
+        Writes every instruction address of the app binary that ran (that
+        the JIT translated) to coverage.txt in the user data directory, as
+        address ranges: at exit, every 1800 presented frames, and when F8
+        is pressed. This turns the message trace on even with no selectors.
+
+    --trace-watch=...
+        Writes a row of origin "watch" to trace.log for every write the
+        app's code makes to a watched field: the value before and after,
+        the address of the writing instruction and the link register. An
+        item is a hex address or Class.ivar (the first live instance of
+        that class), a colon and a type (u8, i8, u16, i16, u32, i32, f32,
+        ptr, u64, i64 or f64), and optionally a name after ";", for example
+        --trace-watch=SharedData.totalGold:f32;gold. Watches can also be
+        listed one per line, with spaces, in trace_watch.txt in the user
+        data directory. Writes made by touchHLE itself (memcpy and the
+        like) are not seen. This turns the message trace on even with no
+        selectors.
+
 Other options:
     --preferred-languages=...
         Specifies a list of preferred languages to be reported to the app.

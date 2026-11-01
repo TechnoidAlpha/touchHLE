@@ -64,7 +64,10 @@ use properties::{ivar_list_t, objc_copyStruct, objc_getProperty, objc_setPropert
 use selectors::sel_registerName;
 use synchronization::{objc_sync_enter, objc_sync_exit};
 
-pub use trace::trace_request_scene_dump;
+pub use trace::{
+    trace_addr_hook, trace_note_alloc, trace_note_dealloc, trace_request_scene_dump,
+    trace_start_instruments, trace_wants_precise_halts, trace_watch_halt, trace_write_coverage,
+};
 
 /// Typedef for `NSZone *`. This is a [fossil type] found in the signature of
 /// `allocWithZone:` and similar methods. Its value is always ignored.

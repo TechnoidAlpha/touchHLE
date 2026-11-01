@@ -82,6 +82,17 @@ pub struct Options {
     /// directory) instead of generated random numbers. See
     /// src/libc/stdlib/rng.rs.
     pub rng_replay: Option<PathBuf>,
+    /// `--trace-addresses=`: address hooks for the message trace, each item
+    /// a line of `trace_addresses.txt` with `;` between its words. See
+    /// src/objc/trace/addr.rs.
+    pub trace_addresses: Vec<String>,
+    /// `--coverage`: write the instructions the JIT translated to
+    /// `coverage.txt`. See src/objc/trace/coverage.rs.
+    pub coverage: bool,
+    /// `--trace-watch=`: watchpoints for the message trace, each item a line
+    /// of `trace_watch.txt` with `;` between its words. See
+    /// src/objc/trace/watch.rs.
+    pub trace_watch: Vec<String>,
     /// `--bundle-files-ignore-case`, see
     /// [crate::fs::Fs::set_bundle_files_ignore_case].
     pub bundle_files_ignore_case: bool,
@@ -124,6 +135,9 @@ impl Default for Options {
             dump_scene_every: 0,
             trace_rng: false,
             rng_replay: None,
+            trace_addresses: Vec::new(),
+            coverage: false,
+            trace_watch: Vec::new(),
             bundle_files_ignore_case: false,
         }
     }
@@ -304,6 +318,24 @@ impl Options {
             self.trace_rng = true;
         } else if let Some(path) = arg.strip_prefix("--rng-replay=") {
             self.rng_replay = Some(crate::paths::user_data_base_path().join(path));
+        } else if let Some(values) = arg.strip_prefix("--trace-addresses=") {
+            self.trace_addresses.extend(
+                values
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(String::from),
+            );
+        } else if arg == "--coverage" {
+            self.coverage = true;
+        } else if let Some(values) = arg.strip_prefix("--trace-watch=") {
+            self.trace_watch.extend(
+                values
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(String::from),
+            );
         } else if arg == "--bundle-files-ignore-case" {
             self.bundle_files_ignore_case = true;
         } else if arg == "--ignore-gl-errors" {
