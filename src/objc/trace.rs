@@ -81,11 +81,18 @@
 //! of `trace_selectors.txt`, and every Nth frame with
 //! `--dump-scene-every=N`, and is taken when the next frame is presented
 //! (see [trace_present_frame]).
+//!
+//! An input script (see [script]), from `--input-script=` or
+//! `input_script.txt`, plays touches at chosen frames through the window's
+//! event queue, so they reach the app (and `input.log`) like real ones,
+//! waits on a field's value, and can quit; each command writes a row with
+//! origin `input` (see [run_script]). `--quit-at-frame=` quits on its own.
 
 mod addr;
 mod coverage;
 mod peek;
 mod scene;
+mod script;
 mod state;
 mod watch;
 
@@ -97,7 +104,7 @@ use crate::frame_capture::{FrameCapture, FRAMES_DIR};
 use crate::frameworks::foundation::ns_string;
 use crate::mem::{ConstPtr, ConstVoidPtr, GuestUSize, Mem, Ptr};
 use crate::options::Options;
-use crate::window::{Coords, FingerId};
+use crate::window::{Coords, Event, FingerId};
 use crate::Environment;
 use peek::{PeekBase, PeekSpec, PeekStep, PeekType};
 use std::collections::{HashMap, HashSet};
@@ -117,6 +124,9 @@ pub const INPUT_LOG_FILE: &str = "input.log";
 pub const TRACE_ADDRESSES_FILE: &str = "trace_addresses.txt";
 /// File in the user data directory listing watchpoints, see [watch].
 pub const TRACE_WATCH_FILE: &str = "trace_watch.txt";
+/// File in the user data directory read as the input script when
+/// `--input-script=` is not given, see [script].
+pub const INPUT_SCRIPT_FILE: &str = "input_script.txt";
 /// With `--coverage`, `coverage.txt` is also written every this many
 /// presented frames, so a run that stops without exiting leaves one.
 const COVERAGE_EVERY_FRAMES: u32 = 1800;
@@ -300,6 +310,17 @@ pub struct MsgTrace {
     watch_by_cpu: HashMap<usize, usize>,
     /// The state stream (see [state]), if `--state-every=` is not 0.
     state: Option<StateOut>,
+    /// The input script and `--quit-at-frame=` (see [script]), if either
+    /// is set.
+    script: Option<ScriptState>,
+}
+
+/// The input script and the static variables its waits found objects in.
+struct ScriptState {
+    script: script::Script,
+    /// Per class name: the address of the static variable that pointed at
+    /// an instance last time, see [scene::find_singleton].
+    slots: HashMap<String, Option<u32>>,
 }
 
 /// The state stream's file and what it keeps between snapshots.
@@ -625,6 +646,7 @@ impl MsgTrace {
         let rng = options.trace_rng;
         let coverage = options.coverage;
         let state_every = options.state_every;
+        let (script, script_line) = open_script(options);
         let hooks = hook_lines(options);
         let watches: Vec<Watch> = watch_lines(options, true)
             .into_iter()
@@ -736,6 +758,7 @@ impl MsgTrace {
             && !coverage
             && watches.is_empty()
             && state_every == 0
+            && script.is_none()
         {
             return None;
         }
@@ -774,8 +797,12 @@ impl MsgTrace {
             "# arg1, the new value in arg1_f32, the write's address and size in sp0\n",
             "# and sp1, the old and new bytes in sp2 and sp3, lr, and the writing\n",
             "# instruction's address in self\n",
+            "# origin input: a command of the input script, as written, in the\n",
+            "# selector column (': up' for a tap's up, ': waiting', ': passed' and\n",
+            "# ': timed out' for a wait); its touches are in input.log\n",
         ]
         .concat()
+            + &script_line
             + &format!(
                 "# coverage (coverage.txt): {}\n",
                 if coverage { "on" } else { "off" }
@@ -912,8 +939,180 @@ impl MsgTrace {
             watches,
             watch_by_cpu: HashMap::new(),
             state: open_state(options, bundle_id),
+            script: script.map(|script| ScriptState {
+                script,
+                slots: HashMap::new(),
+            }),
         })
     }
+}
+
+/// The input script (see [script]): the file of `--input-script=`, or else
+/// `input_script.txt` in the user data directory if it is there, with
+/// `--quit-at-frame=`, and the trace header's line for it. [None] if there
+/// is neither a script nor `--quit-at-frame=`. Lines that are not
+/// understood are logged and skipped.
+fn open_script(options: &Options) -> (Option<script::Script>, String) {
+    let path = options.input_script.clone().or_else(|| {
+        let path = crate::paths::user_data_base_path().join(INPUT_SCRIPT_FILE);
+        path.exists().then_some(path)
+    });
+    let quit_at = options.quit_at_frame;
+    let quit_text = match quit_at {
+        Some(frame) => format!("quit at frame {frame}"),
+        None => "no quit frame".to_string(),
+    };
+    let Some(path) = path else {
+        return match quit_at {
+            Some(_) => (
+                Some(script::Script::new(Vec::new(), quit_at)),
+                format!("# input script: none; {quit_text}\n"),
+            ),
+            None => (None, "# input script: off\n".to_string()),
+        };
+    };
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(e) => {
+            log!(
+                "Warning: could not read the input script {}, it is off: {}",
+                path.display(),
+                e
+            );
+            String::new()
+        }
+    };
+    let (commands, bad) = script::Script::parse(&text);
+    for (line, why) in bad {
+        log!(
+            "Warning: input script {} line {} is not understood, skipped: {}",
+            path.display(),
+            line,
+            why
+        );
+    }
+    log!(
+        "Input script on: {} command(s) from {}, {}",
+        commands.len(),
+        path.display(),
+        quit_text
+    );
+    let line = format!(
+        "# input script: {} ({} commands); {}\n",
+        path.display(),
+        commands.len(),
+        quit_text
+    );
+    (Some(script::Script::new(commands, quit_at)), line)
+}
+
+/// Called at each presented frame, with the number the next rows will
+/// carry (the frame being drawn now): runs the input script's commands due
+/// (see [script::Script::tick]). Its touches go into the window's event
+/// queue behind the host's, so UIKit hands them to the app at the run
+/// loop's next turn, before this frame is presented, and `input.log` has
+/// them with this frame number; a quit goes the same way, as `Event::Quit`,
+/// so touchHLE exits as when the window is closed. Each command writes a
+/// row with origin `input`.
+fn run_script(env: &mut Environment, now: u32) {
+    let Some(mut trace) = env.objc.trace.take() else {
+        return;
+    };
+    let Some(ScriptState { script, slots }) = trace.script.as_mut() else {
+        env.objc.trace = Some(trace);
+        return;
+    };
+    let outs = {
+        let mut guest = scene::GuestScene::new(&env.objc, &env.mem);
+        let bin = env.bins.first();
+        script.tick(now, |cond| read_wait_target(&mut guest, bin, slots, cond))
+    };
+    let elapsed_ms = env.startup_time.elapsed().as_secs_f64() * 1000.0;
+    for out in outs {
+        let event = match out {
+            script::Out::Touch(phase, x, y) => {
+                let touches = HashMap::from([(FingerId::Script, (x, y))]);
+                match phase {
+                    script::Phase::Down => Event::TouchesDown(touches),
+                    script::Phase::Move => Event::TouchesMove(touches),
+                    script::Phase::Up => Event::TouchesUp(touches),
+                }
+            }
+            script::Out::Row(text) => {
+                let row = text_row(now, elapsed_ms, env.current_thread, "input", &text);
+                let _ = trace.out.write_all(row.as_bytes());
+                continue;
+            }
+            script::Out::Note(text) => {
+                log!("{}", text);
+                continue;
+            }
+            script::Out::Quit => {
+                log!("Input script: quitting at frame {}.", now);
+                Event::Quit
+            }
+        };
+        if let Some(window) = env.window.as_mut() {
+            window.push_event(event);
+        }
+    }
+    env.objc.trace = Some(trace);
+}
+
+/// Read the target of an input script's `wait`, as the bytes of its type.
+/// A `Class.ivar` is read on the instance a static variable of the app
+/// binary points at (see [scene::find_singleton]), or else on the first
+/// node of that class in the running cocos2d scene. Only reads memory and
+/// the class table.
+fn read_wait_target(
+    guest: &mut scene::GuestScene,
+    bin: Option<&crate::mach_o::MachO>,
+    slots: &mut HashMap<String, Option<u32>>,
+    cond: &script::WaitCond,
+) -> Result<u64, String> {
+    use scene::SceneMemory;
+
+    let addr = match &cond.target {
+        WatchTarget::Addr(addr) => *addr,
+        WatchTarget::Ivar {
+            class,
+            ivar,
+            offset,
+        } => {
+            let bin = bin.ok_or("no app binary")?;
+            let slot = slots.entry(class.clone()).or_default();
+            let object = match scene::find_singleton(guest, bin, slot, class) {
+                Some(object) => object,
+                None => {
+                    let director_slot = slots.entry("CCDirector".to_string()).or_default();
+                    let running = scene::find_singleton(guest, bin, director_slot, "CCDirector")
+                        .and_then(|director| guest.ivar_addr(director, "runningScene_").ok())
+                        .and_then(|addr| guest.word(addr).ok())
+                        .filter(|&scene| scene != 0);
+                    running
+                        .map(|root| state::scene_nodes(guest, root, &mut Vec::new()))
+                        .unwrap_or_default()
+                        .into_iter()
+                        .find(|&node| scene::is_instance_of(guest, node, class))
+                        .ok_or_else(|| {
+                            format!("no instance of {class} in a static variable or the scene")
+                        })?
+                }
+            };
+            let isa = guest.word(object)?;
+            let field = ivar_offset(guest.objc, guest.mem, Ptr::from_bits(isa), ivar)
+                .flatten()
+                .ok_or_else(|| format!("{class} has no ivar {ivar}"))?;
+            object
+                .checked_add(field)
+                .and_then(|addr| addr.checked_add(*offset))
+                .ok_or("the field is past the end of memory")?
+        }
+    };
+    let bytes = read_guest_bytes(guest.mem, addr, cond.ty.size())?;
+    let mut word = [0u8; 8];
+    word[..bytes.len()].copy_from_slice(bytes);
+    Ok(u64::from_le_bytes(word))
 }
 
 /// The classes the state stream writes: `--state-classes=`, or by default
@@ -1094,6 +1293,8 @@ pub fn trace_present_frame(env: &mut Environment) -> Option<FrameCaptureTicket> 
     let trace = env.objc.trace.as_mut()?;
     let frame = trace.frame;
     trace.frame = trace.frame.wrapping_add(1);
+    run_script(env, frame.wrapping_add(1));
+    let trace = env.objc.trace.as_mut()?;
     if trace.coverage && frame > 0 && frame.is_multiple_of(COVERAGE_EVERY_FRAMES) {
         trace_write_coverage(env, "periodic");
     }

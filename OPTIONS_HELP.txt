@@ -371,6 +371,25 @@ Debugging options:
         The default is 4Towers' Game, towersLayer, towerGrid, Tower,
         Creeps, Bullets and SharedData.
 
+    --input-script=FILE
+        Plays the touches listed in FILE (in the user data directory) at
+        chosen presented frames, as if they came from the screen, so a run
+        can play the app unattended. One command per line: "@F tap X Y" at
+        frame F, "+N tap X Y" N frames after the command before, "down",
+        "move" and "up" for a drag, "wait Class.ivar:type >= value" (or a
+        hex address; ops >=, <=, ==, >, <, !=) to hold until a value is
+        reached, optionally with "timeout T", and "quit" to exit as closing
+        the window does. X and Y are guest points as input.log writes them,
+        and input.log's own rows are read as they are. # starts a comment.
+        Without this option, input_script.txt in the user data directory is
+        used if it is there. Each command writes a row of origin "input" to
+        trace.log. This turns the message trace on even with no selectors.
+
+    --quit-at-frame=F
+        Exits touchHLE, as closing the window does, at presented frame F
+        (the frame numbers of trace.log). This turns the message trace on
+        even with no selectors.
+
 Other options:
     --preferred-languages=...
         Specifies a list of preferred languages to be reported to the app.

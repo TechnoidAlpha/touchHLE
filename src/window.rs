@@ -129,6 +129,8 @@ pub enum FingerId {
     ButtonToTouch(crate::options::Button),
     StickToTouch,
     DpadToTouch,
+    /// A touch from the message trace's input script (`--input-script=`).
+    Script,
 }
 pub type Coords = (f32, f32);
 
@@ -987,6 +989,13 @@ impl Window {
         self.lifecycle_events
             .pop_front()
             .or_else(|| self.event_queue.pop_front())
+    }
+
+    /// Queue an event made by touchHLE itself (the message trace's input
+    /// script), behind the ones already queued, to be handled like one from
+    /// the host.
+    pub fn push_event(&mut self, event: Event) {
+        self.event_queue.push_back(event);
     }
 
     /// Queue a lifecycle event and keep track of whether touchHLE is in the

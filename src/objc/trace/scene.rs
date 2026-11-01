@@ -741,7 +741,7 @@ impl SceneMemory for GuestScene<'_> {
 }
 
 /// Whether `object` is an instance (not a class) of `class` or a subclass.
-fn is_instance_of<M: SceneMemory + ?Sized>(m: &mut M, object: u32, class: &str) -> bool {
+pub(super) fn is_instance_of<M: SceneMemory + ?Sized>(m: &mut M, object: u32, class: &str) -> bool {
     object != 0
         && m.class_of(object)
             .is_ok_and(|c| !c.name.starts_with('+') && c.is_a(class))

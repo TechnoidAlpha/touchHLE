@@ -867,7 +867,11 @@ fn container_items<M: StateMemory + ?Sized>(m: &mut M, container: u32) -> Option
 
 /// The nodes of the scene from `root`, depth-first, within the scene
 /// dump's caps.
-fn scene_nodes<M: SceneMemory + ?Sized>(m: &mut M, root: u32, notes: &mut Vec<String>) -> Vec<u32> {
+pub(super) fn scene_nodes<M: SceneMemory + ?Sized>(
+    m: &mut M,
+    root: u32,
+    notes: &mut Vec<String>,
+) -> Vec<u32> {
     let mut nodes = Vec::new();
     let mut seen = HashSet::new();
     let mut stack = vec![(root, 0usize)];

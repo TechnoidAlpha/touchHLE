@@ -99,6 +99,12 @@ pub struct Options {
     /// `--state-classes=`: the classes the state stream writes; empty for
     /// the default ones.
     pub state_classes: Vec<String>,
+    /// `--input-script=FILE`: touches and a quit at chosen frames, from FILE
+    /// in the user data directory. See src/objc/trace/script.rs.
+    pub input_script: Option<PathBuf>,
+    /// `--quit-at-frame=F`: exit at presented frame F. See
+    /// src/objc/trace/script.rs.
+    pub quit_at_frame: Option<u32>,
     /// `--bundle-files-ignore-case`, see
     /// [crate::fs::Fs::set_bundle_files_ignore_case].
     pub bundle_files_ignore_case: bool,
@@ -146,6 +152,8 @@ impl Default for Options {
             trace_watch: Vec::new(),
             state_every: 0,
             state_classes: Vec::new(),
+            input_script: None,
+            quit_at_frame: None,
             bundle_files_ignore_case: false,
         }
     }
@@ -355,6 +363,14 @@ impl Options {
                 .filter(|s| !s.is_empty())
                 .map(String::from)
                 .collect();
+        } else if let Some(path) = arg.strip_prefix("--input-script=") {
+            self.input_script = Some(crate::paths::user_data_base_path().join(path));
+        } else if let Some(value) = arg.strip_prefix("--quit-at-frame=") {
+            self.quit_at_frame = Some(
+                value
+                    .parse()
+                    .map_err(|_| "Invalid value for --quit-at-frame=".to_string())?,
+            );
         } else if arg == "--bundle-files-ignore-case" {
             self.bundle_files_ignore_case = true;
         } else if arg == "--ignore-gl-errors" {
