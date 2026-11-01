@@ -1429,8 +1429,8 @@ fn write_scene_dump(env: &mut Environment, frame: u32, ms: f64, whole_ms: u64, r
         if director.is_none() && !std::mem::replace(no_director_logged, true) {
             log!("Scene dump: no CCDirector found yet, nothing is walked (logged once)");
         }
-        let files = texture_cache.and_then(|cache| scene::texture_files(&mut guest, cache));
-        if files.is_none() && !std::mem::replace(no_texture_cache_logged, true) {
+        let cache = texture_cache.and_then(|cache| scene::texture_cache_entries(&mut guest, cache));
+        if cache.is_none() && !std::mem::replace(no_texture_cache_logged, true) {
             log!("Scene dump: the CCTextureCache's textures could not be read, tex_file is - (logged once)");
         }
         let info = scene::DumpInfo {
@@ -1438,9 +1438,9 @@ fn write_scene_dump(env: &mut Environment, frame: u32, ms: f64, whole_ms: u64, r
             ms: whole_ms,
             trigger: reason,
             viewport,
-            textures: files.as_ref().map(HashMap::len),
+            textures: cache.as_ref().map(Vec::len),
         };
-        let text = scene::dump_text(&mut guest, &info, director, &files.unwrap_or_default());
+        let text = scene::dump_text(&mut guest, &info, director, &cache.unwrap_or_default());
         let path = dir.join(&file_name);
         match std::fs::write(&path, text) {
             Ok(()) if reason != "periodic" => {

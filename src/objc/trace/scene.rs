@@ -611,14 +611,16 @@ pub(super) fn info_line<M: SceneMemory + ?Sized>(
 }
 
 /// A whole dump: the column line, the info line, the node lines from the
-/// director's `runningScene_`, and the notes, each as a `#` line, last a
-/// `# nodes=N` line.
+/// director's `runningScene_`, a `# cache:` line per texture cache entry
+/// (`cache`, from [texture_cache_entries]; see [cache_line]), and the notes,
+/// each as a `#` line, last a `# nodes=N` line.
 pub(super) fn dump_text<M: SceneMemory + ?Sized>(
     m: &mut M,
     info: &DumpInfo,
     director: Option<u32>,
-    files: &HashMap<u32, String>,
+    cache: &[(String, u32)],
 ) -> String {
+    let files = &texture_files(cache);
     let mut text = column_line();
     text.push_str(&info_line(m, info, director));
     let scene = match director {
@@ -640,6 +642,9 @@ pub(super) fn dump_text<M: SceneMemory + ?Sized>(
         }
     };
     text.push_str(&walk.lines);
+    for (file, texture) in cache {
+        text.push_str(&cache_line(m, file, *texture));
+    }
     for note in &walk.notes {
         text.push_str(&format!("# {}\n", note.replace(['\t', '\r', '\n'], " ")));
     }
@@ -809,27 +814,56 @@ fn find_singleton_in<M: SceneMemory + ?Sized>(
     None
 }
 
-/// The texture cache's textures, as a map from the `CCTexture2D`'s address
-/// to the key it was cached under (the file name the game asked for): the
-/// keys and values of its `textures_`, an `NSMutableDictionary` touchHLE
-/// made, read from its host object without calling the guest. [None] if
-/// `textures_` cannot be read or is not one of touchHLE's dictionaries.
-/// A key that is not one of touchHLE's strings is written as its address.
-pub(super) fn texture_files<M: SceneMemory + ?Sized>(
+/// The texture cache's entries, as pairs of the key a texture was cached
+/// under (the file name the game asked for) and the `CCTexture2D`'s
+/// address, sorted by key: the keys and values of its `textures_`, an
+/// `NSMutableDictionary` touchHLE made, read from its host object without
+/// calling the guest. [None] if `textures_` cannot be read or is not one of
+/// touchHLE's dictionaries. A key that is not one of touchHLE's strings is
+/// written as its address.
+pub(super) fn texture_cache_entries<M: SceneMemory + ?Sized>(
     m: &mut M,
     texture_cache: u32,
-) -> Option<HashMap<u32, String>> {
+) -> Option<Vec<(String, u32)>> {
     let dict = pointer(m, texture_cache, "textures_").ok()?;
     let pairs = m.dictionary_pairs(dict)?;
-    Some(
-        pairs
-            .into_iter()
-            .map(|(key, value)| {
-                let file = m.string_text(key).unwrap_or_else(|| format!("{key:#010x}"));
-                (value, file)
-            })
-            .collect(),
-    )
+    let mut entries: Vec<(String, u32)> = pairs
+        .into_iter()
+        .map(|(key, value)| {
+            let file = m.string_text(key).unwrap_or_else(|| format!("{key:#010x}"));
+            (file, value)
+        })
+        .collect();
+    entries.sort();
+    Some(entries)
+}
+
+/// The texture cache's entries (from [texture_cache_entries]) as a map from
+/// the `CCTexture2D`'s address to its key, for the `tex_file` column.
+pub(super) fn texture_files(entries: &[(String, u32)]) -> HashMap<u32, String> {
+    entries
+        .iter()
+        .map(|(file, texture)| (*texture, file.clone()))
+        .collect()
+}
+
+/// One `# cache:` line of a dump for a texture cache entry: the key
+/// (escaped as a `str` peek writes it), then, tab-separated, the
+/// `CCTexture2D`'s `name_` (its GL texture name) and its `width_` and
+/// `height_` as `WxH`; `-` for what cannot be read or a value that is not
+/// a `CCTexture2D`.
+fn cache_line<M: SceneMemory + ?Sized>(m: &mut M, file: &str, texture: u32) -> String {
+    let is_texture = texture != 0 && m.class_of(texture).is_ok_and(|c| c.is_a("CCTexture2D"));
+    let (name, width, height) = if is_texture {
+        (
+            field(m, texture, "name_", 0, Ty::U32),
+            field(m, texture, "width_", 0, Ty::U32),
+            field(m, texture, "height_", 0, Ty::U32),
+        )
+    } else {
+        ("-".to_string(), "-".to_string(), "-".to_string())
+    };
+    format!("# cache: {}\t{name}\t{width}x{height}\n", fmt_str(file))
 }
 
 /// The file name of a dump: `s{frame:06}_{ms}.txt`, the frame and whole
@@ -1394,7 +1428,7 @@ mod tests {
             viewport: Some((0, 0, 320, 480)),
             textures: Some(12),
         };
-        let text = dump_text(&mut g, &info, Some(0x3000), &HashMap::new());
+        let text = dump_text(&mut g, &info, Some(0x3000), &[]);
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(lines[0], column_line().trim_end());
         assert_eq!(
@@ -1411,7 +1445,7 @@ mod tests {
             textures: None,
             ..info
         };
-        let text = dump_text(&mut g, &info, None, &HashMap::new());
+        let text = dump_text(&mut g, &info, None, &[]);
         let lines: Vec<&str> = text.lines().collect();
         assert!(lines[1].contains("\tdirector=-\tpaused=-\trunning_scene=-\t"));
         assert!(lines[1].ends_with("\tviewport=-\ttextures=-"));
@@ -1489,9 +1523,17 @@ mod tests {
         // The second key is not one of touchHLE's strings.
         g.dictionaries
             .insert(0x3800, vec![(0x9000, 0x8000), (0x9100, 0x8100)]);
-        let files = texture_files(&mut g, 0x3000).unwrap();
+        let entries = texture_cache_entries(&mut g, 0x3000).unwrap();
+        // Sorted by key: "0x..." comes before "hud.png".
         assert_eq!(
-            files,
+            entries,
+            vec![
+                ("0x00009100".to_string(), 0x8100),
+                ("hud.png".to_string(), 0x8000),
+            ]
+        );
+        assert_eq!(
+            texture_files(&entries),
             HashMap::from([
                 (0x8000, "hud.png".to_string()),
                 (0x8100, "0x00009100".to_string()),
@@ -1500,10 +1542,47 @@ mod tests {
         // textures_ is nil, or not one of touchHLE's dictionaries, or the
         // cache cannot be read.
         g.put_word(g.ivar(0x3000, "textures_"), 0);
-        assert_eq!(texture_files(&mut g, 0x3000), None);
+        assert_eq!(texture_cache_entries(&mut g, 0x3000), None);
         g.put_word(g.ivar(0x3000, "textures_"), 0x3900);
-        assert_eq!(texture_files(&mut g, 0x3000), None);
-        assert_eq!(texture_files(&mut g, 0x0700), None);
+        assert_eq!(texture_cache_entries(&mut g, 0x3000), None);
+        assert_eq!(texture_cache_entries(&mut g, 0x0700), None);
+    }
+
+    #[test]
+    fn a_dump_lists_the_texture_cache_after_the_nodes() {
+        let mut g = FakeGuest::new();
+        g.object(0x3000, &["CCDirectorTimer", "CCDirectorIOS", "CCDirector"]);
+        g.put_word(g.ivar(0x3000, "runningScene_"), 0x4000);
+        g.node(0x4000, &["CCScene", "CCNode", "NSObject"], &[]);
+        // A 512 by 256 texture, a 0 by 0 one (an empty label's, were it
+        // cached) and a value that is not a CCTexture2D.
+        g.object(0x8000, &["CCTexture2D", "NSObject"]);
+        g.put_word(g.ivar(0x8000, "name_"), 17);
+        g.put_word(g.ivar(0x8000, "width_"), 512);
+        g.put_word(g.ivar(0x8000, "height_"), 256);
+        g.object(0x8100, &["CCTexture2D", "NSObject"]);
+        g.put_word(g.ivar(0x8100, "name_"), 1135);
+        g.object(0x8200, &["CCNode", "NSObject"]);
+        let cache = vec![
+            ("a\tb.png".to_string(), 0x8100),
+            ("towersBaseImg.png".to_string(), 0x8000),
+            ("x.png".to_string(), 0x8200),
+        ];
+        let info = DumpInfo {
+            frame: 1,
+            ms: 2,
+            trigger: "periodic",
+            viewport: None,
+            textures: Some(cache.len()),
+        };
+        let text = dump_text(&mut g, &info, Some(0x3000), &cache);
+        let lines: Vec<&str> = text.lines().collect();
+        assert!(lines[2].starts_with("CCScene\t0\t0x00004000\t"));
+        assert_eq!(lines[3], "# cache: a\\tb.png\t1135\t0x0");
+        assert_eq!(lines[4], "# cache: towersBaseImg.png\t17\t512x256");
+        assert_eq!(lines[5], "# cache: x.png\t-\t-x-");
+        assert_eq!(lines[6], "# nodes=1");
+        assert_eq!(lines.len(), 7);
     }
 
     #[test]
