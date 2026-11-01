@@ -236,7 +236,7 @@ These come with the message trace: they are written only while it is on, into th
 | `frame` | frames presented so far, as in `trace.log` |
 | `ms` | milliseconds since touchHLE started, three decimals, as in `trace.log` |
 | `phase` | `down`, `move` or `up`, as the game receives it: a finger reported down while it is already down reaches the game as a move and is logged as `move` (the other fingers of that event never reach the game and are not logged), and a move or up for a finger that is not down is ignored by touchHLE and not logged |
-| `finger` | which finger: `Mouse`, `Touch(n)` (n is the host's finger id), `VirtualCursor`, `ButtonToTouch(button)`, `StickToTouch` or `DpadToTouch` |
+| `finger` | which finger: `Mouse`, `Touch(n)` (n is the host's finger id), `VirtualCursor`, `ButtonToTouch(button)`, `StickToTouch`, `DpadToTouch`, or `Script` for a touch from the input script (see [Scripted input](#scripted-input)) |
 | `x`, `y` | the position in guest points (the screen is 320 x 480 points), unrotated: what the game's `UITouch` reports, whatever the window's rotation or scale |
 
 An event with two fingers gives two rows with the same `frame`, `ms` and `phase`. The rows are written as the events reach the game's run loop, each event in one write, so a crash keeps every row before it.
@@ -362,7 +362,7 @@ The walk runs on the emulator thread while the frame is presented, so the game s
 
 ## Instruments
 
-Five more ways to read the running game, added in November 2026 on the `4towers-instruments` branch. Each one writes into the message trace's folder, on its clock and with its frame numbers, and each one turns the trace on by itself, so `trace.log` is written even with no selectors. All of them are off unless asked for. The rows they write in `trace.log` have new origins (`rng`, `addr`, `watch`); like `nslog` rows they start with the usual `frame`, `ms`, `thread` and `origin` columns, so a reader that sorts rows by origin first (as `parse_trace.py` does: any origin but `guest` and `host` is read as a text row) reads them without change.
+Five more ways to read the running game, and one to play it, added in November 2026 on the `4towers-instruments` branch. Each one writes into the message trace's folder, on its clock and with its frame numbers, and each one turns the trace on by itself, so `trace.log` is written even with no selectors. All of them are off unless asked for. The rows they write in `trace.log` have new origins (`rng`, `addr`, `watch`, `input`); like `nslog` rows they start with the usual `frame`, `ms`, `thread` and `origin` columns, so a reader that sorts rows by origin first (as `parse_trace.py` does: any origin but `guest` and `host` is read as a text row) reads them without change.
 
 ### Random numbers
 
@@ -544,3 +544,46 @@ Limits: an object is only found if it is in the scene, in a static variable, or 
 What it costs: nothing when off. A snapshot walks the scene, scans the data sections (a few KiB for this game), and reads each object's instance variables; the class layouts are read once. Each snapshot is one write to `state.jsonl`. With the default classes on the title screen it is a few objects; in a level, a few hundred, each line a few KiB.
 
 The type decoding, the layout of the values, the search through the scene, the statics, arrays and instance variables, and the lines are covered by unit tests (`src/objc/trace/state.rs`).
+
+### Scripted input
+
+`--input-script=FILE` plays touches listed in `FILE` (in the user data directory, next to `trace.log`, as for `--rng-replay=`) at chosen frames, so a run can play the game unattended: on a laptop whose desktop session is not attached, synthetic mouse clicks never reach the window, so the touches are made inside touchHLE. Without the option, `input_script.txt` next to the other touchHLE files is used if it is there. `--quit-at-frame=F` exits at presented frame F, with or without a script. The file is read once, at startup. Either one turns the trace on by itself.
+
+One command per line, words separated by spaces; `#` starts a comment, and a line that is not understood is logged with its number and skipped:
+
+```
+[@F | +N] tap X Y
+[@F | +N] down X Y
+[@F | +N] move X Y
+[@F | +N] up X Y
+[@F | +N] wait <target>:<type> <op> <value> [timeout T]
+[@F | +N] quit
+```
+
+- `@F` runs the command at presented frame F, the frame numbers of `trace.log` and `input.log`. `+N` runs it N frames after the command before it ran; with neither, it is `+0`. Commands run one after another, in the order written: an `@F` whose frame has gone by (because a `wait` before it held the script) runs at once.
+- `tap X Y` is a `down` at (X, Y) and an `up` at the same point 3 frames later. `down`, `move` and `up` are one touch each, for a drag. X and Y are guest points, unrotated, exactly as `input.log` writes them (the screen is 320 x 480 points).
+- `wait` holds the script until the value is true, read at each presented frame. `<target>:<type>` is written as for a watchpoint (see Watchpoints above): `Class.ivar` (with an optional `.+N`) or an address in hex, and a type, `u8` to `f64`. A `Class.ivar` is read on the instance a static variable of the app binary points at (found as the scene dump finds the director, which takes `SharedData`), or else on the first node of that class in the running cocos2d scene. `<op>` is one of `>=`, `<=`, `==`, `>`, `<` and `!=`, and `<value>` a number. When it passes, the next `+N` counts from that frame. With `timeout T`, after T frames of waiting the script carries on as if it had passed, and the log says so. A target that cannot be read yet (no instance, no such ivar) counts as not true, logged once per wait.
+- `quit` exits touchHLE through its usual exit path, the one closing the window takes (see [Home and back](#home-and-back)), so the frames still queued and `coverage.txt` are written as at any exit.
+
+A row of `input.log` is also a line: `frame ms phase finger x y` is read as `@frame phase x y` (the finger and the time are ignored), so the rows of one run, header and all, play its touches again: `cp input.log input_script.txt`, or `awk -F'\t' '!/^#/ {print "@" $1, $3, $5, $6}' input.log` for a script to edit.
+
+Every touch the script makes is handed to UIKit as a host touch is, with the finger `Script`: it goes into the window's event queue when frame F - 1 is presented, and the run loop hands it to the game before frame F is presented, so the game gets it, and `input.log` has it, with frame F. There is one script finger, so a `down` while it is still down reaches the game as a move (see the `phase` column of the touch log): leave at least 3 frames between taps, or write the `down` and `up` yourself.
+
+Each command also writes a `trace.log` row with origin `input`, laid out like an `nslog` row: the usual `frame`, `ms` and `thread`, `-` in `variant` and `class`, the command as written (words joined by one space) in the `selector` column, and `-` in the ten columns after it. A tap's up has a row of its own, the command and `: up`; a `wait` has one when it starts (`: waiting`) and one when it passes (`: passed after N frames (value)`) or times out (`: timed out after N frames (last value)`); `--quit-at-frame=` writes `quit (--quit-at-frame=F)`. The header has a line `# input script: <path> (<n> commands); quit at frame F`.
+
+An example, from title screen to Level 1 with a tower built, checked on 1 November 2026 (frames at 30 a second; the title is up by frame 700, and the game's save in that sandbox has every level open):
+
+```
+@750 tap 160 214      # PLAY on the title
+@830 tap 160 214      # NORMAL
+@1250 tap 84 60       # the Level 1 hex on the map
+@1400 tap 234 412     # PLAY on the level card
++60 wait SharedData.totalGold:f32 >= 60 timeout 600
++10 tap 58 55         # a tower socket
++15 tap 36 93         # the red tower, 20 c
+@4500 quit
+```
+
+Its `trace.log` rows read `1460 ... input ... +60 wait SharedData.totalGold:f32 >= 60 timeout 600: passed after 0 frames (90)`, the gold watch shows the tower bought (90 down to 70 in the frames after the tap at 1485) and the kills after it, and `state.jsonl` has the wave's `Creeps` from frame 1710. The game remembers a level it was closed in (see the UIKit list above), so a script that quits inside a level leaves the next run starting there; put the sandbox's `com.lambdamugames.4towers.plist` back between runs.
+
+What it costs: nothing when off (one `Option` check per presented frame). With a script, each presented frame checks the next command's frame; a waiting `wait` reads its target once a frame (a word read once the static variable is known; a scene walk for a class found only in the scene). The parser and the scheduler (the timing of `@` and `+`, the tap's up, waits that pass, time out or cannot read, `quit` and `--quit-at-frame=`, the `input.log` row form) are covered by unit tests (`src/objc/trace/script.rs`).
