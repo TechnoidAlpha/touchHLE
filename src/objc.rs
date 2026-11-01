@@ -96,6 +96,10 @@ pub struct ObjC {
     /// Mutexes for running the +initialize function.
     initializer_threads: HashMap<id, ThreadInitializer>,
 
+    /// Selectors already logged for a send to a freed object (isa 0). See
+    /// `objc_msgSend_inner`.
+    zombie_selectors_logged: std::collections::HashSet<SEL>,
+
     /// Temporary storage for optional type information when sending a message.
     /// Type information isn't part of the `objc_msgSend` ABI, so an alternative
     /// channel is needed.
@@ -113,6 +117,7 @@ impl ObjC {
             classes: HashMap::new(),
             sync_mutexes: HashMap::new(),
             initializer_threads: HashMap::new(),
+            zombie_selectors_logged: std::collections::HashSet::new(),
             message_type_info: None,
             trace: None,
         }

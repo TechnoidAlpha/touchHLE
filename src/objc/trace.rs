@@ -800,6 +800,8 @@ impl MsgTrace {
             "# origin input: a command of the input script, as written, in the\n",
             "# selector column (': up' for a tap's up, ': waiting', ': passed' and\n",
             "# ': timed out' for a wait); its touches are in input.log\n",
+            "# origin zombie: a message sent to a freed object (isa 0), treated as a\n",
+            "# message to nil: 'zombie: <selector> to <receiver>' in the selector column\n",
         ]
         .concat()
             + &script_line
@@ -1974,6 +1976,32 @@ fn nslog_row(frame: u32, ms: f64, thread: usize, message: &str) -> String {
     text_row(frame, ms, thread, "nslog", message)
 }
 
+/// The row for a message sent to a freed object: origin `zombie`, and
+/// `zombie: <selector> to <receiver>` in the selector column.
+fn zombie_row(frame: u32, ms: f64, thread: usize, selector: &str, receiver: u32) -> String {
+    text_row(
+        frame,
+        ms,
+        thread,
+        "zombie",
+        &format!("zombie: {selector} to {receiver:#010x}"),
+    )
+}
+
+/// Called by `objc_msgSend` for each message to a freed object it treats as a
+/// message to nil. When the trace is on, writes a row with origin `zombie`
+/// (see [zombie_row]).
+pub fn trace_zombie(env: &mut Environment, receiver: id, selector: SEL) {
+    let elapsed_ms = env.startup_time.elapsed().as_secs_f64() * 1000.0;
+    let thread = env.current_thread;
+    let name = selector.as_str(&env.mem).to_string();
+    let Some(trace) = env.objc.trace.as_mut() else {
+        return;
+    };
+    let row = zombie_row(trace.frame, elapsed_ms, thread, &name, receiver.to_bits());
+    let _ = trace.out.write_all(row.as_bytes());
+}
+
 /// The row for an app lifecycle step: origin `lifecycle`, and
 /// `lifecycle: <step>` in the selector column.
 fn lifecycle_row(frame: u32, ms: f64, thread: usize, step: &str) -> String {
@@ -2641,8 +2669,8 @@ fn fmt_f32(bits: u32) -> String {
 mod tests {
     use super::{
         capture_due, class_chain_names, lifecycle_row, nslog_row, parse_selector_line,
-        returns_struct, rng_row, touch_row, Class, ClassHostObject, Filter, Markers, ObjC, Ptr,
-        Traced, TrampolineCache,
+        returns_struct, rng_row, touch_row, zombie_row, Class, ClassHostObject, Filter, Markers,
+        ObjC, Ptr, Traced, TrampolineCache,
     };
     use crate::objc::classes::InitializationStatus;
     use crate::objc::{nil, TrivialHostObject};
@@ -2684,6 +2712,17 @@ mod tests {
         );
         let row = rng_row(0, 0.0, 0, "srandom", "seed", u32::MAX, None, 0, None);
         assert!(row.contains("\tsrandom\t0xffffffff\t4294967295\t-\t"));
+    }
+
+    #[test]
+    fn zombie_rows_fill_every_column() {
+        let row = zombie_row(46698, 99.5, 0, "moveB", 0x0020_7030);
+        assert_eq!(
+            row,
+            "46698\t99.500\t0\tzombie\t-\t-\tzombie: moveB to 0x00207030\t\
+             -\t-\t-\t-\t-\t-\t-\t-\t-\t-\n"
+        );
+        assert_eq!(row.trim_end_matches('\n').split('\t').count(), 17);
     }
 
     #[test]

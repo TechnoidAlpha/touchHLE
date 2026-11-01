@@ -11,7 +11,7 @@
 //! - Mike Ash's [objc_msgSend's New Prototype](https://www.mikeash.com/pyblog/objc_msgsends-new-prototype.html)
 //! - Peter Steinberger's [Calling Super at Runtime in Swift](https://steipete.com/posts/calling-super-at-runtime/) explains `objc_msgSendSuper2`
 
-use super::trace::{trace_send, SendVariant};
+use super::trace::{trace_send, trace_zombie, SendVariant};
 use super::{id, nil, Class, ObjC, IMP, SEL};
 use crate::abi::{CallFromHost, GuestRet};
 use crate::environment::ThreadId;
@@ -199,6 +199,26 @@ fn objc_msgSend_inner(
     }
 
     let orig_class = super2.unwrap_or_else(|| ObjC::read_isa(receiver, &env.mem));
+    if orig_class == nil && super2.is_none() {
+        // A message to a freed object. 4Towers does this: run
+        // 20261101_204120_win_L18 panicked at frame 46698 on a
+        // `Bullets moveB` sent to a creep that `Creeps dmg:` had freed 150
+        // frames before. On an iPhone the freed memory keeps its isa, so the
+        // send finds the method and goes on; here the isa reads 0. Treat it
+        // as a message to nil, and say so once per selector. A nil class
+        // from a super call (`super2`) would be a real bug, so that still
+        // hits the assert below.
+        if env.objc.zombie_selectors_logged.insert(selector) {
+            log!(
+                "Message to freed object {:?}, selector \"{}\": treated as a message to nil (4towers fork).",
+                receiver,
+                selector.as_str(&env.mem)
+            );
+        }
+        trace_zombie(env, receiver, selector);
+        env.cpu.regs_mut()[0..2].fill(0);
+        return;
+    }
     assert!(orig_class != nil);
     if !skip_initialize {
         maybe_initialize_class(env, receiver);

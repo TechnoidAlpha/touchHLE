@@ -596,3 +596,13 @@ An example, from title screen to Level 1 with a tower built, checked on 1 Novemb
 Its `trace.log` rows read `1460 ... input ... +60 wait SharedData.totalGold:f32 >= 60 timeout 600: passed after 0 frames (90)`, the gold watch shows the tower bought (90 down to 70 in the frames after the tap at 1485) and the kills after it, and `state.jsonl` has the wave's `Creeps` from frame 1710. The game remembers a level it was closed in (see the UIKit list above), so a script that quits inside a level leaves the next run starting there; put the sandbox's `com.lambdamugames.4towers.plist` back between runs.
 
 What it costs: nothing when off (one `Option` check per presented frame). With a script, each presented frame checks the next command's frame; a waiting `wait` reads its target once a frame (a word read once the static variable is known; a scene walk for a class found only in the scene). The parser and the scheduler (the timing of `@` and `+`, the tap's up, waits that pass, time out or cannot read, `quit` and `--quit-at-frame=`, the `input.log` row form) are covered by unit tests (`src/objc/trace/script.rs`).
+
+## Messages to freed objects
+
+*4Towers* sends messages to objects it has already freed (seen in run `20261101_204120_win_L18` on the S22U: a `Creeps dmg:` row took creep `0x00207030` to -1661.25 HP at frame 46543, and a `Bullets moveB` messaged it 150 frames later, at frame 46698). On an iPhone the freed memory keeps its isa, so the send still finds the method. Here the isa reads 0, and `objc_msgSend` stopped on `assertion failed: orig_class != nil` (`src/objc/messages.rs`).
+
+- A message to a non-nil receiver whose isa is 0 now acts as a message to nil: R0 and R1 are cleared and the call returns, as for a nil receiver. The first send of each selector is logged with `log!` (receiver address and selector); later ones are silent.
+- A super call (`msg_send_super2`) with a nil class still stops on the assert, since that would be a real bug.
+- With a trace on, each such send also writes a `trace.log` row with origin `zombie`, laid out like an `nslog` row, with `zombie: <selector> to <receiver>` in the selector column. The header names the origin.
+- A freed object whose memory has been reused has a non-zero isa and is not caught here.
+- The row layout is covered by a unit test (`zombie_rows_fill_every_column` in `src/objc/trace.rs`). The send itself needs a running guest and has no unit test.
