@@ -2,7 +2,7 @@ name: Build touchHLE
 
 on:
   push:
-    branches: [ "trunk", "4towers", "4towers-trace", "4towers-gnu-ci" ]
+    branches: [ "trunk", "4towers", "4towers-trace", "4towers-gnu-ci", "4towers-instruments" ]
   workflow_dispatch:
   pull_request:
     branches: [ "trunk" ]
