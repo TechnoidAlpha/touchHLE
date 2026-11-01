@@ -698,13 +698,11 @@ impl Environment {
 
         // Selector-filtered message trace (--trace-selectors=), off unless any
         // selectors were chosen.
-        env.objc.start_trace(
-            &env.options.trace_selectors,
-            env.options.capture_frames,
-            env.options.capture_frames_max,
-            env.options.dump_scene_every,
-            env.bundle.bundle_identifier(),
-        );
+        env.objc
+            .start_trace(&env.options, env.bundle.bundle_identifier());
+        if let Some(path) = env.options.rng_replay.clone() {
+            env.libc_state.stdlib.start_replay(&path);
+        }
 
         env.set_up_initial_env_vars();
         dyld::Dyld::do_late_linking(&mut env);

@@ -359,3 +359,43 @@ Only memory and touchHLE's class table are read: the dump never sends a message 
 The walk runs on the emulator thread while the frame is presented, so the game sees the time it takes; for a few hundred nodes that should be well under a millisecond (the first dump also searches the data sections), but it has not been measured.
 
 **Not yet checked on a running game.** The walk is covered by unit tests on a made-up memory and class table (the `ccArray` reader, the column line, the escaping, the colour, the caps), and so are finding a singleton (a class object skipped, the kept slot read first, a search again when it goes stale) and matching the texture cache's keys to its textures; running these on the real cocos2d objects of 4Towers has not been tried yet.
+
+## Instruments
+
+Five more ways to read the running game, added in November 2026 on the `4towers-instruments` branch. Each one writes into the message trace's folder, on its clock and with its frame numbers, and each one turns the trace on by itself, so `trace.log` is written even with no selectors. All of them are off unless asked for. The rows they write in `trace.log` have new origins (`rng`, `addr`, `watch`); like `nslog` rows they start with the usual `frame`, `ms`, `thread` and `origin` columns, so a reader that sorts rows by origin first (as `parse_trace.py` does: any origin but `guest` and `host` is read as a text row) reads them without change.
+
+### Random numbers
+
+`--trace-rng` writes a row with origin `rng` for every random number the game draws and every seed it sets. touchHLE's C library has the generators (`src/libc/stdlib.rs`): `rand`, `rand_r`, `random` and `arc4random` draw, `srand`, `srandom` and `sranddev` seed. It implements no other entry point (`arc4random_uniform`, `drand48` and the rest are not there; 4Towers' decompile calls only `arc4random`, `rand` and `random`). cocos2d's `CCRANDOM_0_1()` is a macro over `random()`, so it shows up as `random`.
+
+The row has the 17 columns of a call row:
+
+| column | value |
+| --- | --- |
+| `frame`, `ms`, `thread` | as for any row |
+| `origin` | `rng` |
+| `variant` | `gen` (the generator's value), `replay` (a value from `--rng-replay=`, below) or `seed` |
+| `class` | `-` |
+| `selector` | the function: `arc4random`, `rand`, `rand_r`, `random`, `srand`, `srandom` or `sranddev` |
+| `arg0` | the value returned (or the seed), in hex |
+| `arg0_f32` | the same in decimal: unsigned for `arc4random` and the seeds, signed for the functions that return an `int` (always 0 or more) |
+| `arg1` | the generator's state after the call, in hex; `-` for a seed |
+| `arg1_f32`, `sp0` to `sp3` | `-` |
+| `lr` | the caller's return address, which names the game's function that drew (look it up in the decompile) |
+| `self` | `rand_r`'s seed pointer, `-` otherwise |
+
+For example (from the unit test, tabs between the columns): `12  3456.789  0  rng  gen  -  arc4random  0xdeadbeef  3735928559  0xdeadbeef  -  -  -  -  -  0x0000a1b3  -`.
+
+The generators are touchHLE's own (xorshift32), not Apple's, so the numbers are not the ones the phone drew; the row says when the game drew, how many times, from where, and what it got under touchHLE.
+
+`--rng-replay=FILE` hands the values listed in `FILE` (in the user data directory, next to `trace.log`) to the draws instead, in order, one per draw whatever the function. A line holds:
+
+- a value: decimal (a negative one is taken as its 32 bits) or hex with `0x`;
+- a function name and a value (`arc4random 0x5d1f3c08`): the name is checked against the function that draws it, and a mismatch is logged (once) but the value is still used;
+- or an `rng` row of a `trace.log`, as written above: its function and `arg0` are read, and its seed rows are skipped. So the `rng` rows of one run, cut out of its trace, replay that run's draws.
+
+`#` starts a comment, and a line that is not understood is logged and skipped. The functions that return an `int` take the value masked with `RAND_MAX` (`0x7fffffff`). The generator still runs at each draw, so its state (in the `arg1` column) is the one it would have had, and when the values run out (logged once) the draws carry on with the generator's own values from there. Replay does not need the trace, but with `--trace-rng` each replayed draw is a row with `replay` in the variant column. The file is read once, at startup.
+
+What it costs: nothing when off (one `Option` check per draw). With `--trace-rng` each draw is one unbuffered write to `trace.log`, like a traced call.
+
+The row format and the replay file's grammar are covered by unit tests (`rng_rows_have_the_call_row_columns` in `src/objc/trace.rs`, and `src/libc/stdlib/rng.rs`).

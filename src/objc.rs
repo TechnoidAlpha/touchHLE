@@ -47,7 +47,7 @@ pub use properties::todo_objc_setter;
 pub use selectors::{selector, SEL};
 pub use trace::{
     trace_app_log, trace_capture_frame, trace_finish, trace_lifecycle,
-    trace_note_uncaptured_present, trace_present_frame, trace_touches, trace_wrap_imp,
+    trace_note_uncaptured_present, trace_present_frame, trace_rng, trace_touches, trace_wrap_imp,
 };
 
 use crate::mem::ConstVoidPtr;

@@ -310,6 +310,21 @@ Debugging options:
         each call of that selector. Earlier dumps in that folder are
         removed when the first dump of a run is written.
 
+    --trace-rng
+        Writes a row of origin "rng" to trace.log for every random number
+        the app draws (rand, rand_r, random, arc4random) and every seed it
+        sets (srand, srandom, sranddev): the function, the value, the
+        generator's state after it and the caller's return address. This
+        turns the message trace on even with no selectors.
+
+    --rng-replay=FILE
+        Hands out the values listed in FILE (in the user data directory)
+        to the app's random number draws, in order, one per draw whatever
+        the function, instead of the generated ones. A line holds a value
+        (decimal, or hex with 0x), or a function name and a value, or is
+        an "rng" row of a trace.log (seed rows are skipped); # starts a
+        comment. When the values run out, the generated ones are used.
+
 Other options:
     --preferred-languages=...
         Specifies a list of preferred languages to be reported to the app.

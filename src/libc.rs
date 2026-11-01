@@ -125,7 +125,7 @@ pub struct State {
     pub pthread: pthread::State,
     pub semaphore: semaphore::State,
     pub socket: sys::socket::State,
-    stdlib: stdlib::State,
+    pub stdlib: stdlib::State,
     string: string::State,
     pub stdio: stdio::State,
     time: time::State,

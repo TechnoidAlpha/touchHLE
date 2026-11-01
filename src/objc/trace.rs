@@ -92,6 +92,7 @@ use crate::dyld::HostFunction;
 use crate::frame_capture::{FrameCapture, FRAMES_DIR};
 use crate::frameworks::foundation::ns_string;
 use crate::mem::{ConstPtr, ConstVoidPtr, GuestUSize, Mem, Ptr};
+use crate::options::Options;
 use crate::window::{Coords, FingerId};
 use crate::Environment;
 use peek::{PeekBase, PeekSpec, PeekStep, PeekType};
@@ -273,6 +274,9 @@ pub struct MsgTrace {
     capture_no_restart: bool,
     /// The scene dumps, see [scene].
     scene: SceneDumps,
+    /// `--trace-rng`: write a row per random number draw and seed, see
+    /// [trace_rng].
+    rng: bool,
 }
 
 /// The state of the scene dumps (see [scene] and [trace_present_frame]).
@@ -429,16 +433,15 @@ fn periodic_capture(capture_every: u32) -> String {
 
 impl MsgTrace {
     /// Gather the selectors from the option and the file, and open the log if
-    /// there are any or `capture_every` or `scene_every` is not 0. At most
-    /// `capture_max` frames are saved (0: no cap). Returns [None] when the
-    /// trace is off.
-    fn open(
-        option_selectors: &[String],
-        capture_every: u32,
-        capture_max: u32,
-        scene_every: u32,
-        bundle_id: &str,
-    ) -> Option<MsgTrace> {
+    /// there are any, or `--capture-frames=` or `--dump-scene-every=` is not
+    /// 0, or `--trace-rng` is on. At most `--capture-frames-max=` frames are
+    /// saved (0: no cap). Returns [None] when the trace is off.
+    fn open(options: &Options, bundle_id: &str) -> Option<MsgTrace> {
+        let option_selectors = &options.trace_selectors;
+        let capture_every = options.capture_frames;
+        let capture_max = options.capture_frames_max;
+        let scene_every = options.dump_scene_every;
+        let rng = options.trace_rng;
         let base = crate::paths::user_data_base_path();
         // An item of the option is a line of the file with ';' between its
         // words (an options file line cannot hold spaces in one option).
@@ -532,7 +535,7 @@ impl MsgTrace {
                 }
             }
         }
-        if traced.is_empty() && capture_every == 0 && scene_every == 0 {
+        if traced.is_empty() && capture_every == 0 && scene_every == 0 && !rng {
             return None;
         }
         let png_after: Vec<&str> = list
@@ -584,6 +587,10 @@ impl MsgTrace {
              # the column count differs per selector. Peeks are read when the call\n\
              # starts, before the method runs (the state after it is in the next\n\
              # traced row's peeks); '-' is a peek that could not be read\n\
+             # origin rng: a random number draw or seed ({}): variant gen, replay\n\
+             # or seed, the function in selector, the value in arg0 (hex) and\n\
+             # arg0_f32 (decimal), the generator's state after it in arg1, lr\n\
+             # the caller, self the seed pointer of rand_r\n\
              {}\
              frame\tms\tthread\torigin\tvariant\tclass\tselector\targ0\targ0_f32\targ1\targ1_f32\tsp0\tsp1\tsp2\tsp3\tlr\tself\n",
             crate::branding(),
@@ -604,6 +611,7 @@ impl MsgTrace {
             } else {
                 scene_after.join(",")
             },
+            if rng { "on" } else { "off" },
             peek_lines,
         );
         if let Err(e) = out.write_all(header.as_bytes()) {
@@ -658,6 +666,7 @@ impl MsgTrace {
                 every: scene_every,
                 ..SceneDumps::default()
             },
+            rng,
         })
     }
 }
@@ -731,25 +740,11 @@ pub fn trace_touches(env: &mut Environment, phase: &str, touches: &HashMap<Finge
 }
 
 impl ObjC {
-    /// Turn the message trace on if any selectors were chosen or
-    /// `capture_every` (`--capture-frames=`) or `scene_every`
-    /// (`--dump-scene-every=`) is not 0. `capture_max` is
-    /// `--capture-frames-max=`.
-    pub fn start_trace(
-        &mut self,
-        option_selectors: &[String],
-        capture_every: u32,
-        capture_max: u32,
-        scene_every: u32,
-        bundle_id: &str,
-    ) {
-        self.trace = MsgTrace::open(
-            option_selectors,
-            capture_every,
-            capture_max,
-            scene_every,
-            bundle_id,
-        );
+    /// Turn the message trace on if any selectors were chosen, or
+    /// `--capture-frames=` or `--dump-scene-every=` is not 0, or
+    /// `--trace-rng` is on (see [MsgTrace::open]).
+    pub fn start_trace(&mut self, options: &Options, bundle_id: &str) {
+        self.trace = MsgTrace::open(options, bundle_id);
     }
 }
 
@@ -1431,6 +1426,77 @@ pub fn trace_app_log(env: &mut Environment, message: &str) {
     let _ = trace.out.write_all(row.as_bytes());
 }
 
+/// The row for a random number draw or seed: origin `rng`, `source` in the
+/// variant column (`gen`, `replay` or `seed`), `-` for the class, `func` in
+/// the selector column, `value` in hex in `arg0` and in decimal in
+/// `arg0_f32` (signed for the functions that return an `int`), the
+/// generator's `state` after the call in `arg1` (`-` for a seed), `-` in
+/// `arg1_f32` and the four stack columns, the caller's return address in
+/// `lr` and the seed pointer of `rand_r` in `self` (`-` otherwise). So the
+/// row has the 17 columns of a call row.
+#[allow(clippy::too_many_arguments)]
+fn rng_row(
+    frame: u32,
+    ms: f64,
+    thread: usize,
+    func: &str,
+    source: &str,
+    value: u32,
+    state: Option<u32>,
+    lr: u32,
+    seed_ptr: Option<u32>,
+) -> String {
+    let decimal = if func == "arc4random" || source == "seed" {
+        value.to_string()
+    } else {
+        (value as i32).to_string()
+    };
+    let hex = |word: Option<u32>| word.map_or("-".to_string(), |w| format!("{w:#010x}"));
+    format!(
+        "{frame}\t{ms:.3}\t{thread}\trng\t{source}\t-\t{func}\t{value:#010x}\t{decimal}\t{}\t-\t-\t-\t-\t-\t{lr:#010x}\t{}\n",
+        hex(state),
+        hex(seed_ptr),
+    )
+}
+
+/// Called by the C library's random number functions (`rand`, `rand_r`,
+/// `random`, `arc4random`) with each value they return, and by the seeding
+/// functions (`srand`, `srandom`, `sranddev`) with the seed. When the trace
+/// is on with `--trace-rng`, writes a row with origin `rng` (see
+/// [rng_row]). `source` is `gen` for a generated value, `replay` for one
+/// from `--rng-replay=`, `seed` for a seed. The `lr` column is the caller's
+/// return address, so the row names the guest function that drew.
+pub fn trace_rng(
+    env: &mut Environment,
+    func: &str,
+    source: &str,
+    value: u32,
+    state: Option<u32>,
+    seed_ptr: Option<u32>,
+) {
+    let elapsed_ms = env.startup_time.elapsed().as_secs_f64() * 1000.0;
+    let thread = env.current_thread;
+    let lr = env.cpu.regs()[Cpu::LR];
+    let Some(trace) = env.objc.trace.as_mut() else {
+        return;
+    };
+    if !trace.rng {
+        return;
+    }
+    let row = rng_row(
+        trace.frame,
+        elapsed_ms,
+        thread,
+        func,
+        source,
+        value,
+        state,
+        lr,
+        seed_ptr,
+    );
+    let _ = trace.out.write_all(row.as_bytes());
+}
+
 /// One `trace.log` row for a scene dump: the frame, ms and thread as for
 /// any row, origin `mark`, `-` for the variant and the class, `text` (the
 /// reason and the file) in the selector column with each tab, carriage
@@ -1585,13 +1651,50 @@ fn fmt_f32(bits: u32) -> String {
 mod tests {
     use super::{
         capture_due, class_chain_names, lifecycle_row, nslog_row, parse_selector_line,
-        returns_struct, touch_row, Class, ClassHostObject, Filter, Markers, ObjC, Ptr, Traced,
-        TrampolineCache,
+        returns_struct, rng_row, touch_row, Class, ClassHostObject, Filter, Markers, ObjC, Ptr,
+        Traced, TrampolineCache,
     };
     use crate::objc::classes::InitializationStatus;
     use crate::objc::{nil, TrivialHostObject};
     use crate::window::FingerId;
     use std::collections::HashMap;
+
+    #[test]
+    fn rng_rows_have_the_call_row_columns() {
+        let row = rng_row(
+            12,
+            3456.7891,
+            0,
+            "arc4random",
+            "gen",
+            0xdead_beef,
+            Some(0xdead_beef),
+            0xa1b3,
+            None,
+        );
+        assert_eq!(
+            row,
+            "12\t3456.789\t0\trng\tgen\t-\tarc4random\t0xdeadbeef\t3735928559\t0xdeadbeef\t-\t-\t-\t-\t-\t0x0000a1b3\t-\n"
+        );
+        assert_eq!(row.trim_end().split('\t').count(), 17);
+        let row = rng_row(
+            1,
+            2.0,
+            1,
+            "rand_r",
+            "replay",
+            7,
+            Some(9),
+            0x10,
+            Some(0x2000),
+        );
+        assert_eq!(
+            row,
+            "1\t2.000\t1\trng\treplay\t-\trand_r\t0x00000007\t7\t0x00000009\t-\t-\t-\t-\t-\t0x00000010\t0x00002000\n"
+        );
+        let row = rng_row(0, 0.0, 0, "srandom", "seed", u32::MAX, None, 0, None);
+        assert!(row.contains("\tsrandom\t0xffffffff\t4294967295\t-\t"));
+    }
 
     #[test]
     fn nslog_rows_fill_every_column() {

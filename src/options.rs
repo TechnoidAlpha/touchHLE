@@ -75,6 +75,13 @@ pub struct Options {
     /// `--dump-scene-every=N`: dump the cocos2d scene every Nth presented
     /// frame while the message trace is on (0 is off). See src/objc/trace.rs.
     pub dump_scene_every: u32,
+    /// `--trace-rng`: write each random number draw and seed to the message
+    /// trace. See src/objc/trace.rs.
+    pub trace_rng: bool,
+    /// `--rng-replay=FILE`: hand out the values in FILE (in the user data
+    /// directory) instead of generated random numbers. See
+    /// src/libc/stdlib/rng.rs.
+    pub rng_replay: Option<PathBuf>,
     /// `--bundle-files-ignore-case`, see
     /// [crate::fs::Fs::set_bundle_files_ignore_case].
     pub bundle_files_ignore_case: bool,
@@ -115,6 +122,8 @@ impl Default for Options {
             capture_frames: 0,
             capture_frames_max: 3000,
             dump_scene_every: 0,
+            trace_rng: false,
+            rng_replay: None,
             bundle_files_ignore_case: false,
         }
     }
@@ -291,6 +300,10 @@ impl Options {
             self.dump_scene_every = value
                 .parse()
                 .map_err(|_| "Invalid value for --dump-scene-every=".to_string())?;
+        } else if arg == "--trace-rng" {
+            self.trace_rng = true;
+        } else if let Some(path) = arg.strip_prefix("--rng-replay=") {
+            self.rng_replay = Some(crate::paths::user_data_base_path().join(path));
         } else if arg == "--bundle-files-ignore-case" {
             self.bundle_files_ignore_case = true;
         } else if arg == "--ignore-gl-errors" {

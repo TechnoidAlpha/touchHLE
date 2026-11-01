@@ -18,6 +18,7 @@ use std::str::FromStr;
 use std::time::SystemTime;
 
 pub mod qsort;
+pub mod rng;
 
 #[derive(Default)]
 pub struct State {
@@ -25,6 +26,44 @@ pub struct State {
     random: u32,
     arc4random: u32,
     fcvt_buf: Option<MutPtr<u8>>,
+    /// Values to hand out instead of the generators' own (`--rng-replay=`),
+    /// see [rng].
+    replay: Option<rng::Replay>,
+}
+
+impl State {
+    /// Read the replay file of `--rng-replay=`: from then on each draw
+    /// (`rand`, `rand_r`, `random`, `arc4random`) returns its next value,
+    /// until they are used up. A file that cannot be read is logged and
+    /// changes nothing.
+    pub fn start_replay(&mut self, path: &std::path::Path) {
+        let text = match std::fs::read_to_string(path) {
+            Ok(text) => text,
+            Err(e) => {
+                log!(
+                    "Warning: could not read {}, no random number replay: {}",
+                    path.display(),
+                    e
+                );
+                return;
+            }
+        };
+        let (replay, bad) = rng::Replay::parse(&text);
+        for (line, why) in bad {
+            log!(
+                "Warning: {} line {} is not understood, skipped: {}",
+                path.display(),
+                line,
+                why
+            );
+        }
+        log!(
+            "Random number replay on: {} value(s) from {}",
+            replay.len(),
+            path.display()
+        );
+        self.replay = Some(replay);
+    }
 }
 
 // Sizes of zero are implementation-defined. macOS will happily give you back
@@ -196,6 +235,7 @@ const RAND_MAX: i32 = i32::MAX;
 
 fn srand(env: &mut Environment, seed: u32) {
     env.libc_state.stdlib.rand = seed;
+    crate::objc::trace_rng(env, "srand", "seed", seed, None, None);
 }
 
 // BSD's rand() seed function — we just use host system time,
@@ -207,17 +247,75 @@ fn sranddev(env: &mut Environment) {
         .as_nanos();
     let seed = (time ^ (time >> 32)) as u32;
     env.libc_state.stdlib.rand = seed;
+    crate::objc::trace_rng(env, "sranddev", "seed", seed, None, None);
+}
+
+/// The result of a draw by `func`: the next replayed value if a replay is
+/// on and has values left, otherwise `generated`, the generator's own.
+/// `mask` is applied to a replayed value (`RAND_MAX` for the functions that
+/// return a non-negative `int`). The generator's state is advanced as
+/// usual either way, so a replay that runs out carries on with the values
+/// the generator would have given. The draw is written to the message trace
+/// (see [crate::objc::trace_rng]) with `state`, the generator's state after
+/// it, and `seed_ptr` for `rand_r`.
+fn draw(
+    env: &mut Environment,
+    func: &str,
+    generated: u32,
+    mask: u32,
+    state: u32,
+    seed_ptr: Option<u32>,
+) -> u32 {
+    let replayed = match env.libc_state.stdlib.replay.as_mut() {
+        Some(replay) => {
+            let (value, note) = replay.next(func);
+            match note {
+                Some(rng::ReplayNote::OtherFunction {
+                    index,
+                    written_for,
+                    drawn_by,
+                }) => {
+                    log!(
+                        "Random number replay: value {} was written for {} but {} drew it; used anyway (logged once)",
+                        index + 1,
+                        written_for,
+                        drawn_by
+                    );
+                }
+                Some(rng::ReplayNote::UsedUp { count, drawn_by }) => {
+                    log!(
+                        "Random number replay: all {} value(s) used, {} and later draws get the generator's own (logged once)",
+                        count,
+                        drawn_by
+                    );
+                }
+                None => (),
+            }
+            value.map(|value| value & mask)
+        }
+        None => None,
+    };
+    let (value, source) = match replayed {
+        Some(value) => (value, "replay"),
+        None => (generated, "gen"),
+    };
+    crate::objc::trace_rng(env, func, source, value, Some(state), seed_ptr);
+    value
 }
 
 fn rand(env: &mut Environment) -> i32 {
     env.libc_state.stdlib.rand = prng(env.libc_state.stdlib.rand);
-    (env.libc_state.stdlib.rand as i32) & RAND_MAX
+    let state = env.libc_state.stdlib.rand;
+    let generated = ((state as i32) & RAND_MAX) as u32;
+    draw(env, "rand", generated, RAND_MAX as u32, state, None) as i32
 }
 fn rand_r(env: &mut Environment, seed_ptr: MutPtr<u32>) -> i32 {
     let mut seed = env.mem.read(seed_ptr);
     seed = prng(seed);
     env.mem.write(seed_ptr, seed);
-    (seed as i32) & RAND_MAX
+    let generated = ((seed as i32) & RAND_MAX) as u32;
+    let ptr = Some(seed_ptr.to_bits());
+    draw(env, "rand_r", generated, RAND_MAX as u32, seed, ptr) as i32
 }
 
 // BSD's "better" random number generator, with an implementation that is not
@@ -227,18 +325,22 @@ fn srandom(env: &mut Environment, seed: u32) {
     set_errno(env, 0);
 
     env.libc_state.stdlib.random = seed;
+    crate::objc::trace_rng(env, "srandom", "seed", seed, None, None);
 }
 fn random(env: &mut Environment) -> i32 {
     // TODO: handle errno properly
     set_errno(env, 0);
 
     env.libc_state.stdlib.random = prng(env.libc_state.stdlib.random);
-    (env.libc_state.stdlib.random as i32) & RAND_MAX
+    let state = env.libc_state.stdlib.random;
+    let generated = ((state as i32) & RAND_MAX) as u32;
+    draw(env, "random", generated, RAND_MAX as u32, state, None) as i32
 }
 
 fn arc4random(env: &mut Environment) -> u32 {
     env.libc_state.stdlib.arc4random = prng(env.libc_state.stdlib.arc4random);
-    env.libc_state.stdlib.arc4random
+    let state = env.libc_state.stdlib.arc4random;
+    draw(env, "arc4random", state, u32::MAX, state, None)
 }
 
 #[allow(non_camel_case_types)]
