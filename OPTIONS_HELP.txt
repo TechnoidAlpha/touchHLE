@@ -355,6 +355,22 @@ Debugging options:
         like) are not seen. This turns the message trace on even with no
         selectors.
 
+    --state-every=N
+        Writes a snapshot of the app's objects every Nth presented frame to
+        state.jsonl in the user data directory: one JSON line per live
+        object of the chosen classes, with every instance variable by name,
+        read from memory without calling the app. Objects are found in the
+        cocos2d scene, in the app's static variables, and through the
+        object pointers, arrays and dictionaries of the objects found. N
+        must be 1 or more; 0 is off. This turns the message trace on even
+        with no selectors.
+
+    --state-classes=...
+        The classes --state-every= writes, separated by commas (a subclass
+        of one is written too), for example --state-classes=Creeps,Tower.
+        The default is 4Towers' Game, towersLayer, towerGrid, Tower,
+        Creeps, Bullets and SharedData.
+
 Other options:
     --preferred-languages=...
         Specifies a list of preferred languages to be reported to the app.

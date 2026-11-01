@@ -22,7 +22,7 @@ use crate::libc::stdlib::qsort::qsort_generic;
 use crate::mem::{ConstPtr, MutPtr, MutVoidPtr, Ptr};
 use crate::objc::{
     autorelease, id, msg, msg_class, msg_send, nil, objc_classes, release, retain, Class,
-    ClassExports, HostObject, NSZonePtr, SEL,
+    ClassExports, HostObject, NSZonePtr, ObjC, SEL,
 };
 use crate::Environment;
 
@@ -40,6 +40,24 @@ pub(super) struct ArrayHostObject {
     pub(super) array: Vec<id>,
 }
 impl HostObject for ArrayHostObject {}
+
+/// The objects in `array` if it is one of touchHLE's arrays, in order, read
+/// from its host object without calling the guest and without panicking
+/// (for the message trace's state stream, which looks through the game's
+/// arrays). [None] for anything else: a nil or unknown pointer, or an
+/// object of another class.
+pub fn host_array_items(objc: &ObjC, array: id) -> Option<Vec<id>> {
+    let mut host_object = objc.get_host_object(array)?;
+    // A host object may wrap its superclass's, as in [ObjC::borrow]. A
+    // bound, in case a chain loops.
+    for _ in 0..16 {
+        if let Some(found) = host_object.as_any().downcast_ref::<ArrayHostObject>() {
+            return Some(found.array.clone());
+        }
+        host_object = host_object.as_superclass()?;
+    }
+    None
+}
 
 pub const CLASSES: ClassExports = objc_classes! {
 

@@ -86,6 +86,7 @@ mod addr;
 mod coverage;
 mod peek;
 mod scene;
+mod state;
 mod watch;
 
 use super::{id, nil, Class, ClassHostObject, ObjC, IMP, SEL};
@@ -297,6 +298,16 @@ pub struct MsgTrace {
     /// number for it.
     watches: Vec<Watch>,
     watch_by_cpu: HashMap<usize, usize>,
+    /// The state stream (see [state]), if `--state-every=` is not 0.
+    state: Option<StateOut>,
+}
+
+/// The state stream's file and what it keeps between snapshots.
+struct StateOut {
+    /// `--state-every=N`: a snapshot every Nth frame.
+    every: u32,
+    stream: state::StateStream,
+    file: File,
 }
 
 /// An address hook (see [addr]) and its peeks.
@@ -603,8 +614,9 @@ impl MsgTrace {
     /// Gather the selectors from the option and the file, and open the log if
     /// there are any, or `--capture-frames=` or `--dump-scene-every=` is not
     /// 0, or `--trace-rng` or `--coverage` is on, or there are address hooks
-    /// or watchpoints. At most `--capture-frames-max=` frames are saved (0:
-    /// no cap). Returns [None] when the trace is off.
+    /// or watchpoints, or `--state-every=` is not 0. At most
+    /// `--capture-frames-max=` frames are saved (0: no cap). Returns [None]
+    /// when the trace is off.
     fn open(options: &Options, bundle_id: &str) -> Option<MsgTrace> {
         let option_selectors = &options.trace_selectors;
         let capture_every = options.capture_frames;
@@ -612,6 +624,7 @@ impl MsgTrace {
         let scene_every = options.dump_scene_every;
         let rng = options.trace_rng;
         let coverage = options.coverage;
+        let state_every = options.state_every;
         let hooks = hook_lines(options);
         let watches: Vec<Watch> = watch_lines(options, true)
             .into_iter()
@@ -722,6 +735,7 @@ impl MsgTrace {
             && hooks.is_empty()
             && !coverage
             && watches.is_empty()
+            && state_every == 0
         {
             return None;
         }
@@ -766,6 +780,14 @@ impl MsgTrace {
                 "# coverage (coverage.txt): {}\n",
                 if coverage { "on" } else { "off" }
             )
+            + &match state_every {
+                0 => "# state stream (state.jsonl): off\n".to_string(),
+                n => format!(
+                    "# state stream (state.jsonl): every {} frames, classes {}\n",
+                    n,
+                    state_classes(options).join(" ")
+                ),
+            }
             + &hooks
                 .iter()
                 .map(|hook| addr::hook_header_line(&hook.line))
@@ -889,7 +911,70 @@ impl MsgTrace {
             coverage,
             watches,
             watch_by_cpu: HashMap::new(),
+            state: open_state(options, bundle_id),
         })
+    }
+}
+
+/// The classes the state stream writes: `--state-classes=`, or by default
+/// the game's (see [state::DEFAULT_CLASSES]).
+fn state_classes(options: &Options) -> Vec<String> {
+    if options.state_classes.is_empty() {
+        state::DEFAULT_CLASSES
+            .iter()
+            .map(|name| name.to_string())
+            .collect()
+    } else {
+        options.state_classes.clone()
+    }
+}
+
+/// Create `state.jsonl` and write its header line, if `--state-every=` is
+/// not 0. Returns [None] (and logs why) if it cannot be written; the rest
+/// of the trace carries on without it.
+fn open_state(options: &Options, bundle_id: &str) -> Option<StateOut> {
+    let every = options.state_every;
+    if every == 0 {
+        return None;
+    }
+    let classes = state_classes(options);
+    let build = format!(
+        "{}{}{}",
+        crate::branding(),
+        if crate::branding().is_empty() {
+            ""
+        } else {
+            " "
+        },
+        crate::VERSION
+    );
+    let path = crate::paths::user_data_base_path().join(state::STATE_FILE);
+    let result = File::create(&path).and_then(|mut file| {
+        file.write_all(state::header_line(&build, bundle_id, every, &classes).as_bytes())?;
+        Ok(file)
+    });
+    match result {
+        Ok(file) => {
+            log!(
+                "State stream on: every {} frames, classes {}, written to {}",
+                every,
+                classes.join(" "),
+                path.display()
+            );
+            Some(StateOut {
+                every,
+                stream: state::StateStream::new(classes),
+                file,
+            })
+        }
+        Err(e) => {
+            log!(
+                "Warning: could not write {}, no state stream: {}",
+                path.display(),
+                e
+            );
+            None
+        }
     }
 }
 
@@ -1018,6 +1103,14 @@ pub fn trace_present_frame(env: &mut Environment) -> Option<FrameCaptureTicket> 
         trace.capture_pending = true;
         start_capture_for_scene(trace);
         write_scene_dump(env, frame, elapsed.as_secs_f64() * 1000.0, ms, &reason);
+    }
+    let trace = env.objc.trace.as_mut()?;
+    if trace
+        .state
+        .as_ref()
+        .is_some_and(|state| frame.is_multiple_of(state.every))
+    {
+        write_state(env, frame, ms);
     }
     let trace = env.objc.trace.as_mut()?;
     let due = capture_due(frame, trace.capture_every, trace.capture_pending);
@@ -1156,6 +1249,49 @@ fn write_scene_dump(env: &mut Environment, frame: u32, ms: f64, whole_ms: u64, r
             Err(e) => {
                 log!("Warning: could not write {}: {}", path.display(), e);
             }
+        }
+    }
+    env.objc.trace = Some(trace);
+}
+
+/// Write a snapshot of the state stream for frame `frame`, presented `ms`
+/// milliseconds after startup, to `state.jsonl` (see [state]). Only reads
+/// guest memory and the class table: nothing here calls the guest. If the
+/// file cannot be written, that is logged and the stream stops.
+fn write_state(env: &mut Environment, frame: u32, ms: u64) {
+    use scene::SceneMemory;
+
+    // Taken out while it is used, so the class table can be read alongside.
+    let Some(mut trace) = env.objc.trace.take() else {
+        return;
+    };
+    if let Some(out) = trace.state.as_mut() {
+        let mut guest = scene::GuestScene::new(&env.objc, &env.mem);
+        let bin = env.bins.first();
+        let director = bin.and_then(|bin| {
+            scene::find_singleton(&mut guest, bin, &mut out.stream.director_slot, "CCDirector")
+        });
+        let running = director
+            .and_then(|director| guest.ivar_addr(director, "runningScene_").ok())
+            .and_then(|addr| guest.word(addr).ok())
+            .filter(|&scene| scene != 0);
+        let sections = bin
+            .map(|bin| {
+                bin.sections
+                    .iter()
+                    .filter(|section| scene::DATA_SECTIONS.contains(&section.name.as_str()))
+                    .map(|section| (section.addr, section.size))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let roots = state::Roots {
+            scene: running,
+            sections,
+        };
+        let text = state::snapshot(&mut guest, &mut out.stream, &roots, frame, ms);
+        if let Err(e) = out.file.write_all(text.as_bytes()) {
+            log!("Warning: could not write the state stream, it stops: {}", e);
+            trace.state = None;
         }
     }
     env.objc.trace = Some(trace);

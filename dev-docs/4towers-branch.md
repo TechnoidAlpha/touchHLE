@@ -501,3 +501,46 @@ Limits:
 - What it costs: every access to a watched page, read or write, goes through a callback (a function call instead of one instruction), and each write to the watched bytes leaves the JIT twice. A field that is written every frame is fine; a page that holds a hot array is slower. Other pages are not affected, and with no watchpoint nothing changes.
 
 The parsing of the three files' lines, the rows, the header lines, the range merging and the watch bookkeeping (which writes touch which ranges, the halt and the step after it, the store-exclusive case) are covered by unit tests (`src/objc/trace/addr.rs`, `coverage.rs`, `watch.rs`, `src/cpu/watch.rs`, and the hook peeks in `src/objc/trace/peek.rs`).
+
+### State stream
+
+`--state-every=N` writes, every Nth presented frame (counting from frame 0), a snapshot of every live object of the chosen classes, with every instance variable by name, to `state.jsonl` next to `trace.log`. It is made for comparing the game's state with the remake's: positions, hit points, timers, flags, as the game holds them, on the trace's frame clock. 30 is once a second at the game's 30 frames a second.
+
+The classes are `--state-classes=` (names separated by commas), or by default the game's: `Game`, `towersLayer`, `towerGrid` (the towers on the map), `Tower`, `Creeps`, `Bullets` and `SharedData` (the names in the class dump, `decomp/headers/`). A class is matched on the class chain, as for Receiver class above, so a subclass of a chosen class is written too (`--state-classes=CCNode` writes every node).
+
+Objects are found without calling the game, from three places:
+
+- the cocos2d scene: every node from the `CCDirector`'s `runningScene_` down, as for the scene dump;
+- the app binary's data sections (`__data`, `__bss`, `__common`): every word that points at an instance of a chosen class, such as the static variable that holds `SharedData`;
+- the objects found so far: each object-typed instance variable of a chosen object (also inside a struct or a C array, like `towersLayer`'s `towers` grid) that points at another chosen object, or at an array (touchHLE's `NSArray` and `NSMutableArray`, cocos2d's `CCArray`) or a dictionary (touchHLE's) whose items are. So the creeps and bullets in `SharedData`'s `mcreepsArray`, `bulletsArray` and the rest are found even when they are not in the scene.
+
+The instance variables come from each class's ivar list in the app binary (cocos2d is linked into it, so `CCNode`'s are there too): name, type encoding, size, and the offset touchHLE settled on. An object line has those of its class and every superclass, superclasses first, which is their order in memory.
+
+The file is JSON Lines: one JSON object per line, each with a `kind`:
+
+- `header`, the first line: `schema` (`touchHLE-state-1`; it changes if the format does), `touchhle` (the build), `app`, `every`, `classes`, and the caps `max_objects` and `max_elements`.
+- `snapshot`, one per snapshot, before its objects: `frame` and `ms` (the trace's clock: frames presented so far, milliseconds since touchHLE started, as in `trace.log`), `objects` (how many were written), `by_class` (how many of each class), `found` (how many were found in the scene, in a static variable and through another object's instance variable) and `notes` (what could not be read, and a note if a cap cut the snapshot).
+- `class`, the first time a class is written in the file, before its first object: `class`, `chain` (the class and its superclasses), `size` (of an instance), `ivars` (one entry per instance variable: `key`, the key in an object line, which is the name, or `Class.name` if a superclass has one of that name too; `class`, the class that declares it; `name`; `type`, the type encoding as the binary has it; `offset`; `size`; `decoded`, false if the value is written as hex bytes) and `notes`.
+- `object`, one per object: `frame`, `class`, `addr` (the object's address, as a string in hex), `via` (where it was found: `scene`, `static 0x00151230`, or the holding object's class and the path to it, as `SharedData.mcreepsArray[3]` or `towersLayer.towers[2][5]`; `{}` for a dictionary's value), `ivars` (by key), and `cut: true` if a C array or hex value was cut at `max_elements`. If the class's ivars could not be read, `ivars` is `null` and `error` says why.
+
+Values follow the type encoding:
+
+| type | value |
+| --- | --- |
+| integers, `BOOL` (`c C s S i I l L q Q B`) | a number (a `BOOL` is a signed `char`, so `1`, or `-1` for a 255) |
+| `float`, `double` | a number, or `"nan"`, `"inf"`, `"-inf"` |
+| object (`@`), class, selector, any other pointer | its address as a string, `"0x0015bb50"` (an object of a chosen class has its own line, with that `addr`) |
+| struct | a JSON object by field name, as `{"x": 160, "y": 240}` (by index, `"0"`, `"1"`, when the encoding has no names) |
+| C array | a JSON array, at most `max_elements` (1024) elements |
+| bitfield (`bN`) | a number: the binary gives only the byte offset, shared by the bitfields declared next to each other, so the bits are counted from the lowest, the first of a run at one offset from bit 0 and each next one where the one before ended (`CCNode`'s `isTransformDirty_`, `isInverseDirty_` and `isTransformGLDirty_` are bits 0, 1 and 2 of one byte) |
+| a union, or a type not decoded | its bytes in hex, in memory order, as `"01020304"` |
+
+For example (from a run on the title screen with `--state-classes=SharedData,MainMenu,CCMenu,CCDirector`): `{"kind":"snapshot","frame":120,"ms":6057,"objects":6,"by_class":{"CCDirectorTimer":1,"CCMenu":3,"MainMenu":1,"SharedData":1},"found":{"scene":4,"static":2,"ivar":0},"notes":[]}`, and an object line starts `{"kind":"object","frame":120,"class":"MainMenu","addr":"0x0015ac40","via":"scene","ivars":{"rotation_":0,"scaleX_":1,"scaleY_":1,"position_":{"x":0,"y":0},...`.
+
+Caps: at most 5000 objects per snapshot (`max_objects`; the snapshot's notes say if it was reached), 1024 elements of a C array or bytes of a hex value per instance variable, and the scene walk's caps (5000 nodes, 32 levels).
+
+Limits: an object is only found if it is in the scene, in a static variable, or reachable from another chosen object through an object pointer, an array or a dictionary (not a set, a C array of pointers typed `void *`, or a container inside a container). A value is read as it is in memory when the frame is presented, which is between the game's updates.
+
+What it costs: nothing when off. A snapshot walks the scene, scans the data sections (a few KiB for this game), and reads each object's instance variables; the class layouts are read once. Each snapshot is one write to `state.jsonl`. With the default classes on the title screen it is a few objects; in a level, a few hundred, each line a few KiB.
+
+The type decoding, the layout of the values, the search through the scene, the statics, arrays and instance variables, and the lines are covered by unit tests (`src/objc/trace/state.rs`).

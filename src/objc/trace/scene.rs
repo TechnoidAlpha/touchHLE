@@ -443,7 +443,10 @@ pub(super) fn ccarray_items<M: SceneMemory + ?Sized>(m: &M, data: u32) -> Result
 
 /// The children of `node`, in the order of its `children_` `CCArray`.
 /// Empty if `children_` is nil (cocos2d makes it at the first `addChild:`).
-fn children_of<M: SceneMemory + ?Sized>(m: &mut M, node: u32) -> Result<Vec<u32>, String> {
+pub(super) fn children_of<M: SceneMemory + ?Sized>(
+    m: &mut M,
+    node: u32,
+) -> Result<Vec<u32>, String> {
     let array = pointer(m, node, "children_")?;
     if array == 0 {
         return Ok(Vec::new());
@@ -646,8 +649,8 @@ pub(super) fn dump_text<M: SceneMemory + ?Sized>(
 
 /// [SceneMemory] over the real guest memory and class table.
 pub(super) struct GuestScene<'a> {
-    objc: &'a ObjC,
-    mem: &'a Mem,
+    pub(super) objc: &'a ObjC,
+    pub(super) mem: &'a Mem,
     /// Per isa: what is known of the class, or [None] if the word is not a
     /// class touchHLE knows.
     classes: HashMap<u32, Option<Rc<ClassInfo>>>,
@@ -745,7 +748,7 @@ fn is_instance_of<M: SceneMemory + ?Sized>(m: &mut M, object: u32, class: &str) 
 }
 
 /// The data sections of the app binary searched for singletons.
-const DATA_SECTIONS: [&str; 3] = ["__data", "__bss", "__common"];
+pub(super) const DATA_SECTIONS: [&str; 3] = ["__data", "__bss", "__common"];
 
 /// Find the instance of `class` that a static variable of the app binary
 /// points at: cocos2d keeps its singletons (`CCDirector`,

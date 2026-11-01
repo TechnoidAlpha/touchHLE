@@ -93,6 +93,12 @@ pub struct Options {
     /// of `trace_watch.txt` with `;` between its words. See
     /// src/objc/trace/watch.rs.
     pub trace_watch: Vec<String>,
+    /// `--state-every=N`: write the state stream every Nth presented frame
+    /// (0 is off). See src/objc/trace/state.rs.
+    pub state_every: u32,
+    /// `--state-classes=`: the classes the state stream writes; empty for
+    /// the default ones.
+    pub state_classes: Vec<String>,
     /// `--bundle-files-ignore-case`, see
     /// [crate::fs::Fs::set_bundle_files_ignore_case].
     pub bundle_files_ignore_case: bool,
@@ -138,6 +144,8 @@ impl Default for Options {
             trace_addresses: Vec::new(),
             coverage: false,
             trace_watch: Vec::new(),
+            state_every: 0,
+            state_classes: Vec::new(),
             bundle_files_ignore_case: false,
         }
     }
@@ -336,6 +344,17 @@ impl Options {
                     .filter(|s| !s.is_empty())
                     .map(String::from),
             );
+        } else if let Some(value) = arg.strip_prefix("--state-every=") {
+            self.state_every = value
+                .parse()
+                .map_err(|_| "Invalid value for --state-every=".to_string())?;
+        } else if let Some(values) = arg.strip_prefix("--state-classes=") {
+            self.state_classes = values
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(String::from)
+                .collect();
         } else if arg == "--bundle-files-ignore-case" {
             self.bundle_files_ignore_case = true;
         } else if arg == "--ignore-gl-errors" {
