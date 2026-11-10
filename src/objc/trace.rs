@@ -154,6 +154,8 @@ struct Markers {
     png: bool,
     /// `scene`: dump the scene when the next frame is presented.
     scene: bool,
+    /// `profile`: write a `profile` row before the method runs (LIVE8).
+    profile: bool,
     /// The selector's peeks: an index into [MsgTrace::peek_sets], or [None]
     /// if it has none.
     peeks: Option<usize>,
@@ -169,6 +171,8 @@ struct Filter {
     png: bool,
     /// `scene` on any of those lines.
     scene: bool,
+    /// `profile` on any of those lines.
+    profile: bool,
 }
 
 /// A traced selector: who it is traced for, and its peeks.
@@ -186,7 +190,7 @@ impl Traced {
     /// Add a line of this selector with receiver class `class` and the
     /// `png` and `scene` markers if `png` and `scene`. A class listed twice
     /// gets one filter.
-    fn add(&mut self, class: Option<&str>, png: bool, scene: bool) {
+    fn add(&mut self, class: Option<&str>, png: bool, scene: bool, profile: bool) {
         match self
             .filters
             .iter_mut()
@@ -195,11 +199,13 @@ impl Traced {
             Some(filter) => {
                 filter.png |= png;
                 filter.scene |= scene;
+                filter.profile |= profile;
             }
             None => self.filters.push(Filter {
                 class: class.map(str::to_string),
                 png,
                 scene,
+                profile,
             }),
         }
     }
@@ -231,6 +237,7 @@ impl Traced {
         taken.then_some(Markers {
             png,
             scene,
+            profile: false,
             peeks: self.peeks,
         })
     }
@@ -554,6 +561,8 @@ struct SelectorLine {
     png: bool,
     /// The `scene` marker.
     scene: bool,
+    /// The `profile` marker (LIVE8).
+    profile: bool,
     /// The peek specs, in the order given.
     peeks: Vec<PeekSpec>,
     /// Words that are neither a marker nor a peek: ignored, logged once.
@@ -730,7 +739,7 @@ impl MsgTrace {
                 traced.len() - 1
             });
             let entry = &mut traced[index];
-            entry.add(line.class.as_deref(), line.png, line.scene);
+            entry.add(line.class.as_deref(), line.png, line.scene, line.profile);
             if line.peeks.is_empty() {
                 continue;
             }
@@ -2836,6 +2845,21 @@ mod tests {
     }
 
     #[test]
+    fn selector_lines_take_the_profile_marker() {
+        let line = parse_selector_line("initOthers@Game profile scene").unwrap();
+        assert!(line.profile && line.scene && !line.png, "{:?}", line.unknown);
+        assert!(line.unknown.is_empty());
+        assert!(!parse_selector_line("initOthers@Game").unwrap().profile);
+        let mut traced = Traced::default();
+        traced.add(Some("Game"), false, false, true);
+        assert_eq!(
+            traced.markers_for(&["Game", "CCLayer"]).map(|m| m.profile),
+            Some(true)
+        );
+        assert_eq!(traced.markers_for(&["Tower"]), None);
+    }
+
+    #[test]
     fn selector_lines_take_peeks_in_any_order() {
         let s = |v: &[&str]| v.iter().map(|w| w.to_string()).collect::<Vec<_>>();
         assert_eq!(
@@ -2904,16 +2928,17 @@ mod tests {
             class: class.map(str::to_string),
             png,
             scene: false,
+            profile: false,
         }
     }
 
     #[test]
     fn lines_of_one_selector_add_up_per_class() {
         let mut traced = Traced::default();
-        traced.add(Some("CCLabelTTF"), false, false);
-        traced.add(Some("CCLabelBMFont"), true, false);
-        traced.add(Some("CCLabelTTF"), true, false);
-        traced.add(None, false, false);
+        traced.add(Some("CCLabelTTF"), false, false, false);
+        traced.add(Some("CCLabelBMFont"), true, false, false);
+        traced.add(Some("CCLabelTTF"), true, false, false);
+        traced.add(None, false, false, false);
         assert_eq!(
             traced.filters,
             vec![
@@ -2924,8 +2949,8 @@ mod tests {
         );
         assert!(traced.by_class());
         let mut plain = Traced::default();
-        plain.add(None, false, false);
-        plain.add(None, true, false);
+        plain.add(None, false, false, false);
+        plain.add(None, true, false, false);
         assert_eq!(plain.filters, vec![filter(None, true)]);
         assert!(!plain.by_class());
     }
@@ -2947,6 +2972,7 @@ mod tests {
             Some(Markers {
                 png: false,
                 scene: false,
+                profile: false,
                 peeks: Some(2)
             })
         );
@@ -2956,6 +2982,7 @@ mod tests {
             Some(Markers {
                 png: true,
                 scene: false,
+                profile: false,
                 peeks: Some(2)
             })
         );
@@ -2985,6 +3012,7 @@ mod tests {
             Some(Markers {
                 png: true,
                 scene: false,
+                profile: false,
                 peeks: None
             })
         );
@@ -3140,8 +3168,8 @@ mod tests {
         );
         // The marker is per receiver class, like png.
         let mut traced = Traced::default();
-        traced.add(Some("CCLabelTTF"), false, true);
-        traced.add(None, false, false);
+        traced.add(Some("CCLabelTTF"), false, true, false);
+        traced.add(None, false, false, false);
         let label = ["CCLabelTTF", "CCSprite", "CCNode", "NSObject"];
         assert!(traced.markers_for(&label).unwrap().scene);
         assert!(!traced.markers_for(&["Creeps", "NSObject"]).unwrap().scene);
