@@ -371,6 +371,22 @@ Debugging options:
         The default is 4Towers' Game, towersLayer, towerGrid, Tower,
         Creeps, Bullets and SharedData.
 
+    --live-port=N
+        Sends the trace's rows to one reader on 127.0.0.1:N as they are
+        written (only that address, never the network), for an app that
+        follows the game live. Each line is a channel letter, a tab and the
+        row: H (a JSON header, once per connection), T (a trace.log row),
+        I (an input.log row), S (a state.jsonl line, only when the reader's
+        first line is "hello state") and F (frame and milliseconds: every
+        row of that frame is before it). The reader sends one line first,
+        "hello" and its words. The files are written exactly as without a
+        reader. The game never waits for the reader: one that falls 900
+        frames behind is dropped and its socket closed, and a new reader
+        can connect at any time and gets the rows from the next frame on.
+        N is 1 to 65535. If the port cannot be opened, a warning is logged
+        and the game runs without the stream. This turns the message trace
+        on even with no selectors.
+
     --input-script=FILE
         Plays the touches listed in FILE (in the user data directory) at
         chosen presented frames, as if they came from the screen, so a run

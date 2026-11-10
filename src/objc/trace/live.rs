@@ -25,6 +25,7 @@
 //! socket closed, not fed a stream with a gap in it. With no reader the cost
 //! of a row is one branch.
 
+use std::fs::File;
 use std::io::{BufRead, BufReader, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
 use std::sync::mpsc::{sync_channel, SyncSender, TrySendError};
@@ -46,17 +47,20 @@ struct Pending {
     wants_state: bool,
 }
 
-/// The reader being fed.
+/// The reader being fed. Dropping it closes its queue: the writer thread
+/// sends what is queued and then closes the socket. [Reader::cut] closes
+/// the socket at once instead.
 struct Reader {
     sender: SyncSender<Vec<u8>>,
-    /// A handle on the socket, so dropping the reader also ends a writer
-    /// thread that is stuck in a write to a reader that does not read.
+    /// A handle on the socket, so [Reader::cut] can also end a writer thread
+    /// that is stuck in a write to a reader that does not read.
     stream: TcpStream,
     wants_state: bool,
 }
 
-impl Drop for Reader {
-    fn drop(&mut self) {
+impl Reader {
+    /// Drop the reader and close its socket now, queued rows and all.
+    fn cut(self) {
         let _ = self.stream.shutdown(Shutdown::Both);
     }
 }
@@ -112,7 +116,8 @@ impl LiveStream {
         self.port
     }
 
-    /// Whether a reader is being fed.
+    /// Whether a reader is being fed (the tests; LIVE9's touches).
+    #[allow(dead_code)]
     pub fn is_on(&self) -> bool {
         self.reader.is_some()
     }
@@ -167,7 +172,9 @@ impl LiveStream {
                         self.queue_frames,
                         frame
                     );
-                    self.reader = None;
+                    if let Some(reader) = self.reader.take() {
+                        reader.cut();
+                    }
                 }
                 Err(TrySendError::Disconnected(_)) => {
                     log!("Live stream: the reader went away at frame {}", frame);
@@ -211,12 +218,42 @@ impl LiveStream {
         }
         log!("Live stream: a reader connected");
         self.buf.clear();
-        // Taking up a new reader drops the old one.
+        // Taking up a new reader cuts the old one.
+        if let Some(old) = self.reader.take() {
+            old.cut();
+        }
         self.reader = Some(Reader {
             sender,
             stream: p.stream,
             wants_state: p.wants_state,
         });
+    }
+}
+
+/// `trace.log` and, when `--live-port=` is set, the live stream: every
+/// write goes to the file as before, and each of its rows also to the
+/// reader, if one is connected. The file's bytes do not depend on the
+/// reader.
+pub struct TraceOut {
+    file: File,
+    pub live: Option<LiveStream>,
+}
+
+impl TraceOut {
+    pub fn new(file: File, live: Option<LiveStream>) -> TraceOut {
+        TraceOut { file, live }
+    }
+
+    /// Write `bytes` (whole rows) to `trace.log`, and each row to the
+    /// reader.
+    pub fn write_all(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+        let result = self.file.write_all(bytes);
+        if let Some(live) = self.live.as_mut() {
+            for row in bytes.split_inclusive(|&b| b == b'\n') {
+                live.trace_row(row);
+            }
+        }
+        result
     }
 }
 
@@ -402,5 +439,80 @@ mod tests {
         let mut s = s;
         s.read_exact(&mut b).unwrap();
         assert_eq!(&b, b"H\t{}");
+    }
+}
+
+#[cfg(test)]
+mod trace_out_tests {
+    use super::*;
+    use std::io::Read;
+
+    const ROWS: &[&[u8]] = &[
+        b"12\t400.125\t0\tguest\tsend\tCreeps\tdmg:\t0x436c4001\t236.25002\n",
+        b"12\t400.200\t0\trng\tgen\t-\trandom\t0x4b5d5bec\t0x4b5d5bec\n13\t433.000\t0\tguest\tsend\tCCScheduler\ttick:\t0x3d08a58b\n",
+        b"13\t433.010\t0\tlifecycle\t-\t-\tlifecycle: background\n",
+    ];
+
+    fn write_all_rows(out: &mut TraceOut) {
+        for row in ROWS {
+            out.write_all(row).unwrap();
+        }
+    }
+
+    fn temp(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("touchhle-live-{}-{}", std::process::id(), name))
+    }
+
+    #[test]
+    fn a_trace_written_with_a_reader_has_the_same_bytes_as_one_without() {
+        let (p1, p2) = (temp("without"), temp("with"));
+        let mut without = TraceOut::new(File::create(&p1).unwrap(), None);
+        write_all_rows(&mut without);
+        drop(without);
+
+        let mut live = LiveStream::bind(0).unwrap();
+        let mut s = TcpStream::connect(("127.0.0.1", live.port())).unwrap();
+        s.write_all(b"hello\n").unwrap();
+        let t0 = std::time::Instant::now();
+        while !live.is_on() {
+            assert!(t0.elapsed() < Duration::from_secs(5));
+            live.end_frame(0, 0.0, || "{}".to_string());
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let mut with = TraceOut::new(File::create(&p2).unwrap(), Some(live));
+        write_all_rows(&mut with);
+        with.live
+            .as_mut()
+            .unwrap()
+            .end_frame(13, 433.5, || unreachable!());
+        drop(with);
+
+        let a = std::fs::read(&p1).unwrap();
+        let b = std::fs::read(&p2).unwrap();
+        assert_eq!(a, b, "the file must not change with a reader");
+        assert_eq!(a, ROWS.concat());
+
+        // Every row reached the reader behind its T, one line each.
+        let mut got = String::new();
+        s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let mut r = BufReader::new(s);
+        let mut line = String::new();
+        while r.read_line(&mut line).unwrap() > 0 {
+            got.push_str(&line);
+            if line.starts_with("F\t13\t") {
+                break;
+            }
+            line.clear();
+        }
+        let want: String = std::str::from_utf8(&ROWS.concat())
+            .unwrap()
+            .lines()
+            .map(|l| format!("T\t{l}\n"))
+            .collect::<String>()
+            + "F\t13\t433.500\n";
+        assert_eq!(got, format!("H\t{{}}\n{want}"));
+        let _ = r.get_mut().read(&mut [0u8; 1]);
+        let _ = std::fs::remove_file(p1);
+        let _ = std::fs::remove_file(p2);
     }
 }
