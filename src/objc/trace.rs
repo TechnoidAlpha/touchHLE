@@ -90,6 +90,9 @@
 
 mod addr;
 mod coverage;
+// The live stream (LIVE2a): wired into the trace in LIVE2b.
+#[allow(dead_code)]
+mod live;
 mod peek;
 mod scene;
 mod script;
