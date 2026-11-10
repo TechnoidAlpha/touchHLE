@@ -90,8 +90,6 @@
 
 mod addr;
 mod coverage;
-// The live stream (LIVE2a): wired into the trace in LIVE2b.
-#[allow(dead_code)]
 mod live;
 mod peek;
 mod scene;
@@ -276,7 +274,8 @@ pub struct MsgTrace {
     /// Receiver classes and selectors whose IMP was not wrapped because the
     /// method returns a struct, so that is logged once each.
     not_wrapped: HashSet<(Class, SEL)>,
-    out: File,
+    /// `trace.log`, and the live stream (`--live-port=`) if it is on.
+    out: live::TraceOut,
     /// Incremented once per presented frame.
     frame: u32,
     /// The touch log, see [trace_touches]. [None] if it could not be
@@ -762,6 +761,7 @@ impl MsgTrace {
             && watches.is_empty()
             && state_every == 0
             && script.is_none()
+            && options.live_port.is_none()
         {
             return None;
         }
@@ -912,6 +912,23 @@ impl MsgTrace {
         } else {
             None
         };
+        let live = options
+            .live_port
+            .and_then(|port| match live::LiveStream::bind(port) {
+                Ok(live) => {
+                    log!("Live stream on, listening on 127.0.0.1:{}", live.port());
+                    Some(live)
+                }
+                Err(e) => {
+                    log!(
+                        "Warning: the live stream could not listen on 127.0.0.1:{}, it is off: {}",
+                        port,
+                        e
+                    );
+                    None
+                }
+            });
+        let out = live::TraceOut::new(out, live);
         Some(MsgTrace {
             traced,
             by_name,
@@ -1248,6 +1265,11 @@ pub fn trace_touches(env: &mut Environment, phase: &str, touches: &HashMap<Finge
         .map(|(&finger, &coords)| touch_row(frame, elapsed_ms, phase, finger, coords))
         .collect();
     let _ = input.write_all(rows.as_bytes());
+    if let Some(live) = trace.out.live.as_mut() {
+        for row in rows.split_inclusive('\n') {
+            live.input_row(row.as_bytes());
+        }
+    }
 }
 
 impl ObjC {
@@ -1319,6 +1341,15 @@ pub fn trace_present_frame(env: &mut Environment) -> Option<FrameCaptureTicket> 
         write_state(env, frame, ms);
     }
     let trace = env.objc.trace.as_mut()?;
+    // The live stream's F line: every row of this frame is written by now
+    // (rows of the next frame from the input script may be before it too).
+    let rng = trace.rng;
+    let state_every = trace.state.as_ref().map_or(0, |state| state.every);
+    if let Some(live) = trace.out.live.as_mut() {
+        live.end_frame(frame, elapsed.as_secs_f64() * 1000.0, || {
+            live_header(frame, rng, state_every)
+        });
+    }
     let due = capture_due(frame, trace.capture_every, trace.capture_pending);
     // Past the cap nothing is read back, so the frame costs nothing more.
     if !due || trace.capture.as_mut().is_none_or(FrameCapture::at_cap) {
@@ -1326,6 +1357,18 @@ pub fn trace_present_frame(env: &mut Environment) -> Option<FrameCaptureTicket> 
     }
     trace.capture_pending = false;
     Some(FrameCaptureTicket { frame, ms })
+}
+
+/// The live stream's `H` line (without its channel letter): the schema, the
+/// build, the frame now and the options a reader needs to know about.
+fn live_header(frame: u32, rng: bool, state_every: u32) -> String {
+    format!(
+        "{{\"schema\":\"4towers-live-1\",\"build\":\"{}\",\"frame\":{},\"trace_rng\":{},\"state_every\":{}}}",
+        crate::VERSION,
+        frame,
+        rng,
+        state_every
+    )
 }
 
 /// Whether the frame numbered `frame` gets a scene dump, and why: the
@@ -1498,6 +1541,11 @@ fn write_state(env: &mut Environment, frame: u32, ms: u64) {
         if let Err(e) = out.file.write_all(text.as_bytes()) {
             log!("Warning: could not write the state stream, it stops: {}", e);
             trace.state = None;
+        }
+        if let Some(live) = trace.out.live.as_mut() {
+            for line in text.split_inclusive('\n') {
+                live.state_line(line.as_bytes());
+            }
         }
     }
     env.objc.trace = Some(trace);

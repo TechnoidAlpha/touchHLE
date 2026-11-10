@@ -554,6 +554,15 @@ What it costs: nothing when off. A snapshot walks the scene, scans the data sect
 
 The type decoding, the layout of the values, the search through the scene, the statics, arrays and instance variables, and the lines are covered by unit tests (`src/objc/trace/state.rs`).
 
+### Live stream
+
+`--live-port=N` (`src/objc/trace/live.rs`) sends the rows of `trace.log`, `input.log` and `state.jsonl` to one reader on `127.0.0.1:N` as they are written, for the 4Towers side-by-side app, where the remake follows the original frame by frame (the Technoid4Towers repo's `docs/plans/SIDE_BY_SIDE.md`, LIVE2).
+
+- Lines: `H\t{json}` once per connection (schema `4towers-live-1`, the build, the frame now, `trace_rng`, `state_every`), `T\t<row>`, `I\t<row>`, `S\t<line>` (only for a reader whose first line is `hello state`), and `F\t<frame>\t<ms>` at the end of each presented frame, after its state snapshot. Rows keep their bytes. A row of the next frame (the input script's) can come before a frame's `F` line, so a reader files each row under its own frame number.
+- `trace.log` goes through `TraceOut`, which writes the file as before and copies each row to the stream; the file's bytes do not depend on a reader (test `a_trace_written_with_a_reader_has_the_same_bytes_as_one_without`).
+- The game thread makes no socket call. A listener thread accepts and reads the hello line; a frame's rows go to a writer thread through a queue of 900 frames with `try_send`. A reader whose queue is full is dropped and its socket shut down at once (no gap in a stream); a reader that goes away is dropped at the next frame; a new reader replaces the old one. On a normal close the queue is sent before the socket closes.
+- Checked by hand on 10 November 2026: 900 frames of the title screen with `--live-port=47100 --trace-rng --state-every=30` and a reader sending `hello state`: one `H` line, 899 `F` lines in order, and the `T` and `S` lines equal to the files' rows from the reader's first frame on.
+
 ### Scripted input
 
 `--input-script=FILE` plays touches listed in `FILE` (in the user data directory, next to `trace.log`, as for `--rng-replay=`) at chosen frames, so a run can play the game unattended: on a laptop whose desktop session is not attached, synthetic mouse clicks never reach the window, so the touches are made inside touchHLE. Without the option, `input_script.txt` next to the other touchHLE files is used if it is there. `--quit-at-frame=F` exits at presented frame F, with or without a script. The file is read once, at startup. Either one turns the trace on by itself.

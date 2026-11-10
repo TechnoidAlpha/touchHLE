@@ -96,6 +96,10 @@ pub struct Options {
     /// `--state-every=N`: write the state stream every Nth presented frame
     /// (0 is off). See src/objc/trace/state.rs.
     pub state_every: u32,
+    /// `--live-port=N`: send the trace's rows to one reader on
+    /// 127.0.0.1:N as they are written (4Towers branch). See
+    /// src/objc/trace/live.rs.
+    pub live_port: Option<u16>,
     /// `--state-classes=`: the classes the state stream writes; empty for
     /// the default ones.
     pub state_classes: Vec<String>,
@@ -151,6 +155,7 @@ impl Default for Options {
             coverage: false,
             trace_watch: Vec::new(),
             state_every: 0,
+            live_port: None,
             state_classes: Vec::new(),
             input_script: None,
             quit_at_frame: None,
@@ -356,6 +361,13 @@ impl Options {
             self.state_every = value
                 .parse()
                 .map_err(|_| "Invalid value for --state-every=".to_string())?;
+        } else if let Some(value) = arg.strip_prefix("--live-port=") {
+            let port: u16 = value
+                .parse()
+                .ok()
+                .filter(|&port| port != 0)
+                .ok_or_else(|| "Invalid value for --live-port= (1 to 65535)".to_string())?;
+            self.live_port = Some(port);
         } else if let Some(values) = arg.strip_prefix("--state-classes=") {
             self.state_classes = values
                 .split(',')
@@ -456,4 +468,27 @@ fn parse_dump_options(options: &str) -> Result<DumpingOptions, String> {
         }
     }
     Ok(dumping_options)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn live_port_parses_and_a_bad_port_is_refused() {
+        let mut o = Options::default();
+        assert_eq!(o.live_port, None);
+        assert_eq!(o.parse_argument("--live-port=47100"), Ok(true));
+        assert_eq!(o.live_port, Some(47100));
+        for bad in [
+            "--live-port=0",
+            "--live-port=65536",
+            "--live-port=x",
+            "--live-port=",
+        ] {
+            let mut o = Options::default();
+            assert!(o.parse_argument(bad).is_err(), "{bad} was taken");
+            assert_eq!(o.live_port, None);
+        }
+    }
 }
