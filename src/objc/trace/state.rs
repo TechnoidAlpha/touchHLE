@@ -1122,8 +1122,74 @@ pub(super) const PROFILE_ARRAYS: [&str; 7] = [
 /// `shared` without calling the guest: [PROFILE_NUMBERS], [PROFILE_PERKS]
 /// and [PROFILE_ARRAYS] by name, each `null` if it cannot be read.
 /// `shared` [None] gives a row that says no `SharedData` was found.
-pub(super) fn profile_line<M: StateMemory + ?Sized>(_m: &mut M, _shared: Option<u32>) -> String {
-    String::new()
+pub(super) fn profile_line<M: StateMemory + ?Sized>(m: &mut M, shared: Option<u32>) -> String {
+    let Some(shared) = shared else {
+        return "{\"kind\":\"profile\",\"error\":\"no SharedData found\"}".to_string();
+    };
+    let mut out = format!("{{\"kind\":\"profile\",\"addr\":{}", json_addr(shared));
+    for (i, &name) in PROFILE_NUMBERS.iter().enumerate() {
+        out.push(',');
+        out.push_str(&json_str(name));
+        out.push(':');
+        let word = m.ivar_addr(shared, name).and_then(|addr| m.word(addr));
+        match word {
+            // lvlNum and gameMode are ints, the buffs floats
+            Ok(word) if i < 2 => out.push_str(&(word as i32).to_string()),
+            Ok(word) => {
+                let value = f32::from_bits(word);
+                out.push_str(&json_float(f64::from(value), value.to_string()));
+            }
+            Err(_) => out.push_str("null"),
+        }
+    }
+    for &name in &PROFILE_PERKS {
+        out.push(',');
+        out.push_str(&json_str(name));
+        out.push(':');
+        match m
+            .ivar_addr(shared, name)
+            .and_then(|addr| m.bytes(addr, 1).map(|b| b[0]))
+        {
+            Ok(byte) => out.push_str(&byte.to_string()),
+            Err(_) => out.push_str("null"),
+        }
+    }
+    for &name in &PROFILE_ARRAYS {
+        out.push(',');
+        out.push_str(&json_str(name));
+        out.push(':');
+        let items = m
+            .ivar_addr(shared, name)
+            .and_then(|addr| m.word(addr))
+            .ok()
+            .and_then(|array| m.array_items(array));
+        let Some(items) = items else {
+            out.push_str("null");
+            continue;
+        };
+        out.push('[');
+        for (j, &item) in items.iter().enumerate() {
+            if j > 0 {
+                out.push(',');
+            }
+            match m.number_value(item) {
+                Some(value) => out.push_str(&json_number(value)),
+                None => out.push_str("null"),
+            }
+        }
+        out.push(']');
+    }
+    out.push('}');
+    out
+}
+
+/// An NSNumber's value as JSON: a whole number without a fraction.
+fn json_number(value: f64) -> String {
+    if value.fract() == 0.0 && value.abs() < 1e15 {
+        (value as i64).to_string()
+    } else {
+        json_float(value, value.to_string())
+    }
 }
 
 #[cfg(test)]
@@ -1345,13 +1411,25 @@ mod tests {
     /// A `SharedData` at a fresh address with every profile field: the
     /// numbers from offset 4, the perks after them, then the arrays, each an
     /// array of NSNumbers with the values given.
-    fn shared_data(g: &mut FakeGuest, numbers: [f64; 7], perks: [u8; 9], arrays: &[&[f64]; 7]) -> u32 {
-        let isa = g.class(vec![record("SharedData", 0, &[], 128), record("NSObject", 0, &[], 4)]);
+    fn shared_data(
+        g: &mut FakeGuest,
+        numbers: [f64; 7],
+        perks: [u8; 9],
+        arrays: &[&[f64]; 7],
+    ) -> u32 {
+        let isa = g.class(vec![
+            record("SharedData", 0, &[], 128),
+            record("NSObject", 0, &[], 4),
+        ]);
         let object = g.object(isa, 128);
         for (i, name) in PROFILE_NUMBERS.iter().enumerate() {
             let at = 4 + 4 * i as u32;
             g.offsets.insert((isa, name), at);
-            let word = if i < 2 { numbers[i] as i32 as u32 } else { (numbers[i] as f32).to_bits() };
+            let word = if i < 2 {
+                numbers[i] as i32 as u32
+            } else {
+                (numbers[i] as f32).to_bits()
+            };
             g.put_word(object + at, word);
         }
         for (i, name) in PROFILE_PERKS.iter().enumerate() {
@@ -1382,7 +1460,15 @@ mod tests {
             &mut g,
             [24.0, 1.0, 1.1, 1.0, 1.25, 1.0, 1.5],
             [1, 0, 0, 0, 1, 0, 0, 0, 1],
-            &[&[1.0, 0.0, 1.0], &[1.0, 1.0], &[3.0, -1.0], &[0.0], &[], &[2.0, 5.0], &[7.0]],
+            &[
+                &[1.0, 0.0, 1.0],
+                &[1.0, 1.0],
+                &[3.0, -1.0],
+                &[0.0],
+                &[],
+                &[2.0, 5.0],
+                &[7.0],
+            ],
         );
         assert_eq!(
             profile_line(&mut g, Some(shared)),
@@ -1412,7 +1498,12 @@ mod tests {
     #[test]
     fn a_profile_field_that_cannot_be_read_is_null() {
         let mut g = FakeGuest::new();
-        let shared = shared_data(&mut g, [2.0, 0.0, 1.0, 1.0, 1.0, 1.0, 1.0], [0; 9], &[&[1.0], &[], &[], &[], &[], &[], &[]]);
+        let shared = shared_data(
+            &mut g,
+            [2.0, 0.0, 1.0, 1.0, 1.0, 1.0, 1.0],
+            [0; 9],
+            &[&[1.0], &[], &[], &[], &[], &[], &[]],
+        );
         // warningCreeps points at something that is not one of touchHLE's
         // arrays; unlockArray holds an object that is not an NSNumber.
         let isa = g.word(shared).unwrap();

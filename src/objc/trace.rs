@@ -15,7 +15,10 @@
 //! is off, the only cost per message is one `Option::is_some` check.
 //!
 //! A line of `trace_selectors.txt` may add marker words after the selector,
-//! separated by spaces (see [parse_selector_line]). The only one is `png`:
+//! separated by spaces (see [parse_selector_line]): `png`, `scene` (see
+//! below) and `profile`, which writes a `profile` row with the game's
+//! level, mode, gear and profile arrays before the method runs (see
+//! [write_profile_row]; LIVE8 of the game repo's side-by-side plan).
 //! `powerFire png` saves the first frame presented after each call of
 //! `powerFire`, the frame that shows its result. `--capture-frames=N` saves
 //! every Nth frame as well, up to `--capture-frames-max=` frames a run
@@ -223,6 +226,7 @@ impl Traced {
         let mut taken = false;
         let mut png = false;
         let mut scene = false;
+        let mut profile = false;
         for filter in &self.filters {
             let takes = filter
                 .class
@@ -232,12 +236,13 @@ impl Traced {
                 taken = true;
                 png |= filter.png;
                 scene |= filter.scene;
+                profile |= filter.profile;
             }
         }
         taken.then_some(Markers {
             png,
             scene,
-            profile: false,
+            profile,
             peeks: self.peeks,
         })
     }
@@ -294,6 +299,9 @@ pub struct MsgTrace {
     capture_every: u32,
     /// A selector with the `png` marker was called since the last frame.
     capture_pending: bool,
+    /// Where the `SharedData` singleton was found last time, for the
+    /// `profile` rows, see [scene::find_singleton].
+    shared_data_slot: Option<u32>,
     /// Whether the "frames are not captured on this path" message has been
     /// logged.
     uncaptured_path_logged: bool,
@@ -574,8 +582,8 @@ struct SelectorLine {
 /// One line of `trace_selectors.txt`: the selector, optionally followed by
 /// `@ClassName` in the same word, then optional marker words and peek specs
 /// in any order, separated by spaces or tabs; `#` starts a comment. Returns
-/// [None] for a blank or comment-only line. The markers are `png` and
-/// `scene`; a word starting with `self`, `arg0` or `arg1` is a peek (see
+/// [None] for a blank or comment-only line. The markers are `png`,
+/// `scene` and `profile`; a word starting with `self`, `arg0` or `arg1` is a peek (see
 /// [peek]); any other word is ignored, and logged once by the caller.
 fn parse_selector_line(line: &str) -> Option<SelectorLine> {
     let line = line.split('#').next().unwrap();
@@ -604,6 +612,8 @@ fn parse_selector_line(line: &str) -> Option<SelectorLine> {
             parsed.png = true;
         } else if word == "scene" {
             parsed.scene = true;
+        } else if word == "profile" {
+            parsed.profile = true;
         } else if peek::looks_like_peek(word) {
             match peek::parse_peek(word) {
                 Ok(spec) => parsed.peeks.push(spec),
@@ -709,7 +719,7 @@ impl MsgTrace {
             for word in &line.unknown {
                 if unknown_logged.insert(word.clone()) {
                     log!(
-                        "Warning: {} has an unknown marker {:?} (after {}), ignored; the markers are png and scene, and a peek starts with self, arg0 or arg1",
+                        "Warning: {} has an unknown marker {:?} (after {}), ignored; the markers are png, scene and profile, and a peek starts with self, arg0 or arg1",
                         source,
                         word,
                         line.selector
@@ -952,6 +962,7 @@ impl MsgTrace {
             capture,
             capture_every,
             capture_pending: false,
+            shared_data_slot: None,
             uncaptured_path_logged: false,
             capture_max,
             capture_no_restart: capture_every > 0 || !png_after.is_empty(),
@@ -1709,7 +1720,8 @@ fn class_chain_names(objc: &ObjC, class: Class) -> Vec<String> {
 
 /// Act on a traced call's markers once its line is written: `png` asks for
 /// the next frame's picture, `scene` for a scene dump at the next frame,
-/// with `selector <name>` as the reason.
+/// with `selector <name>` as the reason, and `profile` writes a `profile`
+/// row now, before the method runs (see [write_profile_row]).
 fn note_markers(env: &mut Environment, markers: Markers, selector: SEL) {
     let reason = markers
         .scene
@@ -1720,6 +1732,32 @@ fn note_markers(env: &mut Environment, markers: Markers, selector: SEL) {
             add_scene_reason(&mut trace.scene.pending, &reason);
         }
     }
+    if markers.profile {
+        write_profile_row(env);
+    }
+}
+
+/// Write a `profile` row (LIVE8): origin `profile` and, in the selector
+/// column, one line of JSON with the level, the mode, the buffs, the perks
+/// and the profile's arrays, read from the game's `SharedData` (see
+/// [state::profile_line]). Only reads guest memory and the class table:
+/// nothing here calls the guest. It goes to `trace.log` and the live stream
+/// like any row.
+fn write_profile_row(env: &mut Environment) {
+    let elapsed_ms = env.startup_time.elapsed().as_secs_f64() * 1000.0;
+    let thread = env.current_thread;
+    // Taken out while it is used, so the class table can be read alongside.
+    let Some(mut trace) = env.objc.trace.take() else {
+        return;
+    };
+    let mut guest = scene::GuestScene::new(&env.objc, &env.mem);
+    let shared = env.bins.first().and_then(|bin| {
+        scene::find_singleton(&mut guest, bin, &mut trace.shared_data_slot, "SharedData")
+    });
+    let text = state::profile_line(&mut guest, shared);
+    let row = text_row(trace.frame, elapsed_ms, thread, "profile", &text);
+    let _ = trace.out.write_all(row.as_bytes());
+    env.objc.trace = Some(trace);
 }
 
 /// The class name as written in the trace, with `+` for a metaclass.
@@ -2847,7 +2885,11 @@ mod tests {
     #[test]
     fn selector_lines_take_the_profile_marker() {
         let line = parse_selector_line("initOthers@Game profile scene").unwrap();
-        assert!(line.profile && line.scene && !line.png, "{:?}", line.unknown);
+        assert!(
+            line.profile && line.scene && !line.png,
+            "{:?}",
+            line.unknown
+        );
         assert!(line.unknown.is_empty());
         assert!(!parse_selector_line("initOthers@Game").unwrap().profile);
         let mut traced = Traced::default();
