@@ -29,6 +29,18 @@ pub struct State {
     current_touches: HashMap<FingerId, id>,
 }
 
+/// Whether a finger other than the message trace's own (the input script's
+/// and the live reader's) is down: the live reader's one-finger guard
+/// (LIVE9).
+pub fn real_finger_down(env: &Environment) -> bool {
+    env.framework_state
+        .uikit
+        .ui_touch
+        .current_touches
+        .keys()
+        .any(|finger| !matches!(finger, FingerId::Script | FingerId::Remote))
+}
+
 pub(super) struct UITouchHostObject {
     /// Strong reference to the `UIView`
     pub(super) view: id,
