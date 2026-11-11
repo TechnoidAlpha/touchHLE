@@ -1119,19 +1119,17 @@ fn run_remote_touches(env: &mut Environment, now: u32) {
     };
     let touches = live.take_touches(real_down);
     for touch in touches {
-        let (word, event_of): (&str, fn(HashMap<FingerId, Coords>) -> Event) = match touch.phase {
-            live::RemotePhase::Down => ("down", Event::TouchesDown),
-            live::RemotePhase::Move => ("move", Event::TouchesMove),
-            live::RemotePhase::Up => ("up", Event::TouchesUp),
+        let fingers = HashMap::from([(FingerId::Remote, (touch.x, touch.y))]);
+        let (word, event) = match touch.phase {
+            live::RemotePhase::Down => ("down", Event::TouchesDown(fingers)),
+            live::RemotePhase::Move => ("move", Event::TouchesMove(fingers)),
+            live::RemotePhase::Up => ("up", Event::TouchesUp(fingers)),
         };
         let text = format!("remote {} {} {}", word, touch.x, touch.y);
         let row = text_row(now, elapsed_ms, thread, "remote", &text);
         let _ = trace.out.write_all(row.as_bytes());
         if let Some(window) = env.window.as_mut() {
-            window.push_event(event_of(HashMap::from([(
-                FingerId::Remote,
-                (touch.x, touch.y),
-            )])));
+            window.push_event(event);
         }
     }
 }
