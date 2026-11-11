@@ -40,6 +40,73 @@ pub const QUEUE_FRAMES: usize = 900;
 /// How long the listener waits for a new reader's hello line.
 const HELLO_WAIT: Duration = Duration::from_secs(2);
 
+/// The longest line a reader may send (LIVE9's touches); a longer one is
+/// skipped whole.
+pub const MAX_LINE: usize = 1024;
+
+/// The phase of a touch the reader sent (LIVE9).
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub enum RemotePhase {
+    Down,
+    Move,
+    Up,
+}
+
+/// A touch the reader sent: `down X Y`, `move X Y` or `up X Y`, in guest
+/// points (the remake's canvas is 320 x 480, so its point is the guest's).
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub struct RemoteTouch {
+    pub phase: RemotePhase,
+    pub x: f32,
+    pub y: f32,
+}
+
+/// One line from the reader as a touch, parsed with the input script's
+/// parser; [None] for anything but `down`, `move` or `up` with two numbers
+/// and no timing.
+pub fn parse_remote_line(_line: &str) -> Option<RemoteTouch> {
+    None
+}
+
+/// The one-finger guard on the reader's touches (docs/plans/SIDE_BY_SIDE.md,
+/// LIVE9): one remote finger at a time, never while a real finger is down.
+#[derive(Default)]
+pub struct RemoteFinger {
+    down_at: Option<(f32, f32)>,
+    unguarded: bool,
+}
+
+impl RemoteFinger {
+    /// A guard that lets everything through (the tests' broken input).
+    #[cfg(test)]
+    fn unguarded() -> RemoteFinger {
+        RemoteFinger {
+            down_at: None,
+            unguarded: true,
+        }
+    }
+
+    /// Whether the remote finger is down.
+    pub fn is_down(&self) -> bool {
+        self.down_at.is_some()
+    }
+
+    /// The touches to queue for `incoming`, in order: a down while the
+    /// remote finger is down, or while `real_down` (a real finger is down),
+    /// is dropped, and so is a move or up with no remote finger down;
+    /// `gone` (the reader went away or was replaced) lifts a remote finger
+    /// that is down, at its last point.
+    pub fn filter(
+        &mut self,
+        incoming: Vec<RemoteTouch>,
+        _real_down: bool,
+        _gone: bool,
+    ) -> Vec<RemoteTouch> {
+        let _ = self.unguarded;
+        incoming
+    }
+}
+
 /// A reader the listener has accepted and the game thread has not taken
 /// up yet.
 struct Pending {
@@ -75,6 +142,12 @@ pub struct LiveStream {
     buf: Vec<u8>,
     /// Readers dropped because they fell behind.
     pub dropped: u32,
+    /// The reader's touches, from its touch thread (LIVE9).
+    touches: Option<std::sync::mpsc::Receiver<RemoteTouch>>,
+    /// The one-finger guard on them.
+    finger: RemoteFinger,
+    /// A reader with its finger down was replaced: lift that finger.
+    lift_owed: bool,
 }
 
 impl LiveStream {
@@ -109,6 +182,9 @@ impl LiveStream {
             reader: None,
             buf: Vec::new(),
             dropped: 0,
+            touches: None,
+            finger: RemoteFinger::default(),
+            lift_owed: false,
         })
     }
 
@@ -120,6 +196,13 @@ impl LiveStream {
     #[allow(dead_code)]
     pub fn is_on(&self) -> bool {
         self.reader.is_some()
+    }
+
+    /// The reader's touches since the last call, through the one-finger
+    /// guard ([RemoteFinger]); `real_down`: a real finger is down. Never
+    /// blocks.
+    pub fn take_touches(&mut self, _real_down: bool) -> Vec<RemoteTouch> {
+        Vec::new()
     }
 
     /// A `trace.log` row, as written to the file (ending in a newline).
@@ -313,6 +396,121 @@ mod tests {
                 return lines;
             }
         }
+    }
+
+    fn t(phase: RemotePhase, x: f32, y: f32) -> RemoteTouch {
+        RemoteTouch { phase, x, y }
+    }
+
+    #[test]
+    fn remote_lines_are_down_move_or_up_with_two_numbers() {
+        assert_eq!(
+            parse_remote_line("down 12 34.5"),
+            Some(t(RemotePhase::Down, 12.0, 34.5))
+        );
+        assert_eq!(
+            parse_remote_line("move 1 2\r"),
+            Some(t(RemotePhase::Move, 1.0, 2.0))
+        );
+        assert_eq!(
+            parse_remote_line("up 0 480"),
+            Some(t(RemotePhase::Up, 0.0, 480.0))
+        );
+        for bad in [
+            "rubbish",
+            "down 1",
+            "down one two",
+            "@5 down 1 2",
+            "+3 up 1 2",
+            "tap 1 2",
+            "quit",
+            "",
+        ] {
+            assert_eq!(parse_remote_line(bad), None, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn the_guard_keeps_one_remote_finger() {
+        use RemotePhase::*;
+        let mut f = RemoteFinger::default();
+        // down, down gives one down; the up after it goes through
+        assert_eq!(
+            f.filter(
+                vec![t(Down, 10.0, 10.0), t(Down, 20.0, 20.0), t(Up, 10.0, 10.0)],
+                false,
+                false
+            ),
+            vec![t(Down, 10.0, 10.0), t(Up, 10.0, 10.0)]
+        );
+        // a move or up with no remote finger down is dropped
+        assert_eq!(
+            f.filter(vec![t(Move, 1.0, 1.0), t(Up, 1.0, 1.0)], false, false),
+            vec![]
+        );
+        // a reader that goes away with its finger down gives an up at its last point
+        assert_eq!(
+            f.filter(vec![t(Down, 5.0, 6.0), t(Move, 7.0, 8.0)], false, false),
+            vec![t(Down, 5.0, 6.0), t(Move, 7.0, 8.0)]
+        );
+        assert_eq!(f.filter(vec![], false, true), vec![t(Up, 7.0, 8.0)]);
+        assert!(!f.is_down());
+        // a remote down while a real finger is down is dropped, with what follows it
+        assert_eq!(
+            f.filter(
+                vec![t(Down, 1.0, 2.0), t(Move, 3.0, 4.0), t(Up, 3.0, 4.0)],
+                true,
+                false
+            ),
+            vec![]
+        );
+    }
+
+    #[test]
+    fn the_guard_turned_off_lets_down_down_through() {
+        use RemotePhase::*;
+        let mut f = RemoteFinger::unguarded();
+        assert_eq!(
+            f.filter(vec![t(Down, 10.0, 10.0), t(Down, 20.0, 20.0)], false, false),
+            vec![t(Down, 10.0, 10.0), t(Down, 20.0, 20.0)]
+        );
+    }
+
+    /// The reader's touches from take_touches, until `n` have come or 5 s.
+    fn touches_until(live: &mut LiveStream, n: usize) -> Vec<RemoteTouch> {
+        let t0 = Instant::now();
+        let mut got = Vec::new();
+        while got.len() < n && t0.elapsed() < Duration::from_secs(5) {
+            got.extend(live.take_touches(false));
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        got
+    }
+
+    #[test]
+    fn a_readers_touch_lines_come_out_of_take_touches_and_bad_lines_do_not() {
+        use RemotePhase::*;
+        let mut live = LiveStream::bind(0).unwrap();
+        let mut s = connect(&mut live, "hello\n");
+        let long = format!("move {} 1\n", "9".repeat(2 * MAX_LINE));
+        s.write_all(b"down 100 200\nrubbish\n").unwrap();
+        s.write_all(long.as_bytes()).unwrap();
+        s.write_all(b"up 100 200\n").unwrap();
+        assert_eq!(
+            touches_until(&mut live, 2),
+            vec![t(Down, 100.0, 200.0), t(Up, 100.0, 200.0)]
+        );
+    }
+
+    #[test]
+    fn a_reader_that_goes_away_with_its_finger_down_gives_an_up() {
+        use RemotePhase::*;
+        let mut live = LiveStream::bind(0).unwrap();
+        let mut s = connect(&mut live, "hello\n");
+        s.write_all(b"down 1 2\n").unwrap();
+        assert_eq!(touches_until(&mut live, 1), vec![t(Down, 1.0, 2.0)]);
+        drop(s);
+        assert_eq!(touches_until(&mut live, 1), vec![t(Up, 1.0, 2.0)]);
     }
 
     #[test]
