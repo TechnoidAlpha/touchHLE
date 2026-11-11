@@ -493,6 +493,10 @@ pub(super) trait StateMemory: SceneMemory {
     /// The objects in the array at `array`, in order, if it is one of
     /// touchHLE's, read from its host object.
     fn array_items(&self, array: u32) -> Option<Vec<u32>>;
+
+    /// The value of the number at `number`, if it is one of touchHLE's
+    /// NSNumbers, read from its host object.
+    fn number_value(&self, number: u32) -> Option<f64>;
 }
 
 /// An instance variable as an `ivar_t` of the binary has it.
@@ -833,6 +837,13 @@ impl StateMemory for scene::GuestScene<'_> {
         )?;
         Some(items.into_iter().map(|item| item.to_bits()).collect())
     }
+
+    fn number_value(&self, number: u32) -> Option<f64> {
+        crate::frameworks::foundation::ns_value::host_number_value(
+            self.objc,
+            Ptr::from_bits(number),
+        )
+    }
 }
 
 /// Add `note` to `notes`, unless [MAX_NOTES] are there already.
@@ -1069,6 +1080,118 @@ pub(super) fn snapshot<M: StateMemory + ?Sized>(
     text
 }
 
+/// The `SharedData` instance variables the profile row holds as numbers, in
+/// order: the level and mode, then the five buff multipliers the level
+/// starts with (`decomp/headers/SharedData.h` in the game's repo).
+pub(super) const PROFILE_NUMBERS: [&str; 7] = [
+    "lvlNum",
+    "gameMode",
+    "dmgBuffed",
+    "rangeBuffed",
+    "speedBuffed",
+    "splashBuffed",
+    "utilBuffed",
+];
+
+/// The perk flags (one byte each) the profile row holds, in order.
+pub(super) const PROFILE_PERKS: [&str; 9] = [
+    "fireBonus",
+    "fireCrit",
+    "fireMissle",
+    "splashDmgBonus",
+    "splashExtraGold",
+    "splashReduceCost",
+    "snipeDmg",
+    "snipeStun",
+    "snipeReduceCost",
+];
+
+/// The arrays of NSNumbers the profile row holds, in order.
+pub(super) const PROFILE_ARRAYS: [&str; 7] = [
+    "warningCreeps",
+    "unlockArray",
+    "lvlArray",
+    "lvlArray1",
+    "lvlArray2",
+    "equipmentArray",
+    "tricketArray",
+];
+
+/// The text of a `profile` row (LIVE8): one line of JSON with the profile
+/// and the gear the level starts with, read from the `SharedData` at
+/// `shared` without calling the guest: [PROFILE_NUMBERS], [PROFILE_PERKS]
+/// and [PROFILE_ARRAYS] by name, each `null` if it cannot be read.
+/// `shared` [None] gives a row that says no `SharedData` was found.
+pub(super) fn profile_line<M: StateMemory + ?Sized>(m: &mut M, shared: Option<u32>) -> String {
+    let Some(shared) = shared else {
+        return "{\"kind\":\"profile\",\"error\":\"no SharedData found\"}".to_string();
+    };
+    let mut out = format!("{{\"kind\":\"profile\",\"addr\":{}", json_addr(shared));
+    for (i, &name) in PROFILE_NUMBERS.iter().enumerate() {
+        out.push(',');
+        out.push_str(&json_str(name));
+        out.push(':');
+        let word = m.ivar_addr(shared, name).and_then(|addr| m.word(addr));
+        match word {
+            // lvlNum and gameMode are ints, the buffs floats
+            Ok(word) if i < 2 => out.push_str(&(word as i32).to_string()),
+            Ok(word) => {
+                let value = f32::from_bits(word);
+                out.push_str(&json_float(f64::from(value), value.to_string()));
+            }
+            Err(_) => out.push_str("null"),
+        }
+    }
+    for &name in &PROFILE_PERKS {
+        out.push(',');
+        out.push_str(&json_str(name));
+        out.push(':');
+        match m
+            .ivar_addr(shared, name)
+            .and_then(|addr| m.bytes(addr, 1).map(|b| b[0]))
+        {
+            Ok(byte) => out.push_str(&byte.to_string()),
+            Err(_) => out.push_str("null"),
+        }
+    }
+    for &name in &PROFILE_ARRAYS {
+        out.push(',');
+        out.push_str(&json_str(name));
+        out.push(':');
+        let items = m
+            .ivar_addr(shared, name)
+            .and_then(|addr| m.word(addr))
+            .ok()
+            .and_then(|array| m.array_items(array));
+        let Some(items) = items else {
+            out.push_str("null");
+            continue;
+        };
+        out.push('[');
+        for (j, &item) in items.iter().enumerate() {
+            if j > 0 {
+                out.push(',');
+            }
+            match m.number_value(item) {
+                Some(value) => out.push_str(&json_number(value)),
+                None => out.push_str("null"),
+            }
+        }
+        out.push(']');
+    }
+    out.push('}');
+    out
+}
+
+/// An NSNumber's value as JSON: a whole number without a fraction.
+fn json_number(value: f64) -> String {
+    if value.fract() == 0.0 && value.abs() < 1e15 {
+        (value as i64).to_string()
+    } else {
+        json_float(value, value.to_string())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1154,6 +1277,7 @@ mod tests {
         offsets: HashMap<(u32, &'static str), u32>,
         arrays: HashMap<u32, Vec<u32>>,
         dictionaries: HashMap<u32, Vec<(u32, u32)>>,
+        numbers: HashMap<u32, f64>,
     }
 
     const BASE: u32 = 0x1000;
@@ -1166,6 +1290,7 @@ mod tests {
                 offsets: HashMap::new(),
                 arrays: HashMap::new(),
                 dictionaries: HashMap::new(),
+                numbers: HashMap::new(),
             }
         }
 
@@ -1277,6 +1402,125 @@ mod tests {
         fn array_items(&self, array: u32) -> Option<Vec<u32>> {
             self.arrays.get(&array).cloned()
         }
+
+        fn number_value(&self, number: u32) -> Option<f64> {
+            self.numbers.get(&number).copied()
+        }
+    }
+
+    /// A `SharedData` at a fresh address with every profile field: the
+    /// numbers from offset 4, the perks after them, then the arrays, each an
+    /// array of NSNumbers with the values given.
+    fn shared_data(
+        g: &mut FakeGuest,
+        numbers: [f64; 7],
+        perks: [u8; 9],
+        arrays: &[&[f64]; 7],
+    ) -> u32 {
+        let isa = g.class(vec![
+            record("SharedData", 0, &[], 128),
+            record("NSObject", 0, &[], 4),
+        ]);
+        let object = g.object(isa, 128);
+        for (i, name) in PROFILE_NUMBERS.iter().enumerate() {
+            let at = 4 + 4 * i as u32;
+            g.offsets.insert((isa, name), at);
+            let word = if i < 2 {
+                numbers[i] as i32 as u32
+            } else {
+                (numbers[i] as f32).to_bits()
+            };
+            g.put_word(object + at, word);
+        }
+        for (i, name) in PROFILE_PERKS.iter().enumerate() {
+            let at = 32 + i as u32;
+            g.offsets.insert((isa, name), at);
+            g.put(object + at, &[perks[i]]);
+        }
+        for (i, name) in PROFILE_ARRAYS.iter().enumerate() {
+            let at = 44 + 4 * i as u32;
+            g.offsets.insert((isa, name), at);
+            let array = g.alloc(4);
+            let mut items = Vec::new();
+            for &v in arrays[i] {
+                let n = g.alloc(4);
+                g.numbers.insert(n, v);
+                items.push(n);
+            }
+            g.arrays.insert(array, items);
+            g.put_word(object + at, array);
+        }
+        object
+    }
+
+    #[test]
+    fn the_profile_row_holds_the_numbers_perks_and_arrays() {
+        let mut g = FakeGuest::new();
+        let shared = shared_data(
+            &mut g,
+            [24.0, 1.0, 1.1, 1.0, 1.25, 1.0, 1.5],
+            [1, 0, 0, 0, 1, 0, 0, 0, 1],
+            &[
+                &[1.0, 0.0, 1.0],
+                &[1.0, 1.0],
+                &[3.0, -1.0],
+                &[0.0],
+                &[],
+                &[2.0, 5.0],
+                &[7.0],
+            ],
+        );
+        assert_eq!(
+            profile_line(&mut g, Some(shared)),
+            format!(
+                "{{\"kind\":\"profile\",\"addr\":\"{shared:#010x}\",\
+                 \"lvlNum\":24,\"gameMode\":1,\"dmgBuffed\":1.1,\"rangeBuffed\":1,\
+                 \"speedBuffed\":1.25,\"splashBuffed\":1,\"utilBuffed\":1.5,\
+                 \"fireBonus\":1,\"fireCrit\":0,\"fireMissle\":0,\"splashDmgBonus\":0,\
+                 \"splashExtraGold\":1,\"splashReduceCost\":0,\"snipeDmg\":0,\
+                 \"snipeStun\":0,\"snipeReduceCost\":1,\
+                 \"warningCreeps\":[1,0,1],\"unlockArray\":[1,1],\"lvlArray\":[3,-1],\
+                 \"lvlArray1\":[0],\"lvlArray2\":[],\"equipmentArray\":[2,5],\
+                 \"tricketArray\":[7]}}"
+            )
+        );
+    }
+
+    #[test]
+    fn a_profile_row_without_shared_data_says_so() {
+        let mut g = FakeGuest::new();
+        assert_eq!(
+            profile_line(&mut g, None),
+            "{\"kind\":\"profile\",\"error\":\"no SharedData found\"}"
+        );
+    }
+
+    #[test]
+    fn a_profile_field_that_cannot_be_read_is_null() {
+        let mut g = FakeGuest::new();
+        let shared = shared_data(
+            &mut g,
+            [2.0, 0.0, 1.0, 1.0, 1.0, 1.0, 1.0],
+            [0; 9],
+            &[&[1.0], &[], &[], &[], &[], &[], &[]],
+        );
+        // warningCreeps points at something that is not one of touchHLE's
+        // arrays; unlockArray holds an object that is not an NSNumber.
+        let isa = g.word(shared).unwrap();
+        let at = g.offsets[&(isa, "warningCreeps")];
+        let not_an_array = g.alloc(4);
+        g.put_word(shared + at, not_an_array);
+        let at = g.offsets[&(isa, "unlockArray")];
+        let array = g.word(shared + at).unwrap();
+        let not_a_number = g.alloc(4);
+        g.arrays.insert(array, vec![not_a_number]);
+        // gameMode has no offset: the class has no such ivar.
+        g.offsets.remove(&(isa, "gameMode"));
+        let line = profile_line(&mut g, Some(shared));
+        assert!(line.contains("\"gameMode\":null,"), "{line}");
+        assert!(line.contains("\"warningCreeps\":null,"), "{line}");
+        assert!(line.contains("\"unlockArray\":[null],"), "{line}");
+        assert!(line.contains("\"lvlNum\":2,"), "{line}");
     }
 
     #[test]

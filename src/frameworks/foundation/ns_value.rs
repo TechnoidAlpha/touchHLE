@@ -100,6 +100,22 @@ impl NSNumberHostObject {
     impl_AsValue!(as_i128, i128);
 }
 
+/// The value of `number` as an f64 if it is one of touchHLE's NSNumbers, read
+/// from its host object without calling the guest (for the trace's profile
+/// row). Every integer an `int` holds is exact in an f64.
+pub fn host_number_value(objc: &crate::objc::ObjC, number: id) -> Option<f64> {
+    let mut host_object = objc.get_host_object(number)?;
+    // A host object may wrap its superclass's, as in [ObjC::borrow]. A
+    // bound, in case a chain loops.
+    for _ in 0..16 {
+        if let Some(found) = host_object.as_any().downcast_ref::<NSNumberHostObject>() {
+            return Some(found.as_double());
+        }
+        host_object = host_object.as_superclass()?;
+    }
+    None
+}
+
 pub const CLASSES: ClassExports = objc_classes! {
 
 (env, this, _cmd);
