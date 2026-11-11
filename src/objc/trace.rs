@@ -1101,6 +1101,41 @@ fn run_script(env: &mut Environment, now: u32) {
     env.objc.trace = Some(trace);
 }
 
+/// Called at each presented frame after [run_script]: the live reader's
+/// touches since the last frame (LIVE9; see [live::LiveStream::take_touches]
+/// for the one-finger guard) go into the window's event queue as finger
+/// `Remote`, as the input script's go, so the app plays them and they
+/// reach `input.log` and the stream like any touch. Each writes a row with
+/// origin `remote`.
+fn run_remote_touches(env: &mut Environment, now: u32) {
+    let real_down = crate::frameworks::uikit::ui_touch::real_finger_down(env);
+    let elapsed_ms = env.startup_time.elapsed().as_secs_f64() * 1000.0;
+    let thread = env.current_thread;
+    let Some(trace) = env.objc.trace.as_mut() else {
+        return;
+    };
+    let Some(live) = trace.out.live.as_mut() else {
+        return;
+    };
+    let touches = live.take_touches(real_down);
+    for touch in touches {
+        let (word, event_of): (&str, fn(HashMap<FingerId, Coords>) -> Event) = match touch.phase {
+            live::RemotePhase::Down => ("down", Event::TouchesDown),
+            live::RemotePhase::Move => ("move", Event::TouchesMove),
+            live::RemotePhase::Up => ("up", Event::TouchesUp),
+        };
+        let text = format!("remote {} {} {}", word, touch.x, touch.y);
+        let row = text_row(now, elapsed_ms, thread, "remote", &text);
+        let _ = trace.out.write_all(row.as_bytes());
+        if let Some(window) = env.window.as_mut() {
+            window.push_event(event_of(HashMap::from([(
+                FingerId::Remote,
+                (touch.x, touch.y),
+            )])));
+        }
+    }
+}
+
 /// Read the target of an input script's `wait`, as the bytes of its type.
 /// A `Class.ivar` is read on the instance a static variable of the app
 /// binary points at (see [scene::find_singleton]), or else on the first
@@ -1341,6 +1376,7 @@ pub fn trace_present_frame(env: &mut Environment) -> Option<FrameCaptureTicket> 
     let frame = trace.frame;
     trace.frame = trace.frame.wrapping_add(1);
     run_script(env, frame.wrapping_add(1));
+    run_remote_touches(env, frame.wrapping_add(1));
     let trace = env.objc.trace.as_mut()?;
     if trace.coverage && frame > 0 && frame.is_multiple_of(COVERAGE_EVERY_FRAMES) {
         trace_write_coverage(env, "periodic");

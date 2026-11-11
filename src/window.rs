@@ -131,6 +131,9 @@ pub enum FingerId {
     DpadToTouch,
     /// A touch from the message trace's input script (`--input-script=`).
     Script,
+    /// A touch from the live stream's reader (`--live-port=`, LIVE9): the
+    /// remake's side of the side-by-side app.
+    Remote,
 }
 pub type Coords = (f32, f32);
 
